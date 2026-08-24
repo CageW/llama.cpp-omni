@@ -552,7 +552,7 @@ int main(int argc, char ** argv) {
         std::string cache_path;
         try {
             cache_path = params.omni_runtime_profile.autotune_cache.empty()
-                             ? fs_get_cache_file("omni-runtime-autotune-v2.json")
+                             ? fs_get_cache_file("omni-runtime-autotune-v3.json")
                              : params.omni_runtime_profile.autotune_cache;
         } catch (const std::exception & exception) {
             if (!params.omni_runtime_profile.autotune.empty()) {
@@ -678,7 +678,7 @@ int main(int argc, char ** argv) {
             data.value("duplex_mode", false),
             data.value("tts_gpu_layers", 100),
             data.value("token2wav_device", "gpu:0"),
-            data.value("token2wav_threads", 8));
+            data.value("token2wav_threads", params.omni_runtime_profile.token2wav_threads));
         bool duplex_mode = session_options.duplex_mode;
         int tts_gpu_layers = session_options.tts_gpu_layers;
         std::string token2wav_device = session_options.token2wav_device;
@@ -724,7 +724,7 @@ int main(int argc, char ** argv) {
                                          token2wav_device, duplex_mode,
                                          /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir,
                                          runtime_config ? &*runtime_config : nullptr,
-                                         /*strict_runtime_config=*/false, token2wav_threads);
+                                         session_options.strict_runtime_config, token2wav_threads);
         if (!octx) {
             res_error(res, format_error_response("omni_init failed"));
             return;

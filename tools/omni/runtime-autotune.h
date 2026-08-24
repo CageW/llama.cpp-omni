@@ -10,7 +10,7 @@
 
 namespace omni {
 
-static constexpr int32_t runtime_autotune_schema_version = 2;
+static constexpr int32_t runtime_autotune_schema_version = 3;
 static constexpr int32_t runtime_autotune_scoring_policy = 2;
 
 struct autotune_build_identity {
@@ -23,6 +23,7 @@ struct autotune_file_fingerprint {
     std::string path;
     uint64_t    size          = 0;
     int64_t     modified_time = 0;
+    std::string sha256;
 };
 
 struct autotune_backend_identity {

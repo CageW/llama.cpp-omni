@@ -22,6 +22,7 @@ struct runtime_session_options {
     int32_t     tts_gpu_layers    = 100;
     std::string token2wav_device  = "gpu:0";
     int32_t     token2wav_threads = 8;
+    bool        strict_runtime_config = false;
 };
 
 runtime_session_options resolve_runtime_session_options(const effective_runtime_config * config,

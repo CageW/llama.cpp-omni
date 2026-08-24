@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "omni.h"
 #include "runtime-profile.h"
+#include "runtime-autotune-runner.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -547,13 +548,16 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
         shared_octx = nullptr;
     }
 
-    const int tts_gpu_layers = runtime_config ? runtime_config->tts_gpu_layers : 99;
-    const std::string token2wav_device = runtime_config ? runtime_config->token2wav_device : "gpu:0";
-    const int token2wav_threads = runtime_config ? runtime_config->token2wav_threads : 8;
+    const auto session_options = omni::resolve_runtime_session_options(
+            runtime_config, duplex_mode, /*requested_tts_gpu_layers=*/99, /*requested_token2wav_device=*/"gpu:0",
+            params.omni_runtime_profile.token2wav_threads);
+    const int tts_gpu_layers = session_options.tts_gpu_layers;
+    const std::string token2wav_device = session_options.token2wav_device;
+    const int token2wav_threads = session_options.token2wav_threads;
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, tts_gpu_layers,
                                      token2wav_device, duplex_mode,
                                      model, ctx, output_dir, runtime_config,
-                                     /*strict_runtime_config=*/false, token2wav_threads);
+                                     session_options.strict_runtime_config, token2wav_threads);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;

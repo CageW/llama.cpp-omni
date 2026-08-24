@@ -149,6 +149,7 @@ json serialize_fingerprint(const autotune_fingerprint & value) {
             { "path",          file.path          },
             { "size",          file.size          },
             { "modified_time", file.modified_time },
+            { "sha256",        file.sha256        },
         });
     }
 
@@ -191,6 +192,7 @@ autotune_fingerprint deserialize_fingerprint(const json & input) {
             file.at("path").get<std::string>(),
             file.at("size").get<uint64_t>(),
             file.at("modified_time").get<int64_t>(),
+            file.at("sha256").get<std::string>(),
         });
     }
     return output;
@@ -1011,7 +1013,8 @@ bool operator==(const autotune_build_identity & left, const autotune_build_ident
 }
 
 bool operator==(const autotune_file_fingerprint & left, const autotune_file_fingerprint & right) {
-    return left.path == right.path && left.size == right.size && left.modified_time == right.modified_time;
+    return left.path == right.path && left.size == right.size && left.modified_time == right.modified_time &&
+           left.sha256 == right.sha256;
 }
 
 bool operator==(const autotune_backend_identity & left, const autotune_backend_identity & right) {
@@ -1168,7 +1171,11 @@ autotune_fingerprint create_autotune_fingerprint(const autotune_build_identity &
             return {};
         }
         const auto modified_time = static_cast<int64_t>(modified.time_since_epoch().count());
-        output.files.push_back({ absolute_path.string(), size, modified_time });
+        std::string content_hash;
+        if (!sha256_file(absolute_path.string(), content_hash, error)) {
+            return {};
+        }
+        output.files.push_back({ absolute_path.string(), size, modified_time, std::move(content_hash) });
     }
     std::sort(output.files.begin(), output.files.end(),
               [](const auto & left, const auto & right) { return left.path < right.path; });

@@ -1,6 +1,7 @@
 #include "runtime-autotune-runner.h"
 #include "runtime-autotune.h"
 #include "runtime-hash.h"
+#include "token2wav/token2wav-impl.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -189,6 +190,35 @@ static void test_fingerprint_changes_when_input_file_metadata_changes() {
         omni::create_autotune_fingerprint(test_build(), test_hardware(), { model.string() }, "auto", {}, error);
 
     assert(error.empty());
+    assert(before != after);
+}
+
+static void test_fingerprint_changes_when_input_content_changes_without_metadata_changes() {
+    temporary_autotune_tree tree;
+    const auto              model = tree.write("models/model.gguf", "before");
+    std::error_code         filesystem_error;
+    const auto               original_time = std::filesystem::last_write_time(model, filesystem_error);
+    assert(!filesystem_error);
+
+    std::string error;
+    const auto before = omni::create_autotune_fingerprint(test_build(), test_hardware(), { model.string() }, "auto",
+                                                          {}, error);
+    assert(error.empty());
+
+    {
+        std::ofstream file(model, std::ios::binary | std::ios::trunc);
+        file << "change";
+    }
+    assert(std::filesystem::file_size(model, filesystem_error) == 6);
+    assert(!filesystem_error);
+    std::filesystem::last_write_time(model, original_time, filesystem_error);
+    assert(!filesystem_error);
+
+    const auto after = omni::create_autotune_fingerprint(test_build(), test_hardware(), { model.string() }, "auto",
+                                                         {}, error);
+    assert(error.empty());
+    assert(before.files.front().size == after.files.front().size);
+    assert(before.files.front().modified_time == after.files.front().modified_time);
     assert(before != after);
 }
 
@@ -629,6 +659,7 @@ static void test_runtime_profile_controls_session_options_when_present() {
     assert(profiled.tts_gpu_layers == -1);
     assert(profiled.token2wav_device == "gpu:0");
     assert(profiled.token2wav_threads == 32);
+    assert(profiled.strict_runtime_config);
 
     const auto legacy = omni::resolve_runtime_session_options(nullptr, /*requested_duplex_mode=*/false,
                                                               /*requested_tts_gpu_layers=*/100, "cpu",
@@ -637,6 +668,12 @@ static void test_runtime_profile_controls_session_options_when_present() {
     assert(legacy.tts_gpu_layers == 100);
     assert(legacy.token2wav_device == "cpu");
     assert(legacy.token2wav_threads == 4);
+    assert(!legacy.strict_runtime_config);
+}
+
+static void test_profile_runtime_disables_token2wav_device_fallback() {
+    assert(!omni::flow::token2wav_device_fallback_allowed(true));
+    assert(omni::flow::token2wav_device_fallback_allowed(false));
 }
 
 static omni::autotune_plan_options test_plan_options() {
@@ -1051,12 +1088,13 @@ static void test_selector_fails_when_every_candidate_is_invalid() {
 }
 
 int main() {
-    assert(omni::runtime_autotune_schema_version == 2);
+    assert(omni::runtime_autotune_schema_version == 3);
     assert(omni::runtime_autotune_scoring_policy == 2);
     test_fingerprint_changes_when_device_total_memory_changes();
     test_fingerprint_changes_when_ggml_device_type_changes();
     test_fingerprint_changes_when_build_identity_changes();
     test_fingerprint_changes_when_input_file_metadata_changes();
+    test_fingerprint_changes_when_input_content_changes_without_metadata_changes();
     test_fingerprint_changes_when_an_explicit_override_changes();
     test_fingerprint_changes_when_a_runtime_input_changes();
     test_sha256_hashes_bytes_and_files();
@@ -1077,6 +1115,7 @@ int main() {
     test_cache_plan_validation_accepts_a_recorded_output_mismatch_rejection();
     test_cache_plan_validation_accepts_a_cpu_screening_rejection_without_measured_rounds();
     test_runtime_profile_controls_session_options_when_present();
+    test_profile_runtime_disables_token2wav_device_fallback();
     test_candidate_plan_contains_phase_four_placements();
     test_quantized_candidate_can_be_selectable_when_enabled();
     test_explicit_model_disables_precision_candidates();
