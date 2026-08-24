@@ -2206,7 +2206,8 @@ class Token2Wav {
                      const std::string & vocoder_gguf,
                      const std::string & device_token2mel    = "gpu",
                      const std::string & device_vocoder      = "gpu",
-                     const std::string & coreml_model_path  = "");
+                     const std::string & coreml_model_path  = "",
+                     int                 threads             = 8);
 
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
@@ -2264,7 +2265,8 @@ struct Token2WavSession {
                                      const std::string & device_vocoder      = "gpu",
                                      int                 n_timesteps         = 10,
                                      float               temperature         = 1.0f,
-                                     const std::string & coreml_model_path  = "");
+                                     const std::string & coreml_model_path  = "",
+                                     int                 threads             = 8);
 
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
                                  const std::string & flow_matching_gguf,
@@ -2275,7 +2277,8 @@ struct Token2WavSession {
                                  const std::string & device_vocoder      = "gpu",
                                  int                 n_timesteps         = 10,
                                  float               temperature         = 1.0f,
-                                 const std::string & coreml_model_path  = "");
+                                 const std::string & coreml_model_path  = "",
+                                 int                 threads             = 8);
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 

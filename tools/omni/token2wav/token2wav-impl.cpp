@@ -9652,17 +9652,17 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & vocoder_gguf,
                             const std::string & device_token2mel,
                             const std::string & device_vocoder,
-                            const std::string & coreml_model_path) {
+                            const std::string & coreml_model_path,
+                            int                 threads) {
     reset_stream();
 
-    constexpr int kDefaultThreads = 8;
-    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads,
+    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, threads,
                          coreml_model_path)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
         models_loaded_ = false;
         return false;
     }
-    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
+    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, threads)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
         models_loaded_ = false;
         return false;

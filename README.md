@@ -143,6 +143,122 @@ cmake --build build --target llama-omni-server --target llama-omni-cli -j
 
 > CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
 
+### Runtime profile
+
+`llama-omni-server` can resolve a conservative runtime configuration from the
+available GGUF files and the memory reported by the GGML backends. The `auto`
+profile is the deterministic fallback. It checks the complete Omni model tree,
+selects F16, Q8_0, or Q4_K_M in that order on an accelerator, and uses a
+CPU-compatible profile when no accelerator is available.
+
+```bash
+./build/bin/llama-omni-server \
+    --profile auto \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --host 0.0.0.0 \
+    --port 9060
+```
+
+Inspect the selection without loading weights or opening the HTTP port:
+
+```bash
+./build/bin/llama-omni-server \
+    --profile auto \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --print-effective-config
+```
+
+The resolver assigns LLM, Vision, Audio, TTS, Projector, and Token2Wav to
+detected devices. It estimates each module from its model files and runtime
+overhead. A non-baseline placement is eligible only when every accelerator
+retains at least 10 percent of its current free memory. The deterministic
+baseline remains available when an estimate is pessimistic, although an actual
+module initialization failure still rejects it.
+
+The output contains one `placement=` line for each module. Each line names the
+model path, precision, GGML backend class, selected device, execution mode, and
+`active` status. `llama-omni-server` passes the LLM and TTS placements to
+`llama_model_params`, and passes the Vision, Audio, and Projector placements to
+their GGML backend initializers. Token2Wav receives the resolved `gpu:N` or
+`cpu` device string.
+
+Explicit `--model`, `--n-gpu-layers`, and `--ctx-size` values take precedence
+over the profile. An explicit `--model` also disables the LLM precision probe.
+The current CLI does not expose per-module placement flags. The resolver rejects
+a device that is absent from the detected GGML inventory.
+
+Refresh the runtime autotuning cache before starting a production server:
+
+```bash
+./build/bin/llama-omni-server \
+    --profile auto \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --autotune refresh \
+    --autotune-rounds 3 \
+    --autotune-warmup-rounds 1 \
+    --autotune-cache /path/to/runtime-autotune.json
+```
+
+Refresh first measures available F16, Q8_0, and Q4_K_M LLM files on the Phase 2
+placement. It then evaluates `consolidated`, `encoder_split`,
+`encoder_split_local_projector`, `token2wav_split`, and
+`output_pipeline_split`. On a dual-accelerator machine it also probes Token2Wav
+on CPU with 8, 16, 32, and 64 threads, capped and deduplicated by
+`std::thread::hardware_concurrency()`. Use `--token2wav-threads` to set the normal
+Token2Wav CPU thread count.
+
+Each measured round creates a new Omni context, runs the requested warmup turns,
+resets per-turn state, and then runs the same 12-frame duplex fixture at a
+one-second cadence. Candidate order rotates between rounds. The runner does not
+resample or speed up generated audio. TTS RTF is elapsed generation time divided
+by emitted audio duration. A CPU candidate is stopped before measured rounds
+when its screening turn fails structurally or has TTS RTF greater than or equal
+to 1.5.
+
+Every measured round must complete all 12 frames, keep Frame-total P95 below one
+second, produce a `SPEAK` transition, emit finite audio with a final callback,
+and keep TTS RTF below 1.0. The score uses Encoder P95, TTFT P95, first-audio
+latency, and TTS RTF. Each aggregate metric is `median + MAD`, where MAD is the
+median absolute deviation across measured rounds.
+
+The runner hashes normalized response text and the ordered signed 32-bit TTS
+token stream. A same-precision placement must match the Phase 2 baseline hashes
+in every paired round. A selectable candidate must also be no slower in every
+paired round and improve the aggregate score by at least 5 percent. Otherwise
+the selector keeps the Phase 2 baseline.
+
+Q8_0 and Q4_K_M results are advisory by default because quantization can change
+generated text and TTS tokens. `--autotune-allow-quantized` allows a valid
+quantized result to participate in selection. `--print-effective-config` reports
+`output_consistent_with_baseline=false` when the selected quantized candidate
+has different output hashes, so the accepted quality risk is visible.
+
+The refresh command writes schema 2 cache data atomically and exits without
+opening an HTTP port. The cache contains raw rounds, aggregate metrics, output
+hashes, memory estimates and observations, screening results, skip reasons, and
+the selection reason. A failed refresh returns a nonzero status, preserves the
+previous cache, and retains its diagnostic run directories. After a successful
+refresh, the first failed run directory for each rejected candidate is retained
+and completed run directories are removed. A baseline failure
+also writes a timestamped diagnostic JSON file next to the cache.
+
+Output hashes detect drift but do not prove that spoken audio has the intended
+semantics. Audio semantics validation remains disabled, so the cache records
+`audio_semantics_verified=false`.
+
+Normal `--profile auto` startup never runs calibration. It applies a cache only
+when the executable and loaded backend SHA-256 values, CUDA versions, GGML
+device inventory, all candidate model files, fixture files, protocol settings,
+round counts, CPU thread probes, and explicit overrides match. It then rebuilds
+the candidate plan and recomputes round validity, aggregate scores, output
+consistency, and selection. A missing, stale, malformed, or internally
+inconsistent cache falls back to the Phase 2 profile.
+
+Add `--autotune-cache` to use a non-default cache path. Use
+`--print-effective-config` to inspect cache status, rejection reason, selected
+candidate, output consistency, module placement, and Token2Wav thread count
+without loading model weights or opening the HTTP port.
+
 ### Usage
 
 ```bash
@@ -476,6 +592,8 @@ POST /v1/stream/omni_init
 | `duplex_mode` | `true` enables full-duplex streaming |
 | `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
 | `output_dir` | Directory where TTS WAV files will be written |
+
+When the server starts with `--profile`, the effective runtime configuration controls `duplex_mode`, `tts_gpu_layers`, and `token2wav_device`. Values for those fields in the `omni_init` request are ignored so a request cannot silently replace the placement recorded in an applied autotune cache. Without `--profile`, the request fields keep their legacy behavior.
 
 **Expected response:**
 ```json
