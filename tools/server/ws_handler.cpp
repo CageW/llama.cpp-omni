@@ -626,10 +626,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             ws.send(ev);
         }
         session_mgr.close(session_id);
-        if (!session_activated && pending_octx && shared_octx == pending_octx) {
-            omni_free(pending_octx);
-            shared_octx = nullptr;
-        }
+        release_unactivated_octx_if_owned(
+            pending_octx, shared_octx, octx_mutex, session_activated, omni_free);
         for (const auto & path : retained_media_files) {
             fs::remove(path);
         }
@@ -741,34 +739,42 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // Full-duplex requires index=0 prefill before the first frame. This
     // initializes the system prompt and starts the duplex encoder/LLM pipeline.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
+        bool voice_prefill_ok = false;
+        {
+            std::lock_guard<std::mutex> lock(octx_mutex);
+            voice_prefill_ok = stream_prefill(octx, voice_wav, /*img*/"", /*index*/0);
+            if (voice_prefill_ok && octx->llm_thread_info) {
+                octx->llm_thread_info->start = std::chrono::steady_clock::now();
+            }
+        }
+        if (!voice_prefill_ok) {
             LOG_ERR("WS /backend: voice prefill failed\n");
             if (!voice_wav.empty()) fs::remove(voice_wav);
             fail_fast(session_id, "voice_prefill_failed", octx);
             return;
         }
         if (!voice_wav.empty()) fs::remove(voice_wav);
-        if (octx->llm_thread_info) {
-            octx->llm_thread_info->start = std::chrono::steady_clock::now();
-        }
     }
 
     // Activate session
+    bool activation_ok = false;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!session_mgr.activate(session_id, octx, /*owns_octx*/false)) {
-            LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
-            fail_fast(session_id, "activate_failed", octx);
-            return;
+        activation_ok = session_mgr.activate(session_id, octx, /*owns_octx*/false);
+        if (activation_ok) {
+            session_activated = true;
+            session_mgr.set_close_callback(session_id, [&ws, session_id]() {
+                // Preserve protocol ordering for older runtimes: emit session.closed
+                // before the transport close wakes a blocked ws.read().
+                ws.send(make_session_closed(session_id, "client_closed").dump());
+                ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
+            });
         }
-        session_activated = true;
-        session_mgr.set_close_callback(session_id, [&ws, session_id]() {
-            // Preserve protocol ordering for older runtimes: emit session.closed
-            // before the transport close wakes a blocked ws.read().
-            ws.send(make_session_closed(session_id, "client_closed").dump());
-            ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
-        });
+    }
+    if (!activation_ok) {
+        LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
+        fail_fast(session_id, "activate_failed", octx);
+        return;
     }
 
     // Send session.created

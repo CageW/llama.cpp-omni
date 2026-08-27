@@ -23,6 +23,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <iomanip>
 #include <map>
 #include <optional>
@@ -642,10 +643,31 @@ int main(int argc, char ** argv) {
 
     // HTTP server setup
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    const bool has_ssl_cert = !params.ssl_file_cert.empty();
+    const bool has_ssl_key  = !params.ssl_file_key.empty();
+    if (has_ssl_cert != has_ssl_key) {
+        LOG_ERR("--ssl-cert-file and --ssl-key-file must be provided together\n");
+        llama_backend_free();
+        return 1;
+    }
+
+    std::unique_ptr<httplib::Server> server;
+    if (has_ssl_cert) {
+        server = std::make_unique<httplib::SSLServer>(
+            params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    } else {
+        server = std::make_unique<httplib::Server>();
+    }
+    httplib::Server & svr = *server;
 #else
     httplib::Server svr;
 #endif
+
+    if (!svr.is_valid()) {
+        LOG_ERR("failed to initialize the HTTP server TLS context\n");
+        llama_backend_free();
+        return 1;
+    }
 
     omni_server_state state;
 
@@ -969,7 +991,12 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    if (!svr.listen(params.hostname, params.port)) {
+        LOG_ERR("failed to bind the Omni HTTP server to %s:%d\n",
+                params.hostname.c_str(), params.port);
+        llama_backend_free();
+        return 1;
+    }
 
     // cleanup
     {

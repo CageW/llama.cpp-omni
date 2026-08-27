@@ -20,6 +20,26 @@ namespace httplib {
 namespace ws { class WebSocket; }
 }
 
+inline bool release_unactivated_octx_if_owned(
+        omni_context * pending_octx,
+        omni_context *& shared_octx,
+        std::mutex & octx_mutex,
+        bool session_activated,
+        void (*release_fn)(omni_context *)) {
+    if (session_activated || pending_octx == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(octx_mutex);
+    if (shared_octx != pending_octx) {
+        return false;
+    }
+
+    shared_octx = nullptr;
+    release_fn(pending_octx);
+    return true;
+}
+
 // ============================================================================
 // WS /backend handler — main entry point called from server.cpp
 // ============================================================================

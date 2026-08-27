@@ -514,6 +514,7 @@ void omni_free(struct omni_context * ctx_omni);
 // C++ Token2Wav build and own the streaming cache.
 bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
                                   const std::string & tts_ref_audio_path);
+bool omni_tts_native_frontend_failure_is_fatal(bool native_frontend_configured);
 // Restore the model-directory default Token2Wav voice for a reused session.
 bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a

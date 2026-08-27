@@ -100,6 +100,8 @@ if(OMNI_T2W_ENABLE_NATIVE_FRONTEND)
                            DIRECTORY)
     set_property(TARGET omni APPEND PROPERTY
                  BUILD_RPATH "${OMNI_T2W_ORT_LIBRARY_DIR}")
+    set_property(TARGET omni APPEND PROPERTY
+                 INSTALL_RPATH "${OMNI_T2W_ORT_LIBRARY_DIR}")
 endif()
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
@@ -271,6 +273,13 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(${TARGET_RUNTIME_AUTOTUNE_TEST} PRIVATE cxx_std_17)
     add_test(NAME ${TARGET_RUNTIME_AUTOTUNE_TEST} COMMAND ${TARGET_RUNTIME_AUTOTUNE_TEST})
     set_tests_properties(${TARGET_RUNTIME_AUTOTUNE_TEST} PROPERTIES LABELS "main;omni")
+
+    set(TARGET_TTS_FRONTEND_POLICY_TEST test-tts-frontend-policy)
+    add_executable(${TARGET_TTS_FRONTEND_POLICY_TEST} test/test-tts-frontend-policy.cpp)
+    target_link_libraries(${TARGET_TTS_FRONTEND_POLICY_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_TTS_FRONTEND_POLICY_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_TTS_FRONTEND_POLICY_TEST} COMMAND ${TARGET_TTS_FRONTEND_POLICY_TEST})
+    set_tests_properties(${TARGET_TTS_FRONTEND_POLICY_TEST} PROPERTIES LABELS "main;omni;tts")
 
     add_test(
         NAME voxcpm2-cli-smoke

@@ -8740,6 +8740,10 @@ static void remove_prompt_bundle_dir(const std::string & dir) {
 #endif
 }
 
+bool omni_tts_native_frontend_failure_is_fatal(bool native_frontend_configured) {
+    return native_frontend_configured;
+}
+
 bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
                                   const std::string & tts_ref_audio_path) {
     if (!ctx_omni) {
@@ -8805,7 +8809,10 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
         }
         if (!ctx_omni->token2wav_session->set_prompt_wav(
                 tts_ref_audio_path, native_speech_tokenizer, native_campplus, frontend_threads, 5, 1.0f)) {
-            LOG_WRN("omni_set_tts_reference_audio: native Token2Wav frontend failed; falling back to Python\n");
+            if (omni_tts_native_frontend_failure_is_fatal(native_frontend_configured)) {
+                LOG_ERR("omni_set_tts_reference_audio: native Token2Wav frontend failed\n");
+                return false;
+            }
         } else {
             ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
             ctx_omni->token2wav_buffer = {4218, 4218, 4218};
@@ -8814,7 +8821,8 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
     }
 #else
     if (native_frontend_configured) {
-        LOG_WRN("omni_set_tts_reference_audio: native frontend is disabled at build time; falling back to Python\n");
+        LOG_ERR("omni_set_tts_reference_audio: native frontend is disabled at build time\n");
+        return false;
     }
 #endif
 
