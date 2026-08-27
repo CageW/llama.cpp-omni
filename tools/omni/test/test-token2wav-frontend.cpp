@@ -197,6 +197,20 @@ static void test_prompt_bundle_assembly_rejects_shape_mismatch() {
     assert(error.find("prompt Mel frame count") != std::string::npos);
 }
 
+static void test_onnx_output_shape_contracts_require_single_batch() {
+    std::string error;
+    assert(omni::flow::Token2WavFrontend::validate_speech_tokenizer_output_shape({ 17 }, &error));
+    assert(omni::flow::Token2WavFrontend::validate_speech_tokenizer_output_shape({ 1, 17 }, &error));
+    assert(!omni::flow::Token2WavFrontend::validate_speech_tokenizer_output_shape({ 2, 9 }, &error));
+    assert(error.find("B=1") != std::string::npos);
+
+    error.clear();
+    assert(omni::flow::Token2WavFrontend::validate_campplus_output_shape({ 192 }, &error));
+    assert(omni::flow::Token2WavFrontend::validate_campplus_output_shape({ 1, 192 }, &error));
+    assert(!omni::flow::Token2WavFrontend::validate_campplus_output_shape({ 2, 96 }, &error));
+    assert(error.find("B=1") != std::string::npos);
+}
+
 static void write_float_file(const std::string & path, const std::vector<float> & values) {
     std::ofstream file(path, std::ios::binary);
     assert(file.good());
@@ -280,6 +294,7 @@ int main(int argc, char ** argv) {
     test_campplus_fbank_contract();
     test_prompt_bundle_assembly_adds_lookahead_and_converts_mel_layout();
     test_prompt_bundle_assembly_rejects_shape_mismatch();
+    test_onnx_output_shape_contracts_require_single_batch();
     if (argc == 4) {
         test_native_frontend_with_real_models(argv[1], argv[2], argv[3]);
     } else {

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -76,7 +77,26 @@ static std::vector<float> generate_one_window(omni::flow::Token2WavSession & ses
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 7 || argc > 9) {
+    std::vector<std::string> configured_args;
+    if (argc == 1) {
+        const char * const env_names[] = {
+            "OMNI_T2W_SESSION_MODEL_DIR",
+            "OMNI_T2W_SESSION_SPEECH_TOKENIZER_ONNX",
+            "OMNI_T2W_SESSION_CAMPPLUS_ONNX",
+            "OMNI_T2W_SESSION_VOICE1_WAV",
+            "OMNI_T2W_SESSION_VOICE2_WAV",
+            "OMNI_T2W_SESSION_OUTPUT_DIR",
+        };
+        for (const char * name : env_names) {
+            const char * value = std::getenv(name);
+            if (!value || value[0] == '\0') {
+                std::fprintf(stderr,
+                             "SKIP: set all OMNI_T2W_SESSION_* variables to run the Token2Wav voice-switching E2E\n");
+                return 77;
+            }
+            configured_args.emplace_back(value);
+        }
+    } else if (argc < 7 || argc > 9) {
         std::fprintf(stderr,
                      "usage: %s <model_dir> <speech_tokenizer.onnx> <campplus.onnx> "
                      "<voice1.wav> <voice2.wav> <output_dir> [device] [n_timesteps]\n",
@@ -84,12 +104,12 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    const fs::path model_dir          = argv[1];
-    const std::string speech_tokenizer = argv[2];
-    const std::string campplus         = argv[3];
-    const fs::path voice1              = argv[4];
-    const fs::path voice2              = argv[5];
-    const fs::path output_dir          = argv[6];
+    const fs::path model_dir          = argc == 1 ? configured_args[0] : argv[1];
+    const std::string speech_tokenizer = argc == 1 ? configured_args[1] : argv[2];
+    const std::string campplus         = argc == 1 ? configured_args[2] : argv[3];
+    const fs::path voice1              = argc == 1 ? configured_args[3] : argv[4];
+    const fs::path voice2              = argc == 1 ? configured_args[4] : argv[5];
+    const fs::path output_dir          = argc == 1 ? configured_args[5] : argv[6];
     const std::string device            = argc >= 8 ? argv[7] : "gpu:0";
     const int n_timesteps              = argc >= 9 ? std::stoi(argv[8]) : 5;
 

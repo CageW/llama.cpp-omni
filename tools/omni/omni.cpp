@@ -4386,6 +4386,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             std::string spk_file = prompt_bundle_dir + "/spk_f32.bin";
             std::string tokens_file = prompt_bundle_dir + "/prompt_tokens_i32.bin";
             std::string mel_file = prompt_bundle_dir + "/prompt_mel_btc_f32.bin";
+            ctx_omni->token2wav_default_prompt_bundle_dir.clear();
             
             bool use_prompt_bundle = false;
             {
@@ -4439,6 +4440,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
                         vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, "", token2wav_threads,
                         omni::flow::token2wav_device_fallback_allowed(ctx_omni->strict_runtime_config));
+                if (init_ok) {
+                    ctx_omni->token2wav_default_prompt_bundle_dir = prompt_bundle_dir;
+                }
             }
             // Fallback to CPU
             if (!init_ok && omni::flow::token2wav_device_fallback_allowed(ctx_omni->strict_runtime_config)) {
@@ -8787,8 +8791,11 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
 
     const char * native_speech_tokenizer = std::getenv("OMNI_T2W_SPEECH_TOKENIZER_ONNX");
     const char * native_campplus          = std::getenv("OMNI_T2W_CAMPPLUS_ONNX");
-    if (native_speech_tokenizer && native_speech_tokenizer[0] != '\0' &&
-        native_campplus && native_campplus[0] != '\0') {
+    const bool native_frontend_configured =
+        native_speech_tokenizer && native_speech_tokenizer[0] != '\0' &&
+        native_campplus && native_campplus[0] != '\0';
+#if defined(OMNI_T2W_ENABLE_NATIVE_FRONTEND)
+    if (native_frontend_configured) {
         int frontend_threads = 1;
         if (const char * configured_threads = std::getenv("OMNI_T2W_FRONTEND_THREADS")) {
             const int parsed_threads = std::atoi(configured_threads);
@@ -8798,14 +8805,18 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
         }
         if (!ctx_omni->token2wav_session->set_prompt_wav(
                 tts_ref_audio_path, native_speech_tokenizer, native_campplus, frontend_threads, 5, 1.0f)) {
-            LOG_ERR("omni_set_tts_reference_audio: native Token2Wav frontend failed; "
-                    "configured native frontend is not falling back to Python\n");
-            return false;
+            LOG_WRN("omni_set_tts_reference_audio: native Token2Wav frontend failed; falling back to Python\n");
+        } else {
+            ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+            ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+            return true;
         }
-        ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
-        ctx_omni->token2wav_buffer = {4218, 4218, 4218};
-        return true;
     }
+#else
+    if (native_frontend_configured) {
+        LOG_WRN("omni_set_tts_reference_audio: native frontend is disabled at build time; falling back to Python\n");
+    }
+#endif
 
     configure_python_t2w_gpu_for_frontend(ctx_omni);
     if (!ctx_omni->python_t2w_initialized &&
@@ -8859,8 +8870,13 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
     if (ctx_omni->use_python_token2wav) {
         ok = reset_python_t2w_cache(ctx_omni);
     } else if (ctx_omni->token2wav_initialized && ctx_omni->token2wav_session) {
-        const std::string prompt_cache_gguf = ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
-        ok = ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(prompt_cache_gguf, 5, 1.0f);
+        if (!ctx_omni->token2wav_default_prompt_bundle_dir.empty()) {
+            ok = ctx_omni->token2wav_session->set_prompt_bundle(
+                ctx_omni->token2wav_default_prompt_bundle_dir, 5, 1.0f);
+        } else {
+            const std::string prompt_cache_gguf = ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
+            ok = ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(prompt_cache_gguf, 5, 1.0f);
+        }
     } else {
         LOG_ERR("omni_reset_tts_reference_audio: Token2Wav is not initialized\n");
     }

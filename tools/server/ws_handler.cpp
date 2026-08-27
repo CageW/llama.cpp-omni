@@ -615,13 +615,21 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
 
+    bool session_activated = false;
+
     // Helper: fail-fast — send session.closed and close WS
-    auto fail_fast = [&](const std::string & session_id, const std::string & reason) {
+    auto fail_fast = [&](const std::string & session_id,
+                         const std::string & reason,
+                         omni_context * pending_octx = nullptr) {
         if (!session_id.empty()) {
             std::string ev = make_session_closed(session_id, reason).dump();
             ws.send(ev);
         }
         session_mgr.close(session_id);
+        if (!session_activated && pending_octx && shared_octx == pending_octx) {
+            omni_free(pending_octx);
+            shared_octx = nullptr;
+        }
         for (const auto & path : retained_media_files) {
             fs::remove(path);
         }
@@ -691,7 +699,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         octx->use_python_token2wav) {
         if (!omni_set_tts_reference_audio(
                 octx, "tools/omni/assets/default_ref_audio/default_ref_audio.wav")) {
-            fail_fast(session_id, "tts_voice_prepare_failed");
+            fail_fast(session_id, "tts_voice_prepare_failed", octx);
             return;
         }
     }
@@ -701,27 +709,31 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     if (!parsed_init.ref_audio_b64.empty()) {
         voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
         if (voice_wav.empty()) {
-            fail_fast(session_id, "voice_audio_decode_failed");
+            fail_fast(session_id, "voice_audio_decode_failed", octx);
             return;
         }
         octx->ref_audio_path = voice_wav;
     }
     if (!parsed_init.tts_ref_audio_b64.empty()) {
-        tts_voice_wav = TempMediaFiles::write_audio_wav(
-            parsed_init.tts_ref_audio_b64, temp_dir, msg_counter++);
+        const bool reuse_ref_audio = !voice_wav.empty() &&
+                                     parsed_init.tts_ref_audio_b64 == parsed_init.ref_audio_b64;
+        tts_voice_wav = reuse_ref_audio
+                            ? voice_wav
+                            : TempMediaFiles::write_audio_wav(
+                                  parsed_init.tts_ref_audio_b64, temp_dir, msg_counter++);
         if (tts_voice_wav.empty()) {
             if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "tts_voice_audio_decode_failed");
+            fail_fast(session_id, "tts_voice_audio_decode_failed", octx);
             return;
         }
         octx->tts_ref_audio_path = tts_voice_wav;
         octx->tts_ref_audio_owned = true;
         if (parsed_init.use_tts && !omni_set_tts_reference_audio(octx, tts_voice_wav)) {
             if (!voice_wav.empty()) fs::remove(voice_wav);
-            fs::remove(tts_voice_wav);
+            if (tts_voice_wav != voice_wav) fs::remove(tts_voice_wav);
             octx->tts_ref_audio_path.clear();
             octx->tts_ref_audio_owned = false;
-            fail_fast(session_id, "tts_voice_prepare_failed");
+            fail_fast(session_id, "tts_voice_prepare_failed", octx);
             return;
         }
     }
@@ -733,7 +745,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
             LOG_ERR("WS /backend: voice prefill failed\n");
             if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "voice_prefill_failed");
+            fail_fast(session_id, "voice_prefill_failed", octx);
             return;
         }
         if (!voice_wav.empty()) fs::remove(voice_wav);
@@ -747,9 +759,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         std::lock_guard<std::mutex> lock(octx_mutex);
         if (!session_mgr.activate(session_id, octx, /*owns_octx*/false)) {
             LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
-            fail_fast(session_id, "activate_failed");
+            fail_fast(session_id, "activate_failed", octx);
             return;
         }
+        session_activated = true;
         session_mgr.set_close_callback(session_id, [&ws, session_id]() {
             // Preserve protocol ordering for older runtimes: emit session.closed
             // before the transport close wakes a blocked ws.read().

@@ -91,7 +91,15 @@ if(OMNI_T2W_ENABLE_NATIVE_FRONTEND)
     endif()
     target_compile_definitions(omni PRIVATE OMNI_T2W_ENABLE_NATIVE_FRONTEND=1)
     target_include_directories(omni PRIVATE "${OMNI_T2W_ORT_INCLUDE_DIR}")
-    target_link_libraries(omni PRIVATE "${OMNI_T2W_ORT_LIBRARY}")
+    # The shared omni library exposes ONNX Runtime symbols to its consumers.
+    # Propagate the dependency so executables linking omni resolve those
+    # symbols during their final link step.
+    target_link_libraries(omni PUBLIC "${OMNI_T2W_ORT_LIBRARY}")
+    get_filename_component(OMNI_T2W_ORT_LIBRARY_DIR
+                           "${OMNI_T2W_ORT_LIBRARY}"
+                           DIRECTORY)
+    set_property(TARGET omni APPEND PROPERTY
+                 BUILD_RPATH "${OMNI_T2W_ORT_LIBRARY_DIR}")
 endif()
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled

@@ -53,6 +53,14 @@ class Token2WavFrontend {
                                        FrontendPromptBundle &         out,
                                        std::string *                  error = nullptr);
 
+    // Validate the output shapes accepted from the ONNX frontend models.
+    // Rank-1 tensors represent an already-squeezed batch; rank-2 tensors
+    // must have B=1.
+    static bool validate_speech_tokenizer_output_shape(const std::vector<int64_t> & shape,
+                                                       std::string *                  error = nullptr);
+    static bool validate_campplus_output_shape(const std::vector<int64_t> & shape,
+                                               std::string *                  error = nullptr);
+
     // Run the native WAV frontend. This path is compiled only when
     // OMNI_T2W_ENABLE_NATIVE_FRONTEND is enabled and an ONNX Runtime library
     // is linked into the omni target.

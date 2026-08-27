@@ -531,6 +531,9 @@ static bool run_speech_tokenizer(const AudioFeatures & features,
     bool ok = ort_get_output_shape(api, outputs[0], shape, type, error);
     size_t count = 0;
     if (ok) {
+        ok = Token2WavFrontend::validate_speech_tokenizer_output_shape(shape, error);
+    }
+    if (ok) {
         ok = tensor_element_count(shape, count, error);
     }
     void * output_data = nullptr;
@@ -618,6 +621,9 @@ static bool run_campplus(const AudioFeatures & features,
     bool ok = ort_get_output_shape(api, outputs[0], shape, type, error);
     size_t count = 0;
     if (ok) {
+        ok = Token2WavFrontend::validate_campplus_output_shape(shape, error);
+    }
+    if (ok) {
         ok = tensor_element_count(shape, count, error);
     }
     if (ok && (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || count != 192)) {
@@ -645,6 +651,26 @@ static bool run_campplus(const AudioFeatures & features,
 #endif
 
 }  // namespace
+
+bool Token2WavFrontend::validate_speech_tokenizer_output_shape(const std::vector<int64_t> & shape,
+                                                               std::string *                  error) {
+    const bool valid = (shape.size() == 1 && shape[0] > 0) ||
+                       (shape.size() == 2 && shape[0] == 1 && shape[1] > 0);
+    if (!valid) {
+        return set_error(error, "speech tokenizer output must have shape [T] or [1, T] with B=1");
+    }
+    return true;
+}
+
+bool Token2WavFrontend::validate_campplus_output_shape(const std::vector<int64_t> & shape,
+                                                       std::string *                  error) {
+    const bool valid = (shape.size() == 1 && shape[0] == 192) ||
+                       (shape.size() == 2 && shape[0] == 1 && shape[1] == 192);
+    if (!valid) {
+        return set_error(error, "CampPlus output must have shape [192] or [1, 192] with B=1");
+    }
+    return true;
+}
 
 bool Token2WavFrontend::load_wav_mono(const std::string & path, AudioBuffer & out) {
     out = AudioBuffer();

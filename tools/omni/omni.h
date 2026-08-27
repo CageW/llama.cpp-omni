@@ -431,6 +431,7 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    std::string token2wav_default_prompt_bundle_dir;
     std::string token2wav_device = "gpu:0";
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
