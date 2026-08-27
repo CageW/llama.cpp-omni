@@ -9,6 +9,18 @@ else()
     option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
 endif()
 
+option(OMNI_T2W_ENABLE_NATIVE_FRONTEND
+       "Enable the native Token2Wav WAV frontend with ONNX Runtime"
+       OFF)
+set(OMNI_T2W_ORT_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/onnxruntime"
+    CACHE PATH
+    "Directory containing onnxruntime_c_api.h")
+set(OMNI_T2W_ORT_LIBRARY
+    ""
+    CACHE FILEPATH
+    "ONNX Runtime shared library used by the native Token2Wav frontend")
+
 add_library(omni
             omni.cpp
             omni.h
@@ -29,11 +41,13 @@ add_library(omni
             vision.cpp
             vision.h
             omni-impl.h
-            token2wav/token2wav-impl.cpp
-            token2wav/token2wav-impl.h
-            token2wav/token2wav.cpp
-            token2wav/token2wav.h
-            token2wav/token2wav-profile.h
+    token2wav/token2wav-impl.cpp
+    token2wav/token2wav-impl.h
+    token2wav/token2wav-frontend.cpp
+    token2wav/token2wav-frontend.h
+    token2wav/token2wav.cpp
+    token2wav/token2wav.h
+    token2wav/token2wav-profile.h
             )
 
 # Add CoreML related files when enabled
@@ -63,6 +77,22 @@ target_include_directories(omni PRIVATE ../../vendor)
 target_include_directories(omni PRIVATE ../../examples/gguf-hash/deps)
 target_compile_features   (omni PRIVATE cxx_std_17)
 target_sources(omni PRIVATE ../../examples/gguf-hash/deps/sha256/sha256.c)
+
+if(OMNI_T2W_ENABLE_NATIVE_FRONTEND)
+    if(NOT EXISTS "${OMNI_T2W_ORT_INCLUDE_DIR}/onnxruntime_c_api.h")
+        message(FATAL_ERROR
+                "OMNI_T2W_ENABLE_NATIVE_FRONTEND requires onnxruntime_c_api.h under "
+                "OMNI_T2W_ORT_INCLUDE_DIR='${OMNI_T2W_ORT_INCLUDE_DIR}'")
+    endif()
+    if(NOT OMNI_T2W_ORT_LIBRARY OR NOT EXISTS "${OMNI_T2W_ORT_LIBRARY}")
+        message(FATAL_ERROR
+                "OMNI_T2W_ENABLE_NATIVE_FRONTEND requires OMNI_T2W_ORT_LIBRARY "
+                "to point to an ONNX Runtime shared library")
+    endif()
+    target_compile_definitions(omni PRIVATE OMNI_T2W_ENABLE_NATIVE_FRONTEND=1)
+    target_include_directories(omni PRIVATE "${OMNI_T2W_ORT_INCLUDE_DIR}")
+    target_link_libraries(omni PRIVATE "${OMNI_T2W_ORT_LIBRARY}")
+endif()
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
 if(ENABLE_COREML)
@@ -259,3 +289,25 @@ if(ENABLE_COREML)
     target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
     target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
 endif()
+
+    set(TARGET_T2W_PROMPT_BUNDLE_TEST test-token2wav-prompt-bundle)
+    add_executable(${TARGET_T2W_PROMPT_BUNDLE_TEST} test/test-token2wav-prompt-bundle.cpp)
+    target_link_libraries(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_PROMPT_BUNDLE_TEST} COMMAND ${TARGET_T2W_PROMPT_BUNDLE_TEST})
+    set_tests_properties(${TARGET_T2W_PROMPT_BUNDLE_TEST} PROPERTIES LABELS "main;omni;tts")
+
+    set(TARGET_T2W_FRONTEND_TEST test-token2wav-frontend)
+    add_executable(${TARGET_T2W_FRONTEND_TEST} test/test-token2wav-frontend.cpp)
+    target_link_libraries(${TARGET_T2W_FRONTEND_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_FRONTEND_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_FRONTEND_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_FRONTEND_TEST} COMMAND ${TARGET_T2W_FRONTEND_TEST})
+    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES LABELS "main;omni;tts")
+
+    set(TARGET_T2W_SESSION_TEST test-token2wav-session)
+    add_executable(${TARGET_T2W_SESSION_TEST} test/test-token2wav-session.cpp)
+    target_link_libraries(${TARGET_T2W_SESSION_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_SESSION_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_SESSION_TEST} PRIVATE cxx_std_17)

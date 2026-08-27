@@ -173,9 +173,25 @@ static void stop_reusable_octx_threads(omni_context * octx) {
 // Wipe per-session state on a reused context: stop threads, reset counters/flags,
 // clear LLM/TTS/whisper KV caches, so the next session starts clean on the same
 // loaded model. Used by the shared-octx reuse path in create_session_octx.
-static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
+static bool reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
                                    const std::string & output_dir) {
     stop_reusable_octx_threads(octx);
+
+    // A reused context must not carry a dynamic voice into a session that did
+    // not provide a new reference audio. Restore the static cache before
+    // deleting the old temporary WAV so a failed reset cannot silently leave
+    // the session using the previous voice.
+    if (init.use_tts && init.tts_ref_audio_b64.empty()) {
+        if (!omni_reset_tts_reference_audio(octx)) {
+            LOG_ERR("reset_octx_for_session: failed to restore default TTS voice\n");
+            return false;
+        }
+    } else if (octx->tts_ref_audio_owned && !octx->tts_ref_audio_path.empty()) {
+        fs::remove(octx->tts_ref_audio_path);
+    }
+    octx->tts_ref_audio_path.clear();
+    octx->tts_ref_audio_owned = false;
+    octx->ref_audio_path.clear();
 
     const bool duplex_mode = (init.mode == "full_duplex");
     octx->async = true;
@@ -228,6 +244,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
     }
+    return true;
 }
 
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
@@ -536,7 +553,10 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     // Reuse the server-owned context if it matches this session's mode (avoids
     // reloading the model); otherwise tear it down and build a fresh one.
     if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
-        reset_octx_for_session(shared_octx, init, output_dir);
+        if (!reset_octx_for_session(shared_octx, init, output_dir)) {
+            LOG_ERR("create_session_octx: failed to reset reused context\n");
+            return nullptr;
+        }
         apply_session_config(p, shared_octx, init);
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
                 duplex_mode, output_dir.c_str());
@@ -665,17 +685,50 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         return;
     }
 
-    // Full-duplex requires index=0 prefill before the first frame. This
-    // initializes the system prompt and starts the duplex encoder/LLM pipeline.
-    if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
-        std::string voice_wav;
-        if (!parsed_init.ref_audio_b64.empty()) {
-            voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+    if (parsed_init.use_tts &&
+        parsed_init.ref_audio_b64.empty() &&
+        parsed_init.tts_ref_audio_b64.empty() &&
+        octx->use_python_token2wav) {
+        if (!omni_set_tts_reference_audio(
+                octx, "tools/omni/assets/default_ref_audio/default_ref_audio.wav")) {
+            fail_fast(session_id, "tts_voice_prepare_failed");
+            return;
         }
-        if (!parsed_init.ref_audio_b64.empty() && voice_wav.empty()) {
+    }
+
+    std::string voice_wav;
+    std::string tts_voice_wav;
+    if (!parsed_init.ref_audio_b64.empty()) {
+        voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+        if (voice_wav.empty()) {
             fail_fast(session_id, "voice_audio_decode_failed");
             return;
         }
+        octx->ref_audio_path = voice_wav;
+    }
+    if (!parsed_init.tts_ref_audio_b64.empty()) {
+        tts_voice_wav = TempMediaFiles::write_audio_wav(
+            parsed_init.tts_ref_audio_b64, temp_dir, msg_counter++);
+        if (tts_voice_wav.empty()) {
+            if (!voice_wav.empty()) fs::remove(voice_wav);
+            fail_fast(session_id, "tts_voice_audio_decode_failed");
+            return;
+        }
+        octx->tts_ref_audio_path = tts_voice_wav;
+        octx->tts_ref_audio_owned = true;
+        if (parsed_init.use_tts && !omni_set_tts_reference_audio(octx, tts_voice_wav)) {
+            if (!voice_wav.empty()) fs::remove(voice_wav);
+            fs::remove(tts_voice_wav);
+            octx->tts_ref_audio_path.clear();
+            octx->tts_ref_audio_owned = false;
+            fail_fast(session_id, "tts_voice_prepare_failed");
+            return;
+        }
+    }
+
+    // Full-duplex requires index=0 prefill before the first frame. This
+    // initializes the system prompt and starts the duplex encoder/LLM pipeline.
+    if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
         std::lock_guard<std::mutex> lock(octx_mutex);
         if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
             LOG_ERR("WS /backend: voice prefill failed\n");

@@ -133,8 +133,13 @@ static void stop_python_t2w_service(struct omni_context * ctx_omni);
 static bool send_python_t2w_command(struct omni_context * ctx_omni, const std::string& cmd_json, std::string& response);
 static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::string& device);
 static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::string& ref_audio_path);
+static bool prepare_python_t2w_prompt_bundle(struct omni_context * ctx_omni,
+                                             const std::string & ref_audio_path,
+                                             const std::string & output_dir);
+static std::string json_escape_string(const std::string & value);
 static bool process_python_t2w_tokens(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, bool last_chunk, const std::string& output_path, double& inference_time_ms, double& audio_duration);
 static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
+static std::atomic<uint64_t> g_tts_prompt_bundle_counter{0};
 
 static bool read_wav_pcm16_data(const std::string & wav_path, std::vector<int16_t> & pcm) {
     FILE * f = fopen(wav_path.c_str(), "rb");
@@ -3995,6 +4000,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->media_type = media_type;
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
+    ctx_omni->token2wav_device = token2wav_device;
     ctx_omni->strict_runtime_config = strict_runtime_config;
     if (runtime_config != nullptr) {
         token2wav_threads = runtime_config->token2wav_threads;
@@ -4475,25 +4481,31 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Python T2W 脚本目录：tools/omni/pyt2w/
         // Python T2W 模型目录：dependencies/token2wav/
         
-        // 计算 Python T2W 脚本目录（相对于 tts_bin_dir）
-        // tts_bin_dir 通常是 /xxx/tools/omni/convert/gguf/token2wav-gguf
-        // 我们需要 /xxx/tools/omni/pyt2w
-        std::string t2w_script_dir = tts_bin_dir;  // /xxx/tools/omni/convert/gguf/token2wav-gguf
-        // 回退到 tools/omni/
-        size_t convert_pos = t2w_script_dir.find("/convert/gguf/tts");
-        if (convert_pos != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
-        } else if ((convert_pos = t2w_script_dir.find("/convert/gguf")) != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
-        } else {
-            // 尝试从当前工作目录构建
-            t2w_script_dir = "./tools/omni/pyt2w";
+        // Resolve the sidecar directory from an explicit deployment path first.
+        const char * env_python_t2w_script_dir = getenv("PYTHON_T2W_SCRIPT_DIR");
+        std::string t2w_script_dir =
+            env_python_t2w_script_dir && env_python_t2w_script_dir[0] != '\0'
+                ? env_python_t2w_script_dir
+                : tts_bin_dir;
+        if (env_python_t2w_script_dir == nullptr || env_python_t2w_script_dir[0] == '\0') {
+            size_t convert_pos = t2w_script_dir.find("/convert/gguf/tts");
+            if (convert_pos != std::string::npos) {
+                t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
+            } else if ((convert_pos = t2w_script_dir.find("/convert/gguf")) != std::string::npos) {
+                t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
+            } else {
+                t2w_script_dir = "./tools/omni/pyt2w";
+            }
         }
         ctx_omni->python_t2w_script_dir = t2w_script_dir;
         
         // Python T2W 模型目录（stepaudio2 模型）
         // 默认路径：相对于 script_dir 的 token2wav 子目录
-        ctx_omni->python_t2w_model_dir = t2w_script_dir + "/token2wav";
+        const char * env_python_t2w_model_dir = getenv("PYTHON_T2W_MODEL_DIR");
+        ctx_omni->python_t2w_model_dir =
+            env_python_t2w_model_dir && env_python_t2w_model_dir[0] != '\0'
+                ? env_python_t2w_model_dir
+                : t2w_script_dir + "/token2wav";
         
         // 参考音频路径
         std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
@@ -4859,6 +4871,12 @@ void omni_free(struct omni_context * ctx_omni) {
         // 🔧 停止 Python Token2Wav 服务
         if (ctx_omni->python_t2w_initialized) {
             stop_python_t2w_service(ctx_omni);
+        }
+
+        if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+            std::remove(ctx_omni->tts_ref_audio_path.c_str());
+            ctx_omni->tts_ref_audio_path.clear();
+            ctx_omni->tts_ref_audio_owned = false;
         }
         
         // Free ggml-based projector model
@@ -8494,6 +8512,7 @@ static void stop_python_t2w_service(struct omni_context * ctx_omni) {
     }
     
     ctx_omni->python_t2w_initialized = false;
+    ctx_omni->python_t2w_model_initialized = false;
     print_with_timestamp("Python T2W: 服务已停止\n");
 }
 
@@ -8523,6 +8542,9 @@ static bool send_python_t2w_command(struct omni_context * ctx_omni, const std::s
 
 // 初始化 Python Token2Wav 模型
 static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::string& device) {
+    if (ctx_omni->python_t2w_model_initialized) {
+        return true;
+    }
     if (!ctx_omni->python_t2w_initialized) {
         if (!start_python_t2w_service(ctx_omni)) {
             return false;
@@ -8538,10 +8560,11 @@ static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::str
     
     // 发送 init 命令
     // 🔧 使用 float16 以节省显存（已在 token2wav_service.py 中修复 dtype bug）
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), 
-             "{\"cmd\":\"init\",\"model_dir\":\"%s\",\"device\":\"%s\",\"float16\":true,\"n_timesteps\":5}",
-             ctx_omni->python_t2w_model_dir.c_str(), python_device.c_str());
+    const std::string cmd =
+        "{\"cmd\":\"init\",\"model_dir\":\"" +
+        json_escape_string(ctx_omni->python_t2w_model_dir) +
+        "\",\"device\":\"" + json_escape_string(python_device) +
+        "\",\"float16\":true,\"n_timesteps\":5}";
     
     std::string response;
     if (!send_python_t2w_command(ctx_omni, cmd, response)) {
@@ -8550,14 +8573,41 @@ static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::str
     }
     
     print_with_timestamp("Python T2W init 响应: %s\n", response.c_str());
-    return response.find("\"status\":\"ok\"") != std::string::npos || 
-           response.find("\"status\": \"ok\"") != std::string::npos;
+    const bool ok = response.find("\"status\":\"ok\"") != std::string::npos ||
+                    response.find("\"status\": \"ok\"") != std::string::npos;
+    ctx_omni->python_t2w_model_initialized = ok;
+    return ok;
+}
+
+static std::string json_escape_string(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (const unsigned char c : value) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    escaped += buf;
+                } else {
+                    escaped.push_back((char) c);
+                }
+                break;
+        }
+    }
+    return escaped;
 }
 
 // 设置参考音频
 static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::string& ref_audio_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"set_ref_audio\",\"ref_audio_path\":\"%s\"}", ref_audio_path.c_str());
+    const std::string cmd =
+        "{\"cmd\":\"set_ref_audio\",\"ref_audio_path\":\"" +
+        json_escape_string(ref_audio_path) + "\"}";
     
     std::string response;
     if (!send_python_t2w_command(ctx_omni, cmd, response)) {
@@ -8566,6 +8616,25 @@ static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::
     }
     
     print_with_timestamp("Python T2W set_ref_audio 响应: %s\n", response.c_str());
+    return response.find("\"status\":\"ok\"") != std::string::npos ||
+           response.find("\"status\": \"ok\"") != std::string::npos;
+}
+
+static bool prepare_python_t2w_prompt_bundle(struct omni_context * ctx_omni,
+                                             const std::string & ref_audio_path,
+                                             const std::string & output_dir) {
+    const std::string cmd =
+        "{\"cmd\":\"prepare_prompt_bundle\",\"ref_audio_path\":\"" +
+        json_escape_string(ref_audio_path) +
+        "\",\"output_dir\":\"" + json_escape_string(output_dir) + "\"}";
+
+    std::string response;
+    if (!send_python_t2w_command(ctx_omni, cmd, response)) {
+        LOG_ERR("Python T2W: prepare_prompt_bundle command failed\n");
+        return false;
+    }
+
+    print_with_timestamp("Python T2W prepare_prompt_bundle response: %s\n", response.c_str());
     return response.find("\"status\":\"ok\"") != std::string::npos ||
            response.find("\"status\": \"ok\"") != std::string::npos;
 }
@@ -8622,6 +8691,192 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni) {
     }
     return response.find("\"status\":\"ok\"") != std::string::npos ||
            response.find("\"status\": \"ok\"") != std::string::npos;
+}
+
+static void configure_python_t2w_gpu_for_frontend(struct omni_context * ctx_omni) {
+    if (!ctx_omni->python_t2w_gpu_id.empty()) {
+        return;
+    }
+
+    const char * env_gpu = getenv("PYTHON_T2W_GPU");
+    if (env_gpu && env_gpu[0] != '\0') {
+        ctx_omni->python_t2w_gpu_id = env_gpu;
+        return;
+    }
+
+    const char * env_visible = getenv("CUDA_VISIBLE_DEVICES");
+    if (env_visible && env_visible[0] != '\0') {
+        return;
+    }
+
+    if (ctx_omni->token2wav_device.find("gpu") == std::string::npos) {
+        return;
+    }
+
+    const size_t colon = ctx_omni->token2wav_device.find(':');
+    ctx_omni->python_t2w_gpu_id =
+        colon == std::string::npos ? "0" : ctx_omni->token2wav_device.substr(colon + 1);
+}
+
+static void remove_prompt_bundle_dir(const std::string & dir) {
+    static const char * const files[] = {
+        "spk_f32.bin",
+        "prompt_tokens_i32.bin",
+        "prompt_mel_btc_f32.bin",
+        "manifest.json",
+    };
+    for (const char * file : files) {
+        const std::string path = dir + "/" + file;
+        std::remove(path.c_str());
+    }
+#ifdef _WIN32
+    _rmdir(dir.c_str());
+#else
+    rmdir(dir.c_str());
+#endif
+}
+
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_set_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (tts_ref_audio_path.empty()) {
+        return true;
+    }
+    if (!ctx_omni->use_tts) {
+        ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+        return true;
+    }
+
+    FILE * probe = fopen(tts_ref_audio_path.c_str(), "rb");
+    if (!probe) {
+        LOG_ERR("omni_set_tts_reference_audio: reference audio not found: %s\n",
+                tts_ref_audio_path.c_str());
+        return false;
+    }
+    fclose(probe);
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+
+    if (ctx_omni->use_python_token2wav) {
+        configure_python_t2w_gpu_for_frontend(ctx_omni);
+        if (!ctx_omni->python_t2w_initialized &&
+            !start_python_t2w_service(ctx_omni)) {
+            LOG_ERR("omni_set_tts_reference_audio: Python frontend service unavailable\n");
+            return false;
+        }
+        if (!ctx_omni->python_t2w_model_initialized &&
+            !init_python_t2w_model(ctx_omni, ctx_omni->token2wav_device)) {
+            LOG_ERR("omni_set_tts_reference_audio: Python frontend model initialization failed\n");
+            return false;
+        }
+        if (!set_python_t2w_ref_audio(ctx_omni, tts_ref_audio_path)) {
+            LOG_ERR("omni_set_tts_reference_audio: Python Token2Wav rejected reference audio\n");
+            return false;
+        }
+        ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+        return true;
+    }
+
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        LOG_ERR("omni_set_tts_reference_audio: C++ Token2Wav is not initialized\n");
+        return false;
+    }
+
+    const char * native_speech_tokenizer = std::getenv("OMNI_T2W_SPEECH_TOKENIZER_ONNX");
+    const char * native_campplus          = std::getenv("OMNI_T2W_CAMPPLUS_ONNX");
+    if (native_speech_tokenizer && native_speech_tokenizer[0] != '\0' &&
+        native_campplus && native_campplus[0] != '\0') {
+        int frontend_threads = 1;
+        if (const char * configured_threads = std::getenv("OMNI_T2W_FRONTEND_THREADS")) {
+            const int parsed_threads = std::atoi(configured_threads);
+            if (parsed_threads > 0) {
+                frontend_threads = parsed_threads;
+            }
+        }
+        if (!ctx_omni->token2wav_session->set_prompt_wav(
+                tts_ref_audio_path, native_speech_tokenizer, native_campplus, frontend_threads, 5, 1.0f)) {
+            LOG_ERR("omni_set_tts_reference_audio: native Token2Wav frontend failed; "
+                    "configured native frontend is not falling back to Python\n");
+            return false;
+        }
+        ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+        ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+        return true;
+    }
+
+    configure_python_t2w_gpu_for_frontend(ctx_omni);
+    if (!ctx_omni->python_t2w_initialized &&
+        !start_python_t2w_service(ctx_omni)) {
+        LOG_ERR("omni_set_tts_reference_audio: Python frontend service unavailable\n");
+        return false;
+    }
+    if (!ctx_omni->python_t2w_model_initialized &&
+        !init_python_t2w_model(ctx_omni, ctx_omni->token2wav_device)) {
+        LOG_ERR("omni_set_tts_reference_audio: Python frontend model initialization failed\n");
+        return false;
+    }
+
+    const uint64_t bundle_id = g_tts_prompt_bundle_counter.fetch_add(1);
+    const std::string bundle_dir =
+        ctx_omni->base_output_dir + "/.tts_prompt_bundle_" + std::to_string(bundle_id);
+    if (!cross_platform_mkdir_p(bundle_dir)) {
+        LOG_ERR("omni_set_tts_reference_audio: failed to create bundle directory: %s\n",
+                bundle_dir.c_str());
+        return false;
+    }
+
+    bool ok = prepare_python_t2w_prompt_bundle(ctx_omni, tts_ref_audio_path, bundle_dir);
+    if (ok) {
+        ok = ctx_omni->token2wav_session->set_prompt_bundle(bundle_dir, 5, 1.0f);
+    }
+    remove_prompt_bundle_dir(bundle_dir);
+
+    if (!ok) {
+        LOG_ERR("omni_set_tts_reference_audio: C++ Token2Wav rejected PromptBundle\n");
+        return false;
+    }
+
+    ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
+}
+
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_reset_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (!ctx_omni->use_tts) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+
+    bool ok = false;
+    if (ctx_omni->use_python_token2wav) {
+        ok = reset_python_t2w_cache(ctx_omni);
+    } else if (ctx_omni->token2wav_initialized && ctx_omni->token2wav_session) {
+        const std::string prompt_cache_gguf = ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
+        ok = ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(prompt_cache_gguf, 5, 1.0f);
+    } else {
+        LOG_ERR("omni_reset_tts_reference_audio: Token2Wav is not initialized\n");
+    }
+
+    if (!ok) {
+        LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
+        return false;
+    }
+
+    if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+        std::remove(ctx_omni->tts_ref_audio_path.c_str());
+    }
+    ctx_omni->tts_ref_audio_path.clear();
+    ctx_omni->tts_ref_audio_owned = false;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
 }
 
 // ======================= Token2Wav 线程函数 =======================
