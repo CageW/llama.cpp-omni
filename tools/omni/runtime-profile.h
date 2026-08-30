@@ -55,7 +55,6 @@ struct effective_runtime_config {
     std::string              primary_device_description;
     uint64_t                 primary_device_free_memory  = 0;
     uint64_t                 primary_device_total_memory = 0;
-    uint64_t                 estimated_required_memory   = 0;
     std::string              llm_model;
     std::string              llm_quantization;
     std::string              llm_device;
@@ -75,13 +74,7 @@ struct effective_runtime_config {
     bool                     duplex_mode      = false;
     bool                     async_mode       = false;
     bool                     vpm_batch_encode = false;
-    std::string              autotune_cache_status;
-    std::string              autotune_cache_reason;
-    std::string              autotune_selected_candidate;
-    bool                     output_consistent_with_baseline = false;
-    bool                     audio_semantics_verified = false;
     std::vector<module_placement> placements;
-    std::vector<std::string> fallback_reasons;
 };
 
 struct runtime_profile_overrides {
@@ -111,6 +104,11 @@ runtime_profile_result resolve_runtime_profile(const std::string &              
                                                const hardware_snapshot &         hardware,
                                                const model_inventory &           inventory,
                                                const runtime_profile_overrides & overrides = {});
+
+runtime_profile_result resolve_runtime_profile_from_config(const std::string &               config_path,
+                                                           const hardware_snapshot &         hardware,
+                                                           const model_inventory &           inventory,
+                                                           const runtime_profile_overrides & overrides = {});
 
 std::string format_effective_runtime_config(const effective_runtime_config & config);
 

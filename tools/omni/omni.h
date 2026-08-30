@@ -159,7 +159,6 @@ struct projector_model {
 // ============================================================================
 using audio_output_cb_t = std::function<void(const float * samples, int n_samples, int sample_rate, bool is_final)>;
 using tts_token_output_cb_t = std::function<void(const int32_t * tokens, size_t count, bool is_final)>;
-using runtime_memory_observer_t = std::function<void(const std::string & checkpoint)>;
 
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
@@ -504,8 +503,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output",
                                 const omni::effective_runtime_config * runtime_config = nullptr,
                                 bool strict_runtime_config = false,
-                                int token2wav_threads = 8,
-                                const runtime_memory_observer_t & memory_observer = nullptr);
+                                int token2wav_threads = 8);
 
 void omni_free(struct omni_context * ctx_omni);
 
@@ -520,10 +518,6 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
-
-// Reset per-turn state after an autotune warmup while keeping loaded models and
-// the long-lived duplex/TTS workers available for the measured turn.
-bool omni_reset_calibration_state(struct omni_context * ctx_omni);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);

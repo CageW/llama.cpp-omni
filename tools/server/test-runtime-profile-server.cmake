@@ -23,11 +23,53 @@ foreach(relative_path IN ITEMS
     file(WRITE "${TEST_ROOT}/${relative_path}" "test")
 endforeach()
 
+# Keep this smoke fixture backend-portable; primary resolves to the first
+# visible accelerator on CUDA, Metal, and other GGML backends.
+file(WRITE "${TEST_ROOT}/omni-runtime-profile.json" [=[
+{
+  "schema_version": 1,
+  "profile": "auto",
+  "llm": {
+    "model": "MiniCPM-o-4_5-F16.gguf",
+    "quantization": "F16",
+    "device": "primary",
+    "n_gpu_layers": -2
+  },
+  "vision": {
+    "model": "vision/MiniCPM-o-4_5-vision-F16.gguf",
+    "device": "primary"
+  },
+  "audio": {
+    "model": "audio/MiniCPM-o-4_5-audio-F16.gguf",
+    "device": "primary"
+  },
+  "tts": {
+    "model": "tts/MiniCPM-o-4_5-tts-F16.gguf",
+    "device": "primary",
+    "gpu_layers": -1
+  },
+  "projector": {
+    "model": "tts/MiniCPM-o-4_5-projector-F16.gguf",
+    "device": "primary"
+  },
+  "token2wav": {
+    "model_dir": "token2wav-gguf",
+    "device": "primary",
+    "threads": 8
+  },
+  "runtime": {
+    "n_ctx": 8192,
+    "duplex": true,
+    "async": true,
+    "vpm_batch_encode": true
+  }
+}
+]=])
+
 execute_process(
     COMMAND "${OMNI_SERVER}"
         --profile auto
         --model-dir "${TEST_ROOT}"
-        --autotune-cache "${TEST_ROOT}/missing-autotune.json"
         --print-effective-config
     RESULT_VARIABLE result
     OUTPUT_VARIABLE stdout
@@ -42,8 +84,8 @@ endif()
 if(NOT stdout MATCHES "profile=auto")
     message(FATAL_ERROR "effective config did not contain profile=auto\nstdout:\n${stdout}")
 endif()
-if(NOT stdout MATCHES "resolved_profile=full_omni_")
-    message(FATAL_ERROR "effective config did not contain a resolved full Omni profile\nstdout:\n${stdout}")
+if(NOT stdout MATCHES "resolved_profile=static_config")
+    message(FATAL_ERROR "effective config did not identify the static profile config\nstdout:\n${stdout}")
 endif()
 if(NOT stdout MATCHES "token2wav_model_dir=${TEST_ROOT}/token2wav-gguf")
     message(FATAL_ERROR "effective config did not contain the Token2Wav model directory\nstdout:\n${stdout}")
@@ -57,30 +99,23 @@ endif()
 if(NOT stdout MATCHES "placement=token2wav,")
     message(FATAL_ERROR "effective config did not contain the Token2Wav placement\nstdout:\n${stdout}")
 endif()
-if(NOT stdout MATCHES "autotune_cache=missing")
-    message(FATAL_ERROR "normal startup did not report the missing autotune cache\nstdout:\n${stdout}")
-endif()
 
+file(REMOVE "${TEST_ROOT}/omni-runtime-profile.json")
 execute_process(
     COMMAND "${OMNI_SERVER}"
         --profile auto
         --model-dir "${TEST_ROOT}"
-        --autotune refresh
-        --autotune-cache "${TEST_ROOT}/refresh-autotune.json"
-    RESULT_VARIABLE refresh_result
-    OUTPUT_VARIABLE refresh_stdout
-    ERROR_VARIABLE refresh_stderr
+        --print-effective-config
+    RESULT_VARIABLE missing_config_result
+    OUTPUT_VARIABLE missing_config_stdout
+    ERROR_VARIABLE missing_config_stderr
     TIMEOUT 20
 )
-
-if(refresh_result EQUAL 0)
-    message(FATAL_ERROR "autotune refresh unexpectedly succeeded with fake model files\nstdout:\n${refresh_stdout}\nstderr:\n${refresh_stderr}")
+if(missing_config_result EQUAL 0)
+    message(FATAL_ERROR "missing profile config was accepted\nstdout:\n${missing_config_stdout}\nstderr:\n${missing_config_stderr}")
 endif()
-if(refresh_stdout MATCHES "Omni HTTP server starting" OR refresh_stderr MATCHES "Omni HTTP server starting")
-    message(FATAL_ERROR "autotune refresh entered the HTTP server path\nstdout:\n${refresh_stdout}\nstderr:\n${refresh_stderr}")
-endif()
-if(NOT refresh_stderr MATCHES "autotune calibration failed")
-    message(FATAL_ERROR "autotune refresh failure was not actionable\nstderr:\n${refresh_stderr}")
+if(NOT missing_config_stderr MATCHES "profile config file")
+    message(FATAL_ERROR "missing profile config error was not actionable\nstderr:\n${missing_config_stderr}")
 endif()
 
 execute_process(

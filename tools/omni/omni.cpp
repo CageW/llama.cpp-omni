@@ -3985,8 +3985,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir,
                                 const omni::effective_runtime_config * runtime_config,
                                 bool strict_runtime_config,
-                                int token2wav_threads,
-                                const runtime_memory_observer_t & memory_observer) {
+                                int token2wav_threads) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -4009,9 +4008,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         LOG_ERR("%s: token2wav_threads must be positive\n", __func__);
         delete ctx_omni;
         return NULL;
-    }
-    if (memory_observer) {
-        memory_observer("before_load");
     }
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
@@ -4112,10 +4108,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->ctx_llama = ctx_llama;
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
-    if (memory_observer) {
-        memory_observer("after_llm");
-    }
-
     if (use_tts && !params->tts_model.empty()) {
         print_with_timestamp("=== omni_init: loading TTS model\n");
         // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
@@ -4184,13 +4176,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             return NULL;
         }
         print_with_timestamp("TTS: weights loaded successfully\n");
-        if (memory_observer) {
-            memory_observer("after_tts");
-        }
-        
-        // Load Projector Semantic from GGUF file
-        // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
-        std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
+        // Load Projector Semantic from the profile-provided path when available.
+        std::string projector_path = params->projector_model.empty()
+                                          ? tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf"
+                                          : params->projector_model;
         print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
         const std::string projector_device = omni_runtime_module_device(runtime_config, "projector");
         if (projector_init(ctx_omni->projector, projector_path,
@@ -4204,9 +4193,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 omni_free(ctx_omni);
                 return NULL;
             }
-        }
-        if (memory_observer) {
-            memory_observer("after_projector");
         }
     }
 
@@ -4246,10 +4232,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         delete ctx_omni;
         return NULL;
     }
-    if (memory_observer) {
-        memory_observer("after_audio");
-    }
-
     ctx_omni->n_past = 0;
     
     if (media_type == 2) {
@@ -4285,10 +4267,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
         }
     }
-    if (memory_observer) {
-        memory_observer("after_vision");
-    }
-    
     ctx_omni->llm_thread_info = new LLMThreadInfo(1000);
     if (ctx_omni->use_tts) {
         LOG_INF("init tts....");
@@ -4475,10 +4453,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             omni_free(ctx_omni);
             return NULL;
         }
-        if (memory_observer) {
-            memory_observer("after_token2wav");
-        }
-        
         // ==================== 初始化 Python Token2Wav ====================
         // 🔧 默认使用 Python Token2Wav（精度更高）
         // 设置 Python T2W 脚本目录和模型目录
@@ -4776,45 +4750,6 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
     }
 
     print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
-}
-
-bool omni_reset_calibration_state(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr || ctx_omni->duplex_session != nullptr || !omni_tts_queues_empty(ctx_omni)) {
-        return false;
-    }
-
-    clean_kvcache(ctx_omni);
-    common_sampler_reset(ctx_omni->ctx_sampler);
-    if (ctx_omni->ctx_tts_sampler != nullptr) {
-        common_sampler_reset(ctx_omni->ctx_tts_sampler);
-    }
-
-    if (ctx_omni->ctx_tts_llama != nullptr) {
-        llama_memory_t memory = llama_get_memory(ctx_omni->ctx_tts_llama);
-        if (memory != nullptr) {
-            llama_memory_clear(memory, false);
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
-        ctx_omni->text_queue.clear();
-        ctx_omni->text_done_flag = false;
-        ctx_omni->text_streaming = false;
-    }
-    ctx_omni->token2wav_buffer = { 4218, 4218, 4218 };
-    ctx_omni->token2wav_wav_idx = 0;
-    ctx_omni->wav_turn_base = 0;
-    ctx_omni->simplex_round_idx = 0;
-    ctx_omni->force_listen_used = 0;
-    ctx_omni->current_turn_ended = true;
-    ctx_omni->ended_with_listen.store(false);
-    ctx_omni->slide_last_was_listen.store(true);
-    ctx_omni->llm_generation_done.store(false);
-    ctx_omni->break_event.store(false);
-    ctx_omni->session_stop_event.store(false);
-    ctx_omni->speek_done = true;
-    return true;
 }
 
 void omni_free(struct omni_context * ctx_omni) {
@@ -12053,8 +11988,9 @@ bool omni_duplex_session_end(struct omni_context * ctx_omni, int timeout_ms) {
         }
     }
 
-    // calibration timeout 后只取消尚未被 worker 取走的 frame。已经进入 backend
-    // inference 的调用不能从外部中断，break_event 会让 pipeline 在下一个检查点退出。
+    // On timeout, cancel frames that have not entered the backend yet. An
+    // inference call already in progress cannot be interrupted externally;
+    // break_event makes the pipeline exit at its next checkpoint.
     if (!drained) {
         ctx_omni->break_event.store(true);
     }

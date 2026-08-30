@@ -1114,47 +1114,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
     add_opt(common_arg(
-        {"--autotune"}, "MODE",
-        "run Omni runtime calibration and exit (supported: refresh)",
+        {"--profile-config"}, "PATH",
+        "static JSON runtime profile read by --profile auto (default: MODEL_DIR/omni-runtime-profile.json)",
         [](common_params & params, const std::string & value) {
-            if (value != "refresh") {
-                throw std::invalid_argument("unsupported Omni autotune mode: " + value);
-            }
-            params.omni_runtime_profile.autotune = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
-    add_opt(common_arg(
-        {"--autotune-cache"}, "PATH",
-        "override the versioned Omni runtime autotune cache path",
-        [](common_params & params, const std::string & value) {
-            params.omni_runtime_profile.autotune_cache = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
-    add_opt(common_arg(
-        {"--autotune-rounds"}, "N",
-        "number of measured rounds per Omni runtime autotune candidate (default: 3, range: 1-10)",
-        [](common_params & params, int value) {
-            if (value < 1 || value > 10) {
-                throw std::invalid_argument("--autotune-rounds must be between 1 and 10");
-            }
-            params.omni_runtime_profile.autotune_rounds = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
-    add_opt(common_arg(
-        {"--autotune-warmup-rounds"}, "N",
-        "number of warmup turns before each measured Omni runtime autotune round (default: 1, range: 0-3)",
-        [](common_params & params, int value) {
-            if (value < 0 || value > 3) {
-                throw std::invalid_argument("--autotune-warmup-rounds must be between 0 and 3");
-            }
-            params.omni_runtime_profile.autotune_warmup_rounds = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
-    add_opt(common_arg(
-        {"--autotune-allow-quantized"},
-        "allow a quantized LLM candidate to replace the Phase 2 precision baseline",
-        [](common_params & params) {
-            params.omni_runtime_profile.autotune_allow_quantized = true;
+            params.omni_runtime_profile.profile_config = value;
         }
     ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
     add_opt(common_arg(

@@ -395,12 +395,8 @@ struct common_params_diffusion {
 struct common_params_omni_runtime_profile {
     std::string profile;
     std::string model_dir;
-    std::string autotune;
-    std::string autotune_cache;
-    int32_t autotune_rounds = 3;
-    int32_t autotune_warmup_rounds = 1;
+    std::string profile_config;
     int32_t token2wav_threads = 8;
-    bool autotune_allow_quantized = false;
     bool print_effective_config = false;
     bool model_explicit = false;
     bool n_gpu_layers_explicit = false;

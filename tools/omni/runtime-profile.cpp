@@ -2,14 +2,15 @@
 
 #include "ggml-backend.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 
 namespace omni {
-
-static constexpr uint64_t GiB = 1024ULL * 1024ULL * 1024ULL;
 
 static std::string existing_file(const std::filesystem::path & root, const std::filesystem::path & relative_path) {
     const auto      path = root / relative_path;
@@ -73,13 +74,6 @@ hardware_snapshot detect_hardware_snapshot() {
     return snapshot;
 }
 
-static std::string memory_rejection_reason(const std::string & quantization, uint64_t required, uint64_t available) {
-    std::ostringstream message;
-    message << quantization << " rejected: estimated " << required / GiB << " GiB exceeds " << available / GiB
-            << " GiB free memory";
-    return message.str();
-}
-
 static std::vector<const runtime_device *> accelerator_devices(const hardware_snapshot & hardware) {
     std::vector<const runtime_device *> devices;
     for (const auto & device : hardware.devices) {
@@ -119,11 +113,21 @@ static const runtime_device * find_device(const hardware_snapshot & hardware, co
 
 static std::string normalize_device(const std::string & requested,
                                     const hardware_snapshot & hardware,
-                                    const runtime_device * primary,
                                     const std::string & module,
                                     std::string & error) {
+    const auto accelerators = accelerator_devices(hardware);
+    const runtime_device * primary = accelerators.empty() ? nullptr : accelerators.front();
     if (requested.empty() || requested == "cpu") {
         return requested.empty() ? "cpu" : requested;
+    }
+    if (requested == "primary" || requested == "secondary") {
+        const size_t index = requested == "primary" ? 0 : 1;
+        if (index < accelerators.size()) {
+            return accelerators[index]->name;
+        }
+        error = "unsupported " + module + " placement device: " + requested +
+                " (the requested accelerator is not available)";
+        return {};
     }
     if (requested == "gpu") {
         if (primary != nullptr) {
@@ -159,89 +163,6 @@ static void add_module_placement(effective_runtime_config & config,
                                   device == "cpu" ? "cpu" : "gpu", execution, "active" });
 }
 
-static void apply_accelerator_defaults(effective_runtime_config & config, const runtime_device & primary) {
-    config.primary_device_name         = primary.name;
-    config.primary_device_description  = primary.description;
-    config.primary_device_free_memory  = primary.free_memory;
-    config.primary_device_total_memory = primary.total_memory;
-    config.llm_device                  = primary.name;
-    config.n_gpu_layers                = -2;
-    config.tts_gpu_layers              = -1;
-    config.token2wav_device            = token2wav_device_for(primary);
-    config.n_ctx                       = 8192;
-    config.duplex_mode                 = true;
-    config.async_mode                  = true;
-    config.vpm_batch_encode            = true;
-}
-
-static std::string expected_path(const model_inventory & inventory, const char * relative_path) {
-    if (inventory.root.empty()) {
-        return relative_path;
-    }
-    return inventory.root + "/" + relative_path;
-}
-
-static std::string validate_required_modules(const model_inventory & inventory) {
-    struct required_module {
-        const char *        name;
-        const std::string * path;
-        const char *        relative_path;
-    };
-
-    const required_module modules[] = {
-        { "vision",                  &inventory.vision,                  "vision/MiniCPM-o-4_5-vision-F16.gguf" },
-        { "audio",                   &inventory.audio,                   "audio/MiniCPM-o-4_5-audio-F16.gguf"   },
-        { "tts",                     &inventory.tts,                     "tts/MiniCPM-o-4_5-tts-F16.gguf"       },
-        { "projector",               &inventory.projector,               "tts/MiniCPM-o-4_5-projector-F16.gguf" },
-        { "token2wav encoder",       &inventory.token2wav_encoder,       "token2wav-gguf/encoder.gguf"          },
-        { "token2wav flow_matching", &inventory.token2wav_flow_matching, "token2wav-gguf/flow_matching.gguf"    },
-        { "token2wav flow_extra",    &inventory.token2wav_flow_extra,    "token2wav-gguf/flow_extra.gguf"       },
-        { "token2wav hifigan2",      &inventory.token2wav_hifigan,       "token2wav-gguf/hifigan2.gguf"         },
-        { "token2wav prompt_cache",  &inventory.token2wav_prompt_cache,  "token2wav-gguf/prompt_cache.gguf"     },
-    };
-
-    for (const auto & module : modules) {
-        if (module.path->empty()) {
-            return std::string("missing required ") + module.name +
-                   " model: " + expected_path(inventory, module.relative_path);
-        }
-    }
-    return {};
-}
-
-static void apply_cpu_defaults(effective_runtime_config & config) {
-    config.llm_device       = "cpu";
-    config.n_gpu_layers     = 0;
-    config.tts_gpu_layers   = 0;
-    config.token2wav_device = "cpu";
-    config.n_ctx            = 4096;
-    config.duplex_mode      = false;
-    config.async_mode       = true;
-    config.vpm_batch_encode = false;
-}
-
-static bool select_cpu_model(const model_inventory & inventory, effective_runtime_config & config) {
-    if (!inventory.llm_q4_k_m.empty()) {
-        config.resolved_profile = "full_omni_cpu_q4_k_m";
-        config.llm_model        = inventory.llm_q4_k_m;
-        config.llm_quantization = "Q4_K_M";
-    } else if (!inventory.llm_q8_0.empty()) {
-        config.resolved_profile = "full_omni_cpu_q8_0";
-        config.llm_model        = inventory.llm_q8_0;
-        config.llm_quantization = "Q8_0";
-    } else if (!inventory.llm_f16.empty()) {
-        config.resolved_profile = "full_omni_cpu_f16";
-        config.llm_model        = inventory.llm_f16;
-        config.llm_quantization = "F16";
-    } else {
-        return false;
-    }
-
-    config.reason = "no accelerator backend was detected; selected the smallest available CPU-compatible model";
-    apply_cpu_defaults(config);
-    return true;
-}
-
 static std::string quantization_from_path(const std::string & path) {
     std::string upper = path;
     std::transform(upper.begin(), upper.end(), upper.begin(),
@@ -258,88 +179,11 @@ static std::string quantization_from_path(const std::string & path) {
     return "UNKNOWN";
 }
 
-static bool apply_module_inventory(effective_runtime_config & config,
-                                   const model_inventory & inventory,
-                                   const hardware_snapshot & hardware,
-                                   const runtime_device * primary,
-                                   const runtime_device * secondary,
-                                   const runtime_profile_overrides & overrides,
-                                   std::string & error) {
-    config.vision_model        = inventory.vision;
-    config.audio_model         = inventory.audio;
-    config.tts_model           = inventory.tts;
-    config.projector_model     = inventory.projector;
-    config.token2wav_model_dir = inventory.token2wav_dir;
-
-    const std::string primary_device = primary ? primary->name : "cpu";
-    const std::string secondary_device = secondary ? secondary->name : primary_device;
-    const bool split_modules = primary != nullptr && secondary != nullptr;
-
-    auto choose_device = [&](const std::string & module,
-                             const std::string & default_device,
-                             const std::optional<std::string> & override) -> std::string {
-        return normalize_device(override ? *override : default_device, hardware, primary, module, error);
-    };
-
-    config.llm_device = choose_device("llm", primary_device, overrides.llm_device);
-    config.vision_device = choose_device("vision", split_modules ? secondary_device : primary_device,
-                                         overrides.vision_device);
-    config.audio_device = choose_device("audio", split_modules ? secondary_device : primary_device,
-                                        overrides.audio_device);
-    config.tts_device = choose_device("tts", primary_device, overrides.tts_device);
-    const std::string projector_device = choose_device("projector", split_modules ? secondary_device : primary_device,
-                                                       overrides.projector_device);
-    const std::string token2wav_backend_device = choose_device("token2wav", primary_device,
-                                                               overrides.token2wav_device);
-    if (!error.empty()) {
-        return false;
-    }
-
-    if (config.llm_device == "cpu") {
-        config.n_gpu_layers = 0;
-    }
-    if (config.tts_device == "cpu") {
-        config.tts_gpu_layers = 0;
-    }
-
-    config.token2wav_device = token2wav_backend_device == "cpu" ? "cpu" :
-                              (overrides.token2wav_device && overrides.token2wav_device->rfind("gpu:", 0) == 0
-                                   ? *overrides.token2wav_device
-                                   : token2wav_device_for(*find_device(hardware, token2wav_backend_device)));
-
-    config.placements.clear();
-    add_module_placement(config, "llm", config.llm_model, config.llm_quantization, config.llm_device);
-    add_module_placement(config, "vision", config.vision_model, "F16", config.vision_device);
-    add_module_placement(config, "audio", config.audio_model, "F16", config.audio_device);
-    add_module_placement(config, "tts", config.tts_model, "F16", config.tts_device);
-    add_module_placement(config, "projector", config.projector_model, "F16", projector_device);
-    add_module_placement(config, "token2wav", config.token2wav_model_dir, "F16", token2wav_backend_device);
-    return true;
-}
-
-static void apply_overrides(effective_runtime_config &        config,
-                            const runtime_profile_overrides & overrides,
-                            bool                              has_accelerator) {
+static void apply_overrides(effective_runtime_config & config, const runtime_profile_overrides & overrides) {
     if (overrides.llm_model) {
         config.llm_model        = *overrides.llm_model;
         config.llm_quantization = quantization_from_path(*overrides.llm_model);
-        if (has_accelerator) {
-            const bool multi_accelerator = config.resolved_profile.rfind("full_omni_multi_accelerator_", 0) == 0;
-            if (config.llm_quantization == "Q4_K_M") {
-                config.resolved_profile = multi_accelerator ? "full_omni_multi_accelerator_q4_k_m"
-                                                            : "full_omni_accelerator_q4_k_m";
-            } else if (config.llm_quantization == "Q8_0") {
-                config.resolved_profile = multi_accelerator ? "full_omni_multi_accelerator_q8_0"
-                                                            : "full_omni_accelerator_q8_0";
-            } else if (config.llm_quantization == "F16") {
-                config.resolved_profile = multi_accelerator ? "full_omni_multi_accelerator_f16"
-                                                            : "full_omni_accelerator_f16";
-            } else {
-                config.resolved_profile = multi_accelerator ? "full_omni_multi_accelerator_explicit"
-                                                            : "full_omni_accelerator_explicit";
-            }
-        }
-        config.reason += "; explicit LLM model override preserved";
+        config.reason += "; explicit LLM model override applied";
     }
     if (overrides.n_gpu_layers) {
         config.n_gpu_layers = *overrides.n_gpu_layers;
@@ -368,105 +212,315 @@ runtime_profile_result resolve_runtime_profile(const std::string &              
                                                const model_inventory &           inventory,
                                                const runtime_profile_overrides & overrides) {
     runtime_profile_result result;
+    (void) hardware;
+    (void) inventory;
+    (void) overrides;
     result.config.requested_profile = requested_profile;
+    result.error = requested_profile == "auto"
+                       ? "profile auto requires a static profile config file; use --profile-config or the default "
+                         "MODEL_DIR/omni-runtime-profile.json"
+                       : "unsupported runtime profile: " + requested_profile;
+    return result;
+}
+
+using profile_json = nlohmann::ordered_json;
+
+template <typename T>
+static bool read_required_profile_value(const profile_json & object,
+                                        const char *         section,
+                                        const char *         key,
+                                        T &                  value,
+                                        std::string &        error) {
+    if (!object.is_object() || !object.contains(key)) {
+        error = std::string("profile config missing required field: ") + section + "." + key;
+        return false;
+    }
+    try {
+        value = object.at(key).get<T>();
+    } catch (const std::exception & exception) {
+        error = std::string("profile config field ") + section + "." + key + " has an invalid type: " +
+                exception.what();
+        return false;
+    }
+    return true;
+}
+
+static bool read_required_profile_object(const profile_json & root,
+                                         const char *         key,
+                                         profile_json &       value,
+                                         std::string &        error) {
+    if (!root.contains(key) || !root.at(key).is_object()) {
+        error = std::string("profile config missing required object: ") + key;
+        return false;
+    }
+    value = root.at(key);
+    return true;
+}
+
+static std::string resolve_profile_model_path(const std::string & model_root, const std::string & configured_path) {
+    std::filesystem::path path(configured_path);
+    if (path.is_relative()) {
+        path = std::filesystem::path(model_root) / path;
+    }
+    return path.lexically_normal().string();
+}
+
+static bool require_profile_file(const std::string & module,
+                                 const std::string & path,
+                                 std::string &       error) {
+    std::error_code filesystem_error;
+    if (!std::filesystem::is_regular_file(path, filesystem_error)) {
+        error = "profile config " + module + " model file does not exist: " + path;
+        return false;
+    }
+    return true;
+}
+
+static bool require_profile_directory(const std::string & module,
+                                      const std::string & path,
+                                      std::string &       error) {
+    std::error_code filesystem_error;
+    if (!std::filesystem::is_directory(path, filesystem_error)) {
+        error = "profile config " + module + " model directory does not exist: " + path;
+        return false;
+    }
+    return true;
+}
+
+static bool require_non_empty_profile_value(const char * section,
+                                            const char * key,
+                                            const std::string & value,
+                                            std::string & error) {
+    if (value.empty()) {
+        error = std::string("profile config field ") + section + "." + key + " must not be empty";
+        return false;
+    }
+    return true;
+}
+
+runtime_profile_result resolve_runtime_profile_from_config(const std::string &               config_path,
+                                                           const hardware_snapshot &         hardware,
+                                                           const model_inventory &           inventory,
+                                                           const runtime_profile_overrides & overrides) {
+    runtime_profile_result result;
+    result.config.requested_profile = "auto";
+
+    if (config_path.empty()) {
+        result.error = "profile config file path is empty";
+        return result;
+    }
+    if (inventory.root.empty()) {
+        result.error = "profile config requires a model root; pass --model-dir or --model";
+        return result;
+    }
+
+    std::ifstream file(config_path);
+    if (!file.good()) {
+        result.error = "profile config file does not exist or cannot be read: " + config_path;
+        return result;
+    }
+
+    profile_json document;
+    try {
+        file >> document;
+    } catch (const std::exception & exception) {
+        result.error = "invalid profile config JSON in " + config_path + ": " + exception.what();
+        return result;
+    }
+    if (!document.is_object()) {
+        result.error = "invalid profile config JSON: root must be an object";
+        return result;
+    }
+
+    int schema_version = 0;
+    std::string profile;
+    if (!read_required_profile_value(document, "root", "schema_version", schema_version, result.error) ||
+        !read_required_profile_value(document, "root", "profile", profile, result.error)) {
+        return result;
+    }
+    if (schema_version != 1) {
+        result.error = "unsupported profile config schema_version: " + std::to_string(schema_version);
+        return result;
+    }
+    if (profile != "auto") {
+        result.error = "profile config profile must be \"auto\"";
+        return result;
+    }
+
+    profile_json llm;
+    profile_json vision;
+    profile_json audio;
+    profile_json tts;
+    profile_json projector;
+    profile_json token2wav;
+    profile_json runtime;
+    if (!read_required_profile_object(document, "llm", llm, result.error) ||
+        !read_required_profile_object(document, "vision", vision, result.error) ||
+        !read_required_profile_object(document, "audio", audio, result.error) ||
+        !read_required_profile_object(document, "tts", tts, result.error) ||
+        !read_required_profile_object(document, "projector", projector, result.error) ||
+        !read_required_profile_object(document, "token2wav", token2wav, result.error) ||
+        !read_required_profile_object(document, "runtime", runtime, result.error)) {
+        return result;
+    }
+
+    std::string llm_configured_model;
+    std::string llm_quantization;
+    std::string llm_configured_device;
+    int32_t     n_gpu_layers = 0;
+    if (!read_required_profile_value(llm, "llm", "model", llm_configured_model, result.error) ||
+        !read_required_profile_value(llm, "llm", "quantization", llm_quantization, result.error) ||
+        !read_required_profile_value(llm, "llm", "device", llm_configured_device, result.error) ||
+        !read_required_profile_value(llm, "llm", "n_gpu_layers", n_gpu_layers, result.error)) {
+        return result;
+    }
+
+    std::string vision_configured_model;
+    std::string vision_configured_device;
+    std::string audio_configured_model;
+    std::string audio_configured_device;
+    std::string tts_configured_model;
+    std::string tts_configured_device;
+    std::string projector_configured_model;
+    std::string projector_configured_device;
+    int32_t     tts_gpu_layers = 0;
+    if (!read_required_profile_value(vision, "vision", "model", vision_configured_model, result.error) ||
+        !read_required_profile_value(vision, "vision", "device", vision_configured_device, result.error) ||
+        !read_required_profile_value(audio, "audio", "model", audio_configured_model, result.error) ||
+        !read_required_profile_value(audio, "audio", "device", audio_configured_device, result.error) ||
+        !read_required_profile_value(tts, "tts", "model", tts_configured_model, result.error) ||
+        !read_required_profile_value(tts, "tts", "device", tts_configured_device, result.error) ||
+        !read_required_profile_value(tts, "tts", "gpu_layers", tts_gpu_layers, result.error) ||
+        !read_required_profile_value(projector, "projector", "model", projector_configured_model, result.error) ||
+        !read_required_profile_value(projector, "projector", "device", projector_configured_device, result.error)) {
+        return result;
+    }
+
+    std::string token2wav_configured_dir;
+    std::string token2wav_configured_device;
+    int32_t     token2wav_threads = 0;
+    if (!read_required_profile_value(token2wav, "token2wav", "model_dir", token2wav_configured_dir, result.error) ||
+        !read_required_profile_value(token2wav, "token2wav", "device", token2wav_configured_device, result.error) ||
+        !read_required_profile_value(token2wav, "token2wav", "threads", token2wav_threads, result.error)) {
+        return result;
+    }
+
+    if (!require_non_empty_profile_value("llm", "model", llm_configured_model, result.error) ||
+        !require_non_empty_profile_value("llm", "quantization", llm_quantization, result.error) ||
+        !require_non_empty_profile_value("llm", "device", llm_configured_device, result.error) ||
+        !require_non_empty_profile_value("vision", "model", vision_configured_model, result.error) ||
+        !require_non_empty_profile_value("vision", "device", vision_configured_device, result.error) ||
+        !require_non_empty_profile_value("audio", "model", audio_configured_model, result.error) ||
+        !require_non_empty_profile_value("audio", "device", audio_configured_device, result.error) ||
+        !require_non_empty_profile_value("tts", "model", tts_configured_model, result.error) ||
+        !require_non_empty_profile_value("tts", "device", tts_configured_device, result.error) ||
+        !require_non_empty_profile_value("projector", "model", projector_configured_model, result.error) ||
+        !require_non_empty_profile_value("projector", "device", projector_configured_device, result.error) ||
+        !require_non_empty_profile_value("token2wav", "model_dir", token2wav_configured_dir, result.error) ||
+        !require_non_empty_profile_value("token2wav", "device", token2wav_configured_device, result.error)) {
+        return result;
+    }
+
+    if (!read_required_profile_value(runtime, "runtime", "n_ctx", result.config.n_ctx, result.error) ||
+        !read_required_profile_value(runtime, "runtime", "duplex", result.config.duplex_mode, result.error) ||
+        !read_required_profile_value(runtime, "runtime", "async", result.config.async_mode, result.error) ||
+        !read_required_profile_value(runtime, "runtime", "vpm_batch_encode", result.config.vpm_batch_encode,
+                                     result.error)) {
+        return result;
+    }
+    if (token2wav_threads <= 0 || result.config.n_ctx <= 0) {
+        result.error = "profile config runtime values must be positive";
+        return result;
+    }
+
+    result.config.llm_model        = resolve_profile_model_path(inventory.root, llm_configured_model);
+    result.config.llm_quantization = llm_quantization;
+    result.config.vision_model     = resolve_profile_model_path(inventory.root, vision_configured_model);
+    result.config.audio_model      = resolve_profile_model_path(inventory.root, audio_configured_model);
+    result.config.tts_model        = resolve_profile_model_path(inventory.root, tts_configured_model);
+    result.config.projector_model  = resolve_profile_model_path(inventory.root, projector_configured_model);
+    result.config.token2wav_model_dir = resolve_profile_model_path(inventory.root, token2wav_configured_dir);
+    result.config.n_gpu_layers     = n_gpu_layers;
+    result.config.tts_gpu_layers   = tts_gpu_layers;
+    result.config.token2wav_threads = token2wav_threads;
+
+    if (!require_profile_file("llm", result.config.llm_model, result.error) ||
+        !require_profile_file("vision", result.config.vision_model, result.error) ||
+        !require_profile_file("audio", result.config.audio_model, result.error) ||
+        !require_profile_file("tts", result.config.tts_model, result.error) ||
+        !require_profile_file("projector", result.config.projector_model, result.error) ||
+        !require_profile_directory("token2wav", result.config.token2wav_model_dir, result.error)) {
+        return result;
+    }
+
+    const std::vector<std::pair<const char *, const char *>> token2wav_files = {
+        { "encoder", "encoder.gguf" },
+        { "flow_matching", "flow_matching.gguf" },
+        { "flow_extra", "flow_extra.gguf" },
+        { "hifigan2", "hifigan2.gguf" },
+        { "prompt_cache", "prompt_cache.gguf" },
+    };
+    for (const auto & file_entry : token2wav_files) {
+        if (!require_profile_file("token2wav " + std::string(file_entry.first),
+                                  (std::filesystem::path(result.config.token2wav_model_dir) / file_entry.second).string(),
+                                  result.error)) {
+            return result;
+        }
+    }
 
     const auto accelerators = accelerator_devices(hardware);
-    const runtime_device * primary = accelerators.empty() ? nullptr : accelerators.front();
-    const runtime_device * secondary = accelerators.size() > 1 ? accelerators[1] : nullptr;
+    if (!accelerators.empty()) {
+        const auto * primary = accelerators.front();
+        result.config.primary_device_name         = primary->name;
+        result.config.primary_device_description  = primary->description;
+        result.config.primary_device_free_memory  = primary->free_memory;
+        result.config.primary_device_total_memory = primary->total_memory;
+    }
 
-    if (requested_profile != "auto") {
-        result.error = "unsupported runtime profile: " + requested_profile;
+    auto resolve_configured_device = [&](const std::string & requested,
+                                         const std::string & module,
+                                         std::string &       resolved) {
+        resolved = normalize_device(requested, hardware, module, result.error);
+        return result.error.empty();
+    };
+    std::string llm_device;
+    std::string vision_device;
+    std::string audio_device;
+    std::string tts_device;
+    std::string projector_device;
+    std::string token2wav_backend_device;
+    if (!resolve_configured_device(llm_configured_device, "llm", llm_device) ||
+        !resolve_configured_device(vision_configured_device, "vision", vision_device) ||
+        !resolve_configured_device(audio_configured_device, "audio", audio_device) ||
+        !resolve_configured_device(tts_configured_device, "tts", tts_device) ||
+        !resolve_configured_device(projector_configured_device, "projector", projector_device) ||
+        !resolve_configured_device(token2wav_configured_device, "token2wav", token2wav_backend_device)) {
         return result;
     }
 
-    result.error = validate_required_modules(inventory);
-    if (!result.error.empty()) {
-        return result;
-    }
+    result.config.llm_device     = llm_device;
+    result.config.vision_device  = vision_device;
+    result.config.audio_device   = audio_device;
+    result.config.tts_device     = tts_device;
+    result.config.token2wav_device = token2wav_backend_device == "cpu"
+                                         ? "cpu"
+                                         : token2wav_device_for(*find_device(hardware, token2wav_backend_device));
+    result.config.resolved_profile = "static_config";
+    result.config.reason = "loaded static profile config: " + config_path;
 
-    const bool has_accelerator = primary != nullptr;
-    const bool split_modules = secondary != nullptr && secondary->free_memory >= 4 * GiB;
-    if (!split_modules) {
-        secondary = nullptr;
-    }
-    if (overrides.llm_model) {
-        result.ok                      = true;
-        result.config.resolved_profile = has_accelerator
-                                             ? (split_modules ? "full_omni_multi_accelerator_explicit"
-                                                              : "full_omni_accelerator_explicit")
-                                             : "full_omni_cpu_explicit";
-        result.config.reason           = "explicit LLM model was provided; profile selected execution defaults only";
-        result.config.llm_model        = *overrides.llm_model;
-        result.config.llm_quantization = quantization_from_path(*overrides.llm_model);
-        if (has_accelerator) {
-            apply_accelerator_defaults(result.config, *primary);
-        } else {
-            apply_cpu_defaults(result.config);
-        }
-        if (!apply_module_inventory(result.config, inventory, hardware, primary, secondary, overrides, result.error)) {
-            result.ok = false;
-            return result;
-        }
-        apply_overrides(result.config, overrides, has_accelerator);
-        return result;
-    }
+    result.config.placements.clear();
+    add_module_placement(result.config, "llm", result.config.llm_model, result.config.llm_quantization,
+                         result.config.llm_device);
+    add_module_placement(result.config, "vision", result.config.vision_model, "F16", result.config.vision_device);
+    add_module_placement(result.config, "audio", result.config.audio_model, "F16", result.config.audio_device);
+    add_module_placement(result.config, "tts", result.config.tts_model, "F16", result.config.tts_device);
+    add_module_placement(result.config, "projector", result.config.projector_model, "F16",
+                         projector_device);
+    add_module_placement(result.config, "token2wav", result.config.token2wav_model_dir, "F16",
+                         token2wav_backend_device);
 
-    if (has_accelerator) {
-        struct candidate {
-            const char *        quantization;
-            const char *        resolved_profile;
-            const std::string * model;
-            uint64_t            required_memory;
-        };
-
-        const candidate candidates[] = {
-            { "F16",    "full_omni_accelerator_f16",    &inventory.llm_f16,    20 * GiB },
-            { "Q8_0",   "full_omni_accelerator_q8_0",   &inventory.llm_q8_0,   13 * GiB },
-            { "Q4_K_M", "full_omni_accelerator_q4_k_m", &inventory.llm_q4_k_m, 9 * GiB  },
-        };
-
-        for (const auto & candidate : candidates) {
-            if (candidate.model->empty()) {
-                result.config.fallback_reasons.push_back(std::string(candidate.quantization) +
-                                                         " rejected: model file is not available");
-                continue;
-            }
-            if (primary->free_memory < candidate.required_memory) {
-                result.config.fallback_reasons.push_back(
-                    memory_rejection_reason(candidate.quantization, candidate.required_memory, primary->free_memory));
-                continue;
-            }
-
-            result.ok                      = true;
-            result.config.resolved_profile = split_modules
-                                                 ? std::string("full_omni_multi_accelerator_") +
-                                                       (candidate.quantization == std::string("F16") ? "f16" :
-                                                        candidate.quantization == std::string("Q8_0") ? "q8_0" : "q4_k_m")
-                                                 : candidate.resolved_profile;
-            result.config.reason    = "primary accelerator has enough free memory for the selected full Omni estimate";
-            result.config.llm_model = *candidate.model;
-            result.config.llm_quantization          = candidate.quantization;
-            result.config.estimated_required_memory = candidate.required_memory;
-            apply_accelerator_defaults(result.config, *primary);
-            if (!apply_module_inventory(result.config, inventory, hardware, primary, secondary, overrides, result.error)) {
-                result.ok = false;
-                return result;
-            }
-            apply_overrides(result.config, overrides, true);
-            return result;
-        }
-    } else if (select_cpu_model(inventory, result.config)) {
-        result.ok = true;
-        if (!apply_module_inventory(result.config, inventory, hardware, nullptr, nullptr, overrides, result.error)) {
-            result.ok = false;
-            return result;
-        }
-        apply_overrides(result.config, overrides, false);
-        return result;
-    }
-
-    result.error = has_accelerator ? "no matching runtime profile" :
-                                     "no LLM model in F16, Q8_0, or Q4_K_M is available for runtime profile auto";
+    apply_overrides(result.config, overrides);
+    result.ok = true;
     return result;
 }
 
@@ -484,9 +538,6 @@ std::string format_effective_runtime_config(const effective_runtime_config & con
         output << "primary_device_free_memory_mib=" << config.primary_device_free_memory / (1024ULL * 1024ULL) << '\n';
         output << "primary_device_total_memory_mib=" << config.primary_device_total_memory / (1024ULL * 1024ULL)
                << '\n';
-    }
-    if (config.estimated_required_memory > 0) {
-        output << "estimated_required_memory_mib=" << config.estimated_required_memory / (1024ULL * 1024ULL) << '\n';
     }
     output << "llm_model=" << config.llm_model << '\n';
     output << "llm_quantization=" << config.llm_quantization << '\n';
@@ -509,16 +560,6 @@ std::string format_effective_runtime_config(const effective_runtime_config & con
         output << ",vpm_batch_encode";
     }
     output << ",ctx_size=" << config.n_ctx << '\n';
-    if (!config.autotune_cache_status.empty()) {
-        output << "autotune_cache=" << config.autotune_cache_status << '\n';
-        output << "autotune_cache_reason=" << config.autotune_cache_reason << '\n';
-        if (!config.autotune_selected_candidate.empty()) {
-            output << "autotune_selected_candidate=" << config.autotune_selected_candidate << '\n';
-            output << "output_consistent_with_baseline="
-                   << (config.output_consistent_with_baseline ? "true" : "false") << '\n';
-        }
-        output << "audio_semantics_verified=" << (config.audio_semantics_verified ? "true" : "false") << '\n';
-    }
     output << "placement_plan_count=" << config.placements.size() << '\n';
     for (const auto & placement : config.placements) {
         output << "placement=" << placement.module
@@ -528,9 +569,6 @@ std::string format_effective_runtime_config(const effective_runtime_config & con
                << ",backend=" << placement.backend
                << ",execution=" << placement.execution
                << ",status=" << placement.status << '\n';
-    }
-    for (const auto & fallback : config.fallback_reasons) {
-        output << "fallback=" << fallback << '\n';
     }
     return output.str();
 }

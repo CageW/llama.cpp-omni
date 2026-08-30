@@ -15,7 +15,7 @@
 #include "protocol.h"
 #include "omni.h"
 #include "runtime-profile.h"
-#include "runtime-autotune-runner.h"
+#include "runtime-profile-session.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"

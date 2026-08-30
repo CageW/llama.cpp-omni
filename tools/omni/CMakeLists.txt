@@ -24,12 +24,8 @@ set(OMNI_T2W_ORT_LIBRARY
 add_library(omni
             omni.cpp
             omni.h
-            runtime-autotune.cpp
-            runtime-autotune.h
-            runtime-autotune-runner.cpp
-            runtime-autotune-runner.h
-            runtime-hash.cpp
-            runtime-hash.h
+            runtime-profile-session.cpp
+            runtime-profile-session.h
             runtime-profile.cpp
             runtime-profile.h
             tts-weight-layout.cpp
@@ -267,12 +263,32 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME ${TARGET_RUNTIME_PROFILE_TEST} COMMAND ${TARGET_RUNTIME_PROFILE_TEST})
     set_tests_properties(${TARGET_RUNTIME_PROFILE_TEST} PROPERTIES LABELS "main;omni")
 
-    set(TARGET_RUNTIME_AUTOTUNE_TEST test-runtime-autotune)
-    add_executable(${TARGET_RUNTIME_AUTOTUNE_TEST} test/test-runtime-autotune.cpp)
-    target_link_libraries(${TARGET_RUNTIME_AUTOTUNE_TEST} PRIVATE omni)
-    target_compile_features(${TARGET_RUNTIME_AUTOTUNE_TEST} PRIVATE cxx_std_17)
-    add_test(NAME ${TARGET_RUNTIME_AUTOTUNE_TEST} COMMAND ${TARGET_RUNTIME_AUTOTUNE_TEST})
-    set_tests_properties(${TARGET_RUNTIME_AUTOTUNE_TEST} PROPERTIES LABELS "main;omni")
+    set(TARGET_T2W_PROMPT_BUNDLE_TEST test-token2wav-prompt-bundle)
+    add_executable(${TARGET_T2W_PROMPT_BUNDLE_TEST} test/test-token2wav-prompt-bundle.cpp)
+    target_link_libraries(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_PROMPT_BUNDLE_TEST} COMMAND ${TARGET_T2W_PROMPT_BUNDLE_TEST})
+    set_tests_properties(${TARGET_T2W_PROMPT_BUNDLE_TEST} PROPERTIES LABELS "main;omni;tts")
+
+    set(TARGET_T2W_FRONTEND_TEST test-token2wav-frontend)
+    add_executable(${TARGET_T2W_FRONTEND_TEST} test/test-token2wav-frontend.cpp)
+    target_link_libraries(${TARGET_T2W_FRONTEND_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_FRONTEND_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_FRONTEND_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_FRONTEND_TEST} COMMAND ${TARGET_T2W_FRONTEND_TEST})
+    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES LABELS "main;omni;tts")
+
+    set(TARGET_T2W_SESSION_TEST test-token2wav-session)
+    add_executable(${TARGET_T2W_SESSION_TEST} test/test-token2wav-session.cpp)
+    target_link_libraries(${TARGET_T2W_SESSION_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_SESSION_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_SESSION_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_SESSION_TEST} COMMAND ${TARGET_T2W_SESSION_TEST})
+    set_tests_properties(${TARGET_T2W_SESSION_TEST} PROPERTIES
+        LABELS "main;omni;tts"
+        SKIP_RETURN_CODE 77
+    )
 
     set(TARGET_TTS_FRONTEND_POLICY_TEST test-tts-frontend-policy)
     add_executable(${TARGET_TTS_FRONTEND_POLICY_TEST} test/test-tts-frontend-policy.cpp)
@@ -306,25 +322,3 @@ if(ENABLE_COREML)
     target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
     target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
 endif()
-
-    set(TARGET_T2W_PROMPT_BUNDLE_TEST test-token2wav-prompt-bundle)
-    add_executable(${TARGET_T2W_PROMPT_BUNDLE_TEST} test/test-token2wav-prompt-bundle.cpp)
-    target_link_libraries(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE omni)
-    target_include_directories(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
-    target_compile_features(${TARGET_T2W_PROMPT_BUNDLE_TEST} PRIVATE cxx_std_17)
-    add_test(NAME ${TARGET_T2W_PROMPT_BUNDLE_TEST} COMMAND ${TARGET_T2W_PROMPT_BUNDLE_TEST})
-    set_tests_properties(${TARGET_T2W_PROMPT_BUNDLE_TEST} PROPERTIES LABELS "main;omni;tts")
-
-    set(TARGET_T2W_FRONTEND_TEST test-token2wav-frontend)
-    add_executable(${TARGET_T2W_FRONTEND_TEST} test/test-token2wav-frontend.cpp)
-    target_link_libraries(${TARGET_T2W_FRONTEND_TEST} PRIVATE omni)
-    target_include_directories(${TARGET_T2W_FRONTEND_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
-    target_compile_features(${TARGET_T2W_FRONTEND_TEST} PRIVATE cxx_std_17)
-    add_test(NAME ${TARGET_T2W_FRONTEND_TEST} COMMAND ${TARGET_T2W_FRONTEND_TEST})
-    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES LABELS "main;omni;tts")
-
-    set(TARGET_T2W_SESSION_TEST test-token2wav-session)
-    add_executable(${TARGET_T2W_SESSION_TEST} test/test-token2wav-session.cpp)
-    target_link_libraries(${TARGET_T2W_SESSION_TEST} PRIVATE omni)
-    target_include_directories(${TARGET_T2W_SESSION_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
-    target_compile_features(${TARGET_T2W_SESSION_TEST} PRIVATE cxx_std_17)

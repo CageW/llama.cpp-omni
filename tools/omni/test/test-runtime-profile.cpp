@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "runtime-profile.h"
+#include "runtime-profile-session.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -33,268 +34,268 @@ class temporary_model_tree {
         file << "test";
     }
 
+    void write(const std::filesystem::path & relative_path, const std::string & contents) const {
+        const auto path = root / relative_path;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream file(path);
+        file << contents;
+    }
+
     std::filesystem::path root;
 };
 
-static omni::model_inventory complete_inventory() {
+static void create_complete_model_tree(const temporary_model_tree & tree) {
+    for (const auto & relative_path : {
+             std::filesystem::path("MiniCPM-o-4_5-Q4_K_M.gguf"),
+             std::filesystem::path("vision/MiniCPM-o-4_5-vision-F16.gguf"),
+             std::filesystem::path("audio/MiniCPM-o-4_5-audio-F16.gguf"),
+             std::filesystem::path("tts/MiniCPM-o-4_5-tts-F16.gguf"),
+             std::filesystem::path("tts/MiniCPM-o-4_5-projector-F16.gguf"),
+             std::filesystem::path("token2wav-gguf/encoder.gguf"),
+             std::filesystem::path("token2wav-gguf/flow_matching.gguf"),
+             std::filesystem::path("token2wav-gguf/flow_extra.gguf"),
+             std::filesystem::path("token2wav-gguf/hifigan2.gguf"),
+             std::filesystem::path("token2wav-gguf/prompt_cache.gguf") }) {
+        tree.touch(relative_path);
+    }
+}
+
+static std::string complete_profile_config() {
+    return R"json({
+  "schema_version": 1,
+  "profile": "auto",
+  "llm": {
+    "model": "MiniCPM-o-4_5-Q4_K_M.gguf",
+    "quantization": "Q4_K_M",
+    "device": "CUDA0",
+    "n_gpu_layers": 37
+  },
+  "vision": {
+    "model": "vision/MiniCPM-o-4_5-vision-F16.gguf",
+    "device": "CUDA1"
+  },
+  "audio": {
+    "model": "audio/MiniCPM-o-4_5-audio-F16.gguf",
+    "device": "CUDA1"
+  },
+  "tts": {
+    "model": "tts/MiniCPM-o-4_5-tts-F16.gguf",
+    "device": "CUDA0",
+    "gpu_layers": -1
+  },
+  "projector": {
+    "model": "tts/MiniCPM-o-4_5-projector-F16.gguf",
+    "device": "CUDA1"
+  },
+  "token2wav": {
+    "model_dir": "token2wav-gguf",
+    "device": "CUDA0",
+    "threads": 12
+  },
+  "runtime": {
+    "n_ctx": 6144,
+    "duplex": true,
+    "async": false,
+    "vpm_batch_encode": true
+  }
+})json";
+}
+
+static omni::hardware_snapshot two_accelerators() {
+    omni::hardware_snapshot hardware;
+    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
+    hardware.devices.push_back({ "CUDA1", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
+    return hardware;
+}
+
+static omni::runtime_profile_result resolve_from_tree(const temporary_model_tree & tree,
+                                                       const omni::hardware_snapshot & hardware) {
+    const auto inventory = omni::discover_model_inventory(tree.root.string());
+    return omni::resolve_runtime_profile_from_config(
+        (tree.root / "omni-runtime-profile.json").string(), hardware, inventory);
+}
+
+static void test_auto_requires_static_profile_config() {
+    omni::hardware_snapshot hardware;
+    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
     omni::model_inventory inventory;
-    inventory.root                    = "/models/MiniCPM-o-4_5-gguf";
-    inventory.llm_f16                 = inventory.root + "/MiniCPM-o-4_5-F16.gguf";
-    inventory.llm_q8_0                = inventory.root + "/MiniCPM-o-4_5-Q8_0.gguf";
-    inventory.llm_q4_k_m              = inventory.root + "/MiniCPM-o-4_5-Q4_K_M.gguf";
-    inventory.vision                  = inventory.root + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
-    inventory.audio                   = inventory.root + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
-    inventory.tts                     = inventory.root + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
-    inventory.projector               = inventory.root + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
-    inventory.token2wav_dir           = inventory.root + "/token2wav-gguf";
-    inventory.token2wav_encoder       = inventory.token2wav_dir + "/encoder.gguf";
-    inventory.token2wav_flow_matching = inventory.token2wav_dir + "/flow_matching.gguf";
-    inventory.token2wav_flow_extra    = inventory.token2wav_dir + "/flow_extra.gguf";
-    inventory.token2wav_hifigan       = inventory.token2wav_dir + "/hifigan2.gguf";
-    inventory.token2wav_prompt_cache  = inventory.token2wav_dir + "/prompt_cache.gguf";
-    return inventory;
-}
-
-static void test_auto_selects_f16_when_accelerator_memory_is_sufficient() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-
-    assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_accelerator_f16");
-    assert(result.config.llm_model == "/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf");
-    assert(result.config.llm_quantization == "F16");
-    assert(result.config.n_gpu_layers == -2);
-    assert(result.config.tts_gpu_layers == -1);
-    assert(result.config.token2wav_device == "gpu:0");
-    assert(result.config.n_ctx == 8192);
-    assert(result.config.duplex_mode);
-    assert(result.config.async_mode);
-    assert(result.config.vpm_batch_encode);
-}
-
-static void test_auto_falls_back_to_q8_when_f16_does_not_fit() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 15 * GiB, 96 * GiB, "GPU" });
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-
-    assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_accelerator_q8_0");
-    assert(result.config.llm_quantization == "Q8_0");
-    assert(result.config.llm_model == "/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q8_0.gguf");
-    assert(result.config.fallback_reasons.size() == 1);
-    assert(result.config.fallback_reasons.front().find("F16") != std::string::npos);
-}
-
-static void test_auto_falls_back_to_q4_when_q8_does_not_fit() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 10 * GiB, 96 * GiB, "GPU" });
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-
-    assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_accelerator_q4_k_m");
-    assert(result.config.llm_quantization == "Q4_K_M");
-    assert(result.config.llm_model == "/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf");
-    assert(result.config.fallback_reasons.size() == 2);
-    assert(result.config.fallback_reasons.at(0).find("F16") != std::string::npos);
-    assert(result.config.fallback_reasons.at(1).find("Q8_0") != std::string::npos);
-}
-
-static void test_auto_reports_the_missing_omni_module() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-    auto inventory = complete_inventory();
-    inventory.vision.clear();
+    inventory.root = "/models/MiniCPM-o-4_5-gguf";
 
     const auto result = omni::resolve_runtime_profile("auto", hardware, inventory);
 
     assert(!result.ok);
-    assert(result.error.find("vision") != std::string::npos);
-    assert(result.error.find("MiniCPM-o-4_5-vision-F16.gguf") != std::string::npos);
+    assert(result.error.find("profile config") != std::string::npos);
 }
 
-static void test_auto_uses_cpu_compatible_profile_without_an_accelerator() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CPU", "Apple M-series CPU", false, 48 * GiB, 64 * GiB, "CPU" });
+static void test_static_profile_loads_values_and_maps_logical_devices() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    tree.write("omni-runtime-profile.json", complete_profile_config());
 
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
+    const auto result = resolve_from_tree(tree, two_accelerators());
 
     assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_cpu_q4_k_m");
+    assert(result.config.requested_profile == "auto");
+    assert(result.config.resolved_profile == "static_config");
+    assert(result.config.llm_model == (tree.root / "MiniCPM-o-4_5-Q4_K_M.gguf").string());
     assert(result.config.llm_quantization == "Q4_K_M");
-    assert(result.config.n_gpu_layers == 0);
-    assert(result.config.tts_gpu_layers == 0);
-    assert(result.config.token2wav_device == "cpu");
-    assert(result.config.llm_device == "cpu");
-    assert(result.config.n_ctx == 4096);
-    assert(!result.config.vpm_batch_encode);
-}
-
-static void test_zero_memory_accelerator_is_not_misclassified_as_cpu_only() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CPU", "Apple M-series CPU", false, 48 * GiB, 64 * GiB, "CPU" });
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 0, 96 * GiB, "GPU" });
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-
-    assert(!result.ok);
-    assert(result.error == "no matching runtime profile");
-}
-
-static void test_explicit_values_override_auto_recommendations() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-    const auto                      inventory = complete_inventory();
-    omni::runtime_profile_overrides overrides;
-    overrides.llm_model        = inventory.llm_q4_k_m;
-    overrides.n_gpu_layers     = 37;
-    overrides.n_ctx            = 6144;
-    overrides.token2wav_threads = 32;
-    overrides.vpm_batch_encode = false;
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, inventory, overrides);
-
-    assert(result.ok);
-    assert(result.config.llm_model == inventory.llm_q4_k_m);
-    assert(result.config.llm_quantization == "Q4_K_M");
+    assert(result.config.llm_device == "CUDA0");
     assert(result.config.n_gpu_layers == 37);
+    assert(result.config.vision_device == "CUDA1");
+    assert(result.config.audio_device == "CUDA1");
+    assert(result.config.tts_device == "CUDA0");
+    assert(result.config.tts_gpu_layers == -1);
+    assert(result.config.token2wav_device == "gpu:0");
+    assert(result.config.token2wav_threads == 12);
     assert(result.config.n_ctx == 6144);
-    assert(result.config.token2wav_threads == 32);
-    assert(!result.config.vpm_batch_encode);
+    assert(result.config.duplex_mode);
+    assert(!result.config.async_mode);
+    assert(result.config.vpm_batch_encode);
 }
 
-static void test_explicit_model_works_without_recommended_llm_candidates() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-    auto inventory = complete_inventory();
-    inventory.llm_f16.clear();
-    inventory.llm_q8_0.clear();
-    inventory.llm_q4_k_m.clear();
-    omni::runtime_profile_overrides overrides;
-    overrides.llm_model = "/models/custom-omni.gguf";
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, inventory, overrides);
-
-    assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_accelerator_explicit");
-    assert(result.config.llm_model == "/models/custom-omni.gguf");
-    assert(result.config.llm_quantization == "UNKNOWN");
-    assert(result.config.n_gpu_layers == -2);
-}
-
-static void test_effective_config_explains_modules_and_fallbacks() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 15 * GiB, 96 * GiB, "GPU" });
-
-    const auto        result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-    const std::string output = omni::format_effective_runtime_config(result.config);
-
-    assert(output.find("profile=auto\n") != std::string::npos);
-    assert(output.find("resolved_profile=full_omni_accelerator_q8_0\n") != std::string::npos);
-    assert(output.find("primary_device=CUDA0 (NVIDIA H20)\n") != std::string::npos);
-    assert(output.find("primary_device_free_memory_mib=15360\n") != std::string::npos);
-    assert(output.find("estimated_required_memory_mib=13312\n") != std::string::npos);
-    assert(output.find("llm_quantization=Q8_0\n") != std::string::npos);
-    assert(output.find("vision_model=/models/MiniCPM-o-4_5-gguf/vision/MiniCPM-o-4_5-vision-F16.gguf\n") !=
-           std::string::npos);
-    assert(output.find("audio_model=/models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf\n") !=
-           std::string::npos);
-    assert(output.find("tts_model=/models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf\n") != std::string::npos);
-    assert(output.find("token2wav_device=gpu:0\n") != std::string::npos);
-    assert(output.find("token2wav_threads=8\n") != std::string::npos);
-    assert(output.find("execution=async,duplex,vpm_batch_encode,ctx_size=8192\n") != std::string::npos);
-    assert(output.find("fallback=F16 rejected:") != std::string::npos);
-}
-
-static void test_effective_config_reports_autotune_output_consistency() {
-    omni::effective_runtime_config config;
-    config.autotune_cache_status = "applied";
-    config.autotune_cache_reason = "matching cache";
-    config.autotune_selected_candidate = "precision_q8_0";
-    config.output_consistent_with_baseline = false;
-
-    const std::string output = omni::format_effective_runtime_config(config);
-    assert(output.find("autotune_selected_candidate=precision_q8_0\n") != std::string::npos);
-    assert(output.find("output_consistent_with_baseline=false\n") != std::string::npos);
-}
-
-static const omni::module_placement & find_placement(const omni::effective_runtime_config & config,
-                                                       const std::string & module) {
-    for (const auto & placement : config.placements) {
-        if (placement.module == module) {
-            return placement;
-        }
-    }
-    assert(false && "requested module placement is missing");
-    return config.placements.front();
-}
-
-static void test_auto_assigns_modules_across_accelerators() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-    hardware.devices.push_back({ "CUDA1", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, complete_inventory());
-
-    assert(result.ok);
-    assert(result.config.resolved_profile == "full_omni_multi_accelerator_f16");
-    assert(find_placement(result.config, "llm").device == "CUDA0");
-    assert(find_placement(result.config, "vision").device == "CUDA1");
-    assert(find_placement(result.config, "audio").device == "CUDA1");
-    assert(find_placement(result.config, "tts").device == "CUDA0");
-    assert(find_placement(result.config, "projector").device == "CUDA1");
-    assert(find_placement(result.config, "token2wav").device == "CUDA0");
-    assert(find_placement(result.config, "vision").status == "active");
-}
-
-static void test_unknown_module_device_fails_closed() {
-    omni::hardware_snapshot hardware;
-    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
-    const auto inventory = complete_inventory();
-    omni::runtime_profile_overrides overrides;
-    overrides.vision_device = "CUDA9";
-
-    const auto result = omni::resolve_runtime_profile("auto", hardware, inventory, overrides);
+static void test_static_profile_reports_missing_config_file() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    const auto result = resolve_from_tree(tree, two_accelerators());
 
     assert(!result.ok);
+    assert(result.error.find("profile config file") != std::string::npos);
+    assert(result.error.find("omni-runtime-profile.json") != std::string::npos);
+}
+
+static void test_static_profile_reports_invalid_json() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    tree.write("omni-runtime-profile.json", "{\"schema_version\":");
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+
+    assert(!result.ok);
+    assert(result.error.find("invalid profile config JSON") != std::string::npos);
+}
+
+static void test_static_profile_reports_missing_required_field() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    auto config = complete_profile_config();
+    const auto marker = std::string("  \"audio\": {\n    \"model\": \"audio/MiniCPM-o-4_5-audio-F16.gguf\",\n    \"device\": \"CUDA1\"\n  },\n");
+    config.replace(config.find(marker), marker.size(), "");
+    tree.write("omni-runtime-profile.json", config);
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+
+    assert(!result.ok);
+    assert(result.error.find("audio") != std::string::npos);
+    assert(result.error.find("required") != std::string::npos);
+}
+
+static void test_static_profile_reports_missing_model_file() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    auto config = complete_profile_config();
+    const auto marker = "MiniCPM-o-4_5-Q4_K_M.gguf";
+    config.replace(config.find(marker), std::string(marker).size(), "missing.gguf");
+    tree.write("omni-runtime-profile.json", config);
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+
+    assert(!result.ok);
+    assert(result.error.find("llm model") != std::string::npos);
+    assert(result.error.find("missing.gguf") != std::string::npos);
+}
+
+static void test_static_profile_reports_unavailable_logical_device() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    tree.write("omni-runtime-profile.json", complete_profile_config());
+
+    omni::hardware_snapshot hardware;
+    hardware.devices.push_back({ "CUDA0", "NVIDIA H20", true, 24 * GiB, 96 * GiB, "GPU" });
+    const auto result = resolve_from_tree(tree, hardware);
+
+    assert(!result.ok);
+    assert(result.error.find("CUDA1") != std::string::npos);
     assert(result.error.find("vision") != std::string::npos);
-    assert(result.error.find("CUDA9") != std::string::npos);
+}
+
+static void test_static_profile_rejects_empty_device_value() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    auto config = complete_profile_config();
+    const auto marker = "\"device\": \"CUDA0\"";
+    config.replace(config.find(marker), std::string(marker).size(), "\"device\": \"\"");
+    tree.write("omni-runtime-profile.json", config);
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+
+    assert(!result.ok);
+    assert(result.error.find("llm.device") != std::string::npos);
+    assert(result.error.find("empty") != std::string::npos);
+}
+
+static void test_effective_config_reports_static_source() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    tree.write("omni-runtime-profile.json", complete_profile_config());
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+    assert(result.ok);
+    const auto output = omni::format_effective_runtime_config(result.config);
+    assert(output.find("resolved_profile=static_config\n") != std::string::npos);
+    assert(output.find("llm_quantization=Q4_K_M\n") != std::string::npos);
+}
+
+static void test_runtime_profile_controls_session_options_when_present() {
+    omni::effective_runtime_config config;
+    config.duplex_mode       = true;
+    config.tts_gpu_layers    = -1;
+    config.token2wav_device  = "gpu:0";
+    config.token2wav_threads = 32;
+
+    const auto profiled = omni::resolve_runtime_session_options(&config, false, 100, "cpu", 4);
+    assert(profiled.duplex_mode);
+    assert(profiled.tts_gpu_layers == -1);
+    assert(profiled.token2wav_device == "gpu:0");
+    assert(profiled.token2wav_threads == 32);
+    assert(profiled.strict_runtime_config);
+
+    const auto legacy = omni::resolve_runtime_session_options(nullptr, false, 100, "cpu", 4);
+    assert(!legacy.duplex_mode);
+    assert(legacy.tts_gpu_layers == 100);
+    assert(legacy.token2wav_device == "cpu");
+    assert(legacy.token2wav_threads == 4);
+    assert(!legacy.strict_runtime_config);
 }
 
 static void test_model_inventory_only_reports_files_that_exist() {
     temporary_model_tree tree;
     tree.touch("MiniCPM-o-4_5-F16.gguf");
-    tree.touch("MiniCPM-o-4_5-Q4_K_M.gguf");
     tree.touch("vision/MiniCPM-o-4_5-vision-F16.gguf");
-    tree.touch("audio/MiniCPM-o-4_5-audio-F16.gguf");
-    tree.touch("tts/MiniCPM-o-4_5-tts-F16.gguf");
-    tree.touch("tts/MiniCPM-o-4_5-projector-F16.gguf");
-    tree.touch("token2wav-gguf/encoder.gguf");
-    tree.touch("token2wav-gguf/flow_matching.gguf");
-    tree.touch("token2wav-gguf/flow_extra.gguf");
-    tree.touch("token2wav-gguf/hifigan2.gguf");
-    tree.touch("token2wav-gguf/prompt_cache.gguf");
 
     const auto inventory = omni::discover_model_inventory(tree.root.string());
 
     assert(inventory.root == tree.root.string());
     assert(inventory.llm_f16 == (tree.root / "MiniCPM-o-4_5-F16.gguf").string());
     assert(inventory.llm_q8_0.empty());
-    assert(inventory.llm_q4_k_m == (tree.root / "MiniCPM-o-4_5-Q4_K_M.gguf").string());
+    assert(inventory.llm_q4_k_m.empty());
     assert(inventory.vision == (tree.root / "vision/MiniCPM-o-4_5-vision-F16.gguf").string());
-    assert(inventory.token2wav_prompt_cache == (tree.root / "token2wav-gguf/prompt_cache.gguf").string());
+    assert(inventory.token2wav_prompt_cache.empty());
+}
+
+static bool parse_omni_server_arguments(std::vector<std::string> arguments) {
+    common_params        params;
+    std::vector<char *> argv;
+    for (auto & argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    return common_params_parse(static_cast<int>(argv.size()), argv.data(), params, LLAMA_EXAMPLE_OMNI_SERVER);
 }
 
 static void test_omni_runtime_profile_arguments_are_parsed() {
     common_params            params;
     std::vector<std::string> arguments = {
-        "llama-omni-server",        "--profile", "auto", "--model-dir", "/models/MiniCPM-o-4_5-gguf",
-        "--autotune", "refresh", "--autotune-cache", "/tmp/omni-autotune.json",
-        "--autotune-rounds", "5", "--autotune-warmup-rounds", "2", "--autotune-allow-quantized",
-        "--token2wav-threads", "32", "--print-effective-config",
+        "llama-omni-server", "--profile", "auto", "--model-dir", "/models/MiniCPM-o-4_5-gguf",
+        "--profile-config", "/models/profile.json", "--token2wav-threads", "32", "--print-effective-config",
     };
     std::vector<char *> argv;
     for (auto & argument : arguments) {
@@ -307,46 +308,36 @@ static void test_omni_runtime_profile_arguments_are_parsed() {
     assert(parsed);
     assert(params.omni_runtime_profile.profile == "auto");
     assert(params.omni_runtime_profile.model_dir == "/models/MiniCPM-o-4_5-gguf");
-    assert(params.omni_runtime_profile.autotune == "refresh");
-    assert(params.omni_runtime_profile.autotune_cache == "/tmp/omni-autotune.json");
-    assert(params.omni_runtime_profile.autotune_rounds == 5);
-    assert(params.omni_runtime_profile.autotune_warmup_rounds == 2);
-    assert(params.omni_runtime_profile.autotune_allow_quantized);
+    assert(params.omni_runtime_profile.profile_config == "/models/profile.json");
     assert(params.omni_runtime_profile.token2wav_threads == 32);
     assert(params.omni_runtime_profile.print_effective_config);
 }
 
-static bool parse_omni_server_arguments(std::vector<std::string> arguments) {
-    common_params        params;
-    std::vector<char *> argv;
-    for (auto & argument : arguments) {
-        argv.push_back(argument.data());
-    }
-    return common_params_parse(static_cast<int>(argv.size()), argv.data(), params, LLAMA_EXAMPLE_OMNI_SERVER);
-}
-
 static void test_omni_runtime_profile_argument_ranges_are_validated() {
-    assert(!parse_omni_server_arguments({ "llama-omni-server", "--autotune-rounds", "0" }));
-    assert(!parse_omni_server_arguments({ "llama-omni-server", "--autotune-rounds", "11" }));
-    assert(!parse_omni_server_arguments({ "llama-omni-server", "--autotune-warmup-rounds", "4" }));
     assert(!parse_omni_server_arguments({ "llama-omni-server", "--token2wav-threads", "0" }));
 }
 
+static void test_omni_runtime_profile_rejects_autotune_arguments() {
+    assert(!parse_omni_server_arguments({ "llama-omni-server", "--profile", "auto", "--autotune", "refresh" }));
+    assert(!parse_omni_server_arguments({ "llama-omni-server", "--profile", "auto", "--autotune-cache",
+                                          "/tmp/omni-autotune.json" }));
+    assert(!parse_omni_server_arguments({ "llama-omni-server", "--profile", "auto", "--autotune-rounds", "3" }));
+}
+
 int main() {
-    test_auto_selects_f16_when_accelerator_memory_is_sufficient();
-    test_auto_falls_back_to_q8_when_f16_does_not_fit();
-    test_auto_falls_back_to_q4_when_q8_does_not_fit();
-    test_auto_reports_the_missing_omni_module();
-    test_auto_uses_cpu_compatible_profile_without_an_accelerator();
-    test_zero_memory_accelerator_is_not_misclassified_as_cpu_only();
-    test_explicit_values_override_auto_recommendations();
-    test_explicit_model_works_without_recommended_llm_candidates();
-    test_effective_config_explains_modules_and_fallbacks();
-    test_effective_config_reports_autotune_output_consistency();
-    test_auto_assigns_modules_across_accelerators();
-    test_unknown_module_device_fails_closed();
+    test_auto_requires_static_profile_config();
+    test_static_profile_loads_values_and_maps_logical_devices();
+    test_static_profile_reports_missing_config_file();
+    test_static_profile_reports_invalid_json();
+    test_static_profile_reports_missing_required_field();
+    test_static_profile_reports_missing_model_file();
+    test_static_profile_reports_unavailable_logical_device();
+    test_static_profile_rejects_empty_device_value();
+    test_effective_config_reports_static_source();
+    test_runtime_profile_controls_session_options_when_present();
     test_model_inventory_only_reports_files_that_exist();
     test_omni_runtime_profile_arguments_are_parsed();
     test_omni_runtime_profile_argument_ranges_are_validated();
+    test_omni_runtime_profile_rejects_autotune_arguments();
     return 0;
 }

@@ -145,11 +145,17 @@ cmake --build build --target llama-omni-server --target llama-omni-cli -j
 
 ### Runtime profile
 
-`llama-omni-server` can resolve a conservative runtime configuration from the
-available GGUF files and the memory reported by the GGML backends. The `auto`
-profile is the deterministic fallback. It checks the complete Omni model tree,
-selects F16, Q8_0, or Q4_K_M in that order on an accelerator, and uses a
-CPU-compatible profile when no accelerator is available.
+`--profile auto` reads a static JSON profile. The default path is
+`<model-dir>/omni-runtime-profile.json`; `--profile-config PATH` selects a
+different file. The JSON file names every Omni module, its quantization, GGML
+backend device name, and runtime settings. The server does not select a model
+from available files and does not have a built-in CPU or accelerator fallback.
+
+The server exits before loading weights when the profile file is missing or
+invalid, a required field is absent, a configured model path does not exist, or
+a configured GGML backend device cannot be mapped to a visible accelerator. A
+complete example is in
+[`docs/examples/omni-runtime-profile-auto.md`](docs/examples/omni-runtime-profile-auto.md).
 
 ```bash
 ./build/bin/llama-omni-server \
@@ -168,12 +174,13 @@ Inspect the selection without loading weights or opening the HTTP port:
     --print-effective-config
 ```
 
-The resolver assigns LLM, Vision, Audio, TTS, Projector, and Token2Wav to
-detected devices. It estimates each module from its model files and runtime
-overhead. A non-baseline placement is eligible only when every accelerator
-retains at least 10 percent of its current free memory. The deterministic
-baseline remains available when an estimate is pessimistic, although an actual
-module initialization failure still rejects it.
+The resolver assigns LLM, Vision, Audio, TTS, Projector, and Token2Wav to the
+devices named in the JSON file. The example uses fixed `CUDA0` and `CUDA1`
+backend names for the first and second visible CUDA devices; `cpu` always means
+the CPU backend. The configured names must be present in the current process,
+otherwise profile validation fails. `primary` and `secondary` remain accepted
+as backward-compatible aliases. `CUDA_VISIBLE_DEVICES` (or the corresponding
+vendor visibility variable) limits which accelerators can be mapped.
 
 The output contains one `placement=` line for each module. Each line names the
 model path, precision, GGML backend class, selected device, execution mode, and
@@ -182,82 +189,12 @@ model path, precision, GGML backend class, selected device, execution mode, and
 their GGML backend initializers. Token2Wav receives the resolved `gpu:N` or
 `cpu` device string.
 
-Explicit `--model`, `--n-gpu-layers`, and `--ctx-size` values take precedence
-over the profile. An explicit `--model` also disables the LLM precision probe.
-The current CLI does not expose per-module placement flags. The resolver rejects
-a device that is absent from the detected GGML inventory.
-
-Refresh the runtime autotuning cache before starting a production server:
-
-```bash
-./build/bin/llama-omni-server \
-    --profile auto \
-    --model-dir /path/to/MiniCPM-o-4_5-gguf \
-    --autotune refresh \
-    --autotune-rounds 3 \
-    --autotune-warmup-rounds 1 \
-    --autotune-cache /path/to/runtime-autotune.json
-```
-
-Refresh first measures available F16, Q8_0, and Q4_K_M LLM files on the Phase 2
-placement. It then evaluates `consolidated`, `encoder_split`,
-`encoder_split_local_projector`, `token2wav_split`, and
-`output_pipeline_split`. On a dual-accelerator machine it also probes Token2Wav
-on CPU with 8, 16, 32, and 64 threads, capped and deduplicated by
-`std::thread::hardware_concurrency()`. Use `--token2wav-threads` to set the normal
-Token2Wav CPU thread count.
-
-Each measured round creates a new Omni context, runs the requested warmup turns,
-resets per-turn state, and then runs the same 12-frame duplex fixture at a
-one-second cadence. Candidate order rotates between rounds. The runner does not
-resample or speed up generated audio. TTS RTF is elapsed generation time divided
-by emitted audio duration. A CPU candidate is stopped before measured rounds
-when its screening turn fails structurally or has TTS RTF greater than or equal
-to 1.5.
-
-Every measured round must complete all 12 frames, keep Frame-total P95 below one
-second, produce a `SPEAK` transition, emit finite audio with a final callback,
-and keep TTS RTF below 1.0. The score uses Encoder P95, TTFT P95, first-audio
-latency, and TTS RTF. Each aggregate metric is `median + MAD`, where MAD is the
-median absolute deviation across measured rounds.
-
-The runner hashes normalized response text and the ordered signed 32-bit TTS
-token stream. A same-precision placement must match the Phase 2 baseline hashes
-in every paired round. A selectable candidate must also be no slower in every
-paired round and improve the aggregate score by at least 5 percent. Otherwise
-the selector keeps the Phase 2 baseline.
-
-Q8_0 and Q4_K_M results are advisory by default because quantization can change
-generated text and TTS tokens. `--autotune-allow-quantized` allows a valid
-quantized result to participate in selection. `--print-effective-config` reports
-`output_consistent_with_baseline=false` when the selected quantized candidate
-has different output hashes, so the accepted quality risk is visible.
-
-The refresh command writes schema 2 cache data atomically and exits without
-opening an HTTP port. The cache contains raw rounds, aggregate metrics, output
-hashes, memory estimates and observations, screening results, skip reasons, and
-the selection reason. A failed refresh returns a nonzero status, preserves the
-previous cache, and retains its diagnostic run directories. After a successful
-refresh, the first failed run directory for each rejected candidate is retained
-and completed run directories are removed. A baseline failure
-also writes a timestamped diagnostic JSON file next to the cache.
-
-Output hashes detect drift but do not prove that spoken audio has the intended
-semantics. Audio semantics validation remains disabled, so the cache records
-`audio_semantics_verified=false`.
-
-Normal `--profile auto` startup never runs calibration. It applies a cache only
-when the executable and loaded backend SHA-256 values, CUDA versions, GGML
-device inventory, all candidate model files, fixture files, protocol settings,
-round counts, CPU thread probes, and explicit overrides match. It then rebuilds
-the candidate plan and recomputes round validity, aggregate scores, output
-consistency, and selection. A missing, stale, malformed, or internally
-inconsistent cache falls back to the Phase 2 profile.
-
-Add `--autotune-cache` to use a non-default cache path. Use
-`--print-effective-config` to inspect cache status, rejection reason, selected
-candidate, output consistency, module placement, and Token2Wav thread count
-without loading model weights or opening the HTTP port.
+Explicit `--model`, `--n-gpu-layers`, `--ctx-size`, and
+`--token2wav-threads` values are applied after the JSON file for compatibility
+with existing scripts. Per-module placement still comes from the JSON file.
+Use `--print-effective-config` to inspect the loaded file, model paths,
+quantization, module placement, and Token2Wav thread count before starting the
+server.
 
 ### Usage
 
@@ -582,7 +519,8 @@ POST /v1/stream/omni_init
   "tts_gpu_layers": 100,
   "token2wav_device": "gpu:0",
   "output_dir": "/path/to/output",
-  "voice_audio": "/path/to/reference_voice.wav"
+  "voice_audio": "/path/to/llm_reference.wav",
+  "tts_ref_audio": "/path/to/tts_reference.wav"
 }
 ```
 
@@ -590,10 +528,24 @@ POST /v1/stream/omni_init
 |-------|-------------|
 | `media_type` | `2` = vision + audio (full omni) |
 | `duplex_mode` | `true` enables full-duplex streaming |
-| `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
+| `voice_audio` | Reference WAV used by the LLM audio prompt. Omit to skip the LLM voice prompt |
+| `tts_ref_audio` | Reference WAV used to prepare the Token2Wav voice cache. Omit to reuse `voice_audio`; if both are omitted, use the static `prompt_cache.gguf` voice |
 | `output_dir` | Directory where TTS WAV files will be written |
 
-When the server starts with `--profile`, the effective runtime configuration controls `duplex_mode`, `tts_gpu_layers`, and `token2wav_device`. Values for those fields in the `omni_init` request are ignored so a request cannot silently replace the placement recorded in an applied autotune cache. Without `--profile`, the request fields keep their legacy behavior.
+When `tts_ref_audio` is provided, the server runs the StepAudio2 frontend in the
+Python sidecar, validates the resulting PromptBundle, and computes the
+Token2Wav cache in the already loaded C++ TTS models. The request fails with
+`tts_voice_prepare_failed` if the frontend or cache setup fails; the server
+does not silently keep a previous session's voice.
+
+The Python sidecar needs the external `stepaudio2` package and its Token2Wav
+model directory. By default the directory is
+`<pyt2w-script-dir>/token2wav`; set `PYTHON_T2W_MODEL_DIR` when the model is
+mounted elsewhere. Set `PYTHON_T2W_SCRIPT_DIR` when the server starts from a
+different working directory or the sidecar script is mounted outside the
+repository tree.
+
+When the server starts with `--profile`, the effective runtime configuration controls `duplex_mode`, `tts_gpu_layers`, and `token2wav_device`. Values for those fields in the `omni_init` request are ignored so a request cannot silently replace the static profile placement. Without `--profile`, the request fields keep their legacy behavior.
 
 **Expected response:**
 ```json
