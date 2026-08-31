@@ -37,6 +37,7 @@
 #include <future>
 #include <unordered_map>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <chrono>
 #include <cmath>
@@ -4029,6 +4030,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->media_type = media_type;
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
+    ctx_omni->token2wav_device = token2wav_device;
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
@@ -4820,6 +4822,12 @@ void omni_free(struct omni_context * ctx_omni) {
         if (ctx_omni->projector.initialized) {
             projector_free(ctx_omni->projector);
         }
+    }
+
+    if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+        std::remove(ctx_omni->tts_ref_audio_path.c_str());
+        ctx_omni->tts_ref_audio_path.clear();
+        ctx_omni->tts_ref_audio_owned = false;
     }
     
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
@@ -8577,6 +8585,101 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni) {
     }
     return response.find("\"status\":\"ok\"") != std::string::npos ||
            response.find("\"status\": \"ok\"") != std::string::npos;
+}
+
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_set_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (tts_ref_audio_path.empty()) {
+        return true;
+    }
+    if (!ctx_omni->use_tts) {
+        ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+        return true;
+    }
+
+    std::error_code file_error;
+    const std::filesystem::file_status file_status =
+        std::filesystem::status(tts_ref_audio_path, file_error);
+    const uintmax_t file_size =
+        file_error || !std::filesystem::is_regular_file(file_status)
+            ? 0
+            : std::filesystem::file_size(tts_ref_audio_path, file_error);
+    if (file_error || !std::filesystem::is_regular_file(file_status) ||
+        file_size < 12 ||
+        file_size > 64ULL * 1024ULL * 1024ULL) {
+        LOG_ERR("omni_set_tts_reference_audio: reference audio is not a bounded regular WAV: %s\n",
+                tts_ref_audio_path.c_str());
+        return false;
+    }
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        LOG_ERR("omni_set_tts_reference_audio: C++ Token2Wav is not initialized\n");
+        return false;
+    }
+
+    const std::string speech_tokenizer_gguf =
+        ctx_omni->token2wav_model_dir + "/speech_tokenizer_v2_25hz.gguf";
+    const std::string campplus_gguf =
+        ctx_omni->token2wav_model_dir + "/campplus.gguf";
+    int frontend_threads = 1;
+    if (const char * configured_threads = std::getenv("OMNI_T2W_FRONTEND_THREADS")) {
+        const int parsed_threads = std::atoi(configured_threads);
+        if (parsed_threads > 0) {
+            frontend_threads = parsed_threads;
+        }
+    }
+
+    if (!ctx_omni->token2wav_session->set_prompt_wav(
+            tts_ref_audio_path,
+            speech_tokenizer_gguf,
+            campplus_gguf,
+            frontend_threads,
+            5,
+            1.0f)) {
+        LOG_ERR("omni_set_tts_reference_audio: native GGUF frontend failed\n");
+        return false;
+    }
+
+    ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
+}
+
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_reset_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (!ctx_omni->use_tts) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        LOG_ERR("omni_reset_tts_reference_audio: Token2Wav is not initialized\n");
+        return false;
+    }
+
+    const std::string prompt_cache_gguf =
+        ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
+    if (!ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
+            prompt_cache_gguf, 5, 1.0f)) {
+        LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
+        return false;
+    }
+
+    if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+        std::remove(ctx_omni->tts_ref_audio_path.c_str());
+    }
+    ctx_omni->tts_ref_audio_path.clear();
+    ctx_omni->tts_ref_audio_owned = false;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
 }
 
 // ======================= Token2Wav 线程函数 =======================
