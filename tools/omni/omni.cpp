@@ -1560,64 +1560,20 @@ static llama_token sample_tts_from_logits(struct common_sampler * sampler,
     return token;
 }
 
-OmniGenerationConfig omni_python_base_generation_config() {
-    return OmniGenerationConfig{};
+OmniGenerationConfig omni_python_base_generation_config(bool duplex_mode) {
+    OmniGenerationConfig config;
+    if (duplex_mode) {
+        // Active unified-runtime defaults in the Python base.
+        config.llm_sampling.top_k = 20;
+        config.llm_sampling.repetition_penalty = 1.05f;
+        config.llm_sampling.repetition_window = 512;
+    }
+    return config;
 }
 
 static void apply_generation_config_to_params(common_params & params,
                                               const OmniGenerationConfig & config) {
     apply_llm_sampling_config(params.sampling, config.llm_sampling);
-}
-
-bool omni_apply_generation_config(struct omni_context * ctx_omni,
-                                  struct common_params * params,
-                                  const OmniGenerationConfig & config) {
-    if (!ctx_omni) {
-        return false;
-    }
-
-    common_params * effective_params = params ? params : ctx_omni->params;
-    if (effective_params) {
-        apply_generation_config_to_params(*effective_params, config);
-    }
-
-    common_sampler * new_llm_sampler = nullptr;
-    common_sampler * new_tts_sampler = nullptr;
-    common_sampler * new_tts_sampler_bos = nullptr;
-
-    if (ctx_omni->model && effective_params) {
-        new_llm_sampler = common_sampler_init(ctx_omni->model, effective_params->sampling);
-        if (!new_llm_sampler) {
-            return false;
-        }
-    }
-
-    if (ctx_omni->model_tts && effective_params) {
-        common_params_sampling tts_sampling =
-            make_tts_sampling_params(effective_params->sampling, config.tts_sampling);
-        common_params_sampling tts_first_sampling =
-            make_tts_first_token_sampling_params(effective_params->sampling, config.tts_sampling);
-        new_tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
-        new_tts_sampler_bos = common_sampler_init(ctx_omni->model_tts, tts_first_sampling);
-        if (!new_tts_sampler || !new_tts_sampler_bos) {
-            common_sampler_free(new_llm_sampler);
-            common_sampler_free(new_tts_sampler);
-            common_sampler_free(new_tts_sampler_bos);
-            return false;
-        }
-    }
-
-    common_sampler_free(ctx_omni->ctx_sampler);
-    common_sampler_free(ctx_omni->ctx_tts_sampler);
-    common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
-    ctx_omni->ctx_sampler = new_llm_sampler;
-    ctx_omni->ctx_tts_sampler = new_tts_sampler;
-    ctx_omni->ctx_tts_sampler_bos = new_tts_sampler_bos;
-    ctx_omni->generation_config = config;
-    if (effective_params) {
-        ctx_omni->params = effective_params;
-    }
-    return true;
 }
 
 // ==============================================================================
@@ -3752,8 +3708,7 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
-                                const std::string & base_output_dir,
-                                const OmniGenerationConfig & generation_config) {
+                                const std::string & base_output_dir) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -3769,7 +3724,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->duplex_mode = duplex_mode;
     ctx_omni->token2wav_device = token2wav_device;
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
-    ctx_omni->generation_config = generation_config;
+    ctx_omni->generation_config = omni_python_base_generation_config(duplex_mode);
     apply_generation_config_to_params(*params, ctx_omni->generation_config);
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式

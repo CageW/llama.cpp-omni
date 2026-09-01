@@ -24,10 +24,6 @@ int main() {
     assert(should_materialize_tts_ref_audio(true, "encoded-audio"));
     assert(!should_materialize_tts_ref_audio(true, ""));
 
-    const std::string default_ref_audio = omni_default_ref_audio_path();
-    assert(std::filesystem::path(default_ref_audio).is_absolute());
-    assert(default_ref_audio.find("default_ref_audio/default_ref_audio.wav") != std::string::npos);
-
     std::mutex octx_mutex;
     omni_context * shared_octx = nullptr;
     omni_context * pending_octx = reinterpret_cast<omni_context *>(0x1);

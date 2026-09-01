@@ -152,16 +152,15 @@ struct projector_model {
     bool initialized = false;
 };
 
-// Python base-compatible generation settings shared by LLM, TTS, Token2Wav,
-// and duplex session setup. These defaults mirror the active Python base
-// configuration rather than the generic llama.cpp defaults.
+// Hardcoded generation settings copied from the Python base. The factory below
+// selects the mode-specific LLM defaults; request payloads cannot override them.
 struct OmniSamplingConfig {
     float temperature = 0.7f;
     float top_p = 0.8f;
     int top_k = 100;
     float min_p = 0.0f;
-    float repetition_penalty = 1.05f;
-    int repetition_window = 512;
+    float repetition_penalty = 1.02f;
+    int repetition_window = 128;
     int min_tokens_to_keep = 1;
 };
 
@@ -172,8 +171,8 @@ struct OmniGenerationConfig {
 
     int tts_n_timesteps = 10;
     float token2wav_temperature = 1.0f;
-    int audio_token_chunk_size = 25;
-    int audio_prelook_size = 3;
+    static constexpr int audio_token_chunk_size = 25;
+    static constexpr int audio_prelook_size = 3;
     int tts_max_audio_tokens = 500;
     int tts_max_audio_tokens_per_text_token = 30;
     int tts_min_audio_tokens = 75;
@@ -262,7 +261,7 @@ struct omni_context {
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
 
-    // Generation settings shared by all LLM/TTS/duplex paths.
+    // Hardcoded Python-base settings for this context's mode.
     OmniGenerationConfig generation_config;
 
     struct llama_context * ctx_tts_llama = NULL;
@@ -580,14 +579,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output",
-                                const OmniGenerationConfig & generation_config = {});
+                                const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
-OmniGenerationConfig omni_python_base_generation_config();
-bool omni_apply_generation_config(struct omni_context * ctx_omni,
-                                  struct common_params * params,
-                                  const OmniGenerationConfig & config);
+OmniGenerationConfig omni_python_base_generation_config(bool duplex_mode = false);
 // Prepare a session-level Token2Wav voice from a reference WAV using the
 // native C++ frontend GGUF files in token2wav_model_dir.
 bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,

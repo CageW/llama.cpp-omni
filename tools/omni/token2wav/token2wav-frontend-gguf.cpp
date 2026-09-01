@@ -850,6 +850,7 @@ bool FrontendGGUFModels::run_campplus(const AudioFeatures & features,
                                       int num_threads,
                                       std::vector<float> & embedding,
                                       std::string * error) {
+    std::lock_guard<std::mutex> lock(run_mutex_);
     embedding.clear();
     if (features.channels != 80 || features.frames <= 0 ||
         features.values.size() != static_cast<size_t>(features.channels) * features.frames) {

@@ -4,7 +4,6 @@
 #include <string_view>
 #include <vector>
 #include <functional>
-#include <filesystem>
 #include <mutex>
 
 struct omni_context;
@@ -15,15 +14,6 @@ class SessionManager;
 
 namespace httplib {
 namespace ws { class WebSocket; }
-}
-
-inline std::string omni_default_ref_audio_path() {
-#ifdef OMNI_ASSET_DIR
-    return (std::filesystem::path(OMNI_ASSET_DIR) /
-            "default_ref_audio/default_ref_audio.wav").string();
-#else
-    return "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
-#endif
 }
 
 inline bool should_remove_prefill_audio(const std::string & prefill_audio_path,

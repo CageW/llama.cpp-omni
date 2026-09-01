@@ -13,7 +13,6 @@
 #include "ws_handler.h"
 #include "session.h"
 #include "protocol.h"
-#include "generation_config.h"
 #include "omni.h"
 #include "common.h"
 #include "llama.h"
@@ -243,19 +242,6 @@ static bool reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
     }
-    return true;
-}
-
-// Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
-// context and params. Unknown/missing keys are left at model defaults.
-static bool apply_session_config(common_params & params,
-                                 omni_context * octx,
-                                 const OmniGenerationConfig & config) {
-    if (!omni_apply_generation_config(octx, &params, config)) {
-        LOG_ERR("apply_session_config: failed to rebuild generation samplers\n");
-        return false;
-    }
-    octx->force_listen_used = 0;
     return true;
 }
 
@@ -522,8 +508,6 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
-    const OmniGenerationConfig generation_config =
-        omni_generation_config_from_json(init.config);
 
     // Build params for omni_init
     auto & p = params;
@@ -535,9 +519,6 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
         if (!reset_octx_for_session(shared_octx, init, output_dir)) {
             LOG_ERR("create_session_octx: failed to reset reused context\n");
-            return nullptr;
-        }
-        if (!apply_session_config(p, shared_octx, generation_config)) {
             return nullptr;
         }
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
@@ -552,7 +533,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
                                      /*token2wav_device*/"gpu:0", duplex_mode,
-                                     model, ctx, output_dir, generation_config);
+                                     model, ctx, output_dir);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;
@@ -589,14 +570,24 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     std::vector<std::string> retained_media_files;
 
     bool session_activated = false;
+    omni_context * octx = nullptr;
 
     // Helper: fail-fast — send session.closed and close WS
     auto fail_fast = [&](const std::string & session_id,
                          const std::string & reason,
                          omni_context * pending_octx = nullptr) {
+        if (session_activated && pending_octx == nullptr) {
+            pending_octx = octx;
+        }
         if (!session_id.empty()) {
             std::string ev = make_session_closed(session_id, reason).dump();
             ws.send(ev);
+        }
+        if (session_activated && pending_octx != nullptr) {
+            std::lock_guard<std::mutex> lock(octx_mutex);
+            pending_octx->break_event = true;
+            omni_prepare_for_reuse(pending_octx);
+            pending_octx->audio_output_cb = nullptr;
         }
         session_mgr.close(session_id);
         release_unactivated_octx_if_owned(
@@ -653,7 +644,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
     std::string session_output_dir = (fs::path(temp_dir) / session_id).string();
 
-    omni_context * octx = nullptr;
     omni_context * shared_octx_before_init = nullptr;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
@@ -665,16 +655,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             shared_octx_before_init, shared_octx, octx_mutex, omni_free);
         fail_fast(session_id, "omni_init_failed");
         return;
-    }
-
-    if (parsed_init.use_tts &&
-        parsed_init.ref_audio_b64.empty() &&
-        parsed_init.tts_ref_audio_b64.empty()) {
-        if (!omni_set_tts_reference_audio(
-                octx, omni_default_ref_audio_path())) {
-            fail_fast(session_id, "tts_voice_prepare_failed", octx);
-            return;
-        }
     }
 
     std::string voice_wav;
@@ -955,7 +935,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 if (octx->params) {
                     octx->params->n_predict = parsed_input.max_new_tokens;
                 }
-                    octx->generation_config.length_penalty = parsed_input.length_penalty;
                 const bool prev_use_tts = octx->use_tts;
                 octx->use_tts = parsed_input.use_tts_template;
                 configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);
@@ -1328,6 +1307,7 @@ cleanup:
             }
             session->octx->text_cv.notify_all();
             omni_prepare_for_reuse(session->octx);
+            session->octx->audio_output_cb = nullptr;
         }
         session_mgr.close(session_id);
     }

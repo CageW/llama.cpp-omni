@@ -92,7 +92,8 @@ struct ParsedSessionInit {
 
     std::string system_prompt;
 
-    // opaque pass-through config (sampling params)
+    // Reserved for protocol compatibility; C++ generation parameters are fixed
+    // to the Python-base defaults and ignore sampling overrides here.
     json config;
 };
 
@@ -109,6 +110,8 @@ struct ParsedInput {
     // Turn-based fields
     bool streaming = true;
     int max_new_tokens = 512;
+    // Retained for wire compatibility; C++ generation uses its fixed
+    // Python-base mode configuration.
     float length_penalty = 1.1f;
     bool omni_mode = false;               // pass-through hints (§4.2)
     bool use_tts_template = false;        // emit speech for this turn (use_tts_template OR tts.enabled)
