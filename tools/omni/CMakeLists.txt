@@ -246,7 +246,10 @@ if (LLAMA_BUILD_TESTS)
     target_include_directories(${TARGET_T2W_FRONTEND_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
     target_compile_features(${TARGET_T2W_FRONTEND_TEST} PRIVATE cxx_std_17)
     add_test(NAME ${TARGET_T2W_FRONTEND_TEST} COMMAND ${TARGET_T2W_FRONTEND_TEST})
-    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES LABELS "main;omni;tts")
+    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "main;omni;tts"
+    )
 
     set(TARGET_T2W_SESSION_TEST test-token2wav-session)
     add_executable(${TARGET_T2W_SESSION_TEST} test/test-token2wav-session.cpp)

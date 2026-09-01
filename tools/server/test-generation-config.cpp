@@ -16,6 +16,15 @@ int main() {
     assert(nearly_equal(simplex.llm_sampling.repetition_penalty, 1.02f));
     assert(simplex.llm_sampling.repetition_window == 128);
     assert(nearly_equal(simplex.length_penalty, 1.0f));
+    const std::vector<llama_token> control_tokens = {10, 11, 12, 13, 14, 15};
+    assert(!omni_llm_token_should_update_repetition_history(
+        10, control_tokens.data(), control_tokens.size()));
+    assert(!omni_llm_token_should_update_repetition_history(
+        11, control_tokens.data(), control_tokens.size()));
+    assert(!omni_llm_token_should_update_repetition_history(
+        13, control_tokens.data(), control_tokens.size()));
+    assert(omni_llm_token_should_update_repetition_history(
+        100, control_tokens.data(), control_tokens.size()));
 
     const OmniGenerationConfig duplex =
         omni_python_base_generation_config(true);
@@ -24,9 +33,14 @@ int main() {
     assert(duplex.llm_sampling.top_k == 20);
     assert(nearly_equal(duplex.llm_sampling.repetition_penalty, 1.05f));
     assert(duplex.llm_sampling.repetition_window == 512);
-    assert(nearly_equal(duplex.length_penalty, 1.0f));
+    assert(nearly_equal(duplex.length_penalty, 1.1f));
     assert(duplex.force_listen_count == 0);
     assert(duplex.max_new_speak_tokens_per_chunk == 20);
+    assert(!omni_duplex_tts_uses_top_filters());
+    assert(omni_duplex_tts_output_token_count_for_budget(26) == 25);
+    assert(omni_tts_min_new_tokens_for_chunk(duplex, true, false, 0) == 0);
+    assert(omni_tts_min_new_tokens_for_chunk(duplex, true, false, 1) == 26);
+    assert(omni_tts_min_new_tokens_for_chunk(duplex, true, true, 1) == 0);
 
     for (const OmniGenerationConfig * config : {&simplex, &duplex}) {
         assert(config->tts_n_timesteps == 10);

@@ -386,7 +386,7 @@ ParsedInput parse_input_append(const json & msg) {
     if (in.contains("generation") && in.at("generation").is_object()) {
         const json & gen = in.at("generation");
         out.max_new_tokens = json_int(gen, "max_new_tokens", 512);
-        out.length_penalty = json_float(gen, "length_penalty", 1.1f);
+        out.length_penalty = json_float(gen, "length_penalty", 1.0f);
     }
 
     if (in.contains("image") && in.at("image").is_object()) {

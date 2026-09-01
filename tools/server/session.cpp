@@ -38,7 +38,7 @@ std::string SessionManager::allocate() {
         return ""; // fail-fast: only one active session
     }
 
-    auto session = std::make_unique<OmniSession>();
+    auto session = std::make_shared<OmniSession>();
     session->session_id = generate_uuid();
     session->state = SessionState::UNINITIALIZED;
     session->created_at = now_seconds();
@@ -64,13 +64,13 @@ bool SessionManager::activate(const std::string & session_id, omni_context * oct
     return true;
 }
 
-OmniSession * SessionManager::get(const std::string & session_id) {
+std::shared_ptr<OmniSession> SessionManager::get(const std::string & session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
 
     if (!active_ || active_->session_id != session_id) {
-        return nullptr;
+        return {};
     }
-    return active_.get();
+    return active_;
 }
 
 void SessionManager::set_close_callback(const std::string & session_id, std::function<void()> cb) {
@@ -98,7 +98,7 @@ void SessionManager::request_transport_close(const std::string & session_id) {
 }
 
 void SessionManager::close(const std::string & session_id) {
-    std::unique_ptr<OmniSession> to_free;
+    std::shared_ptr<OmniSession> to_free;
     {
         std::lock_guard<std::mutex> lock(mtx_);
 
@@ -123,7 +123,7 @@ void SessionManager::close(const std::string & session_id) {
 }
 
 void SessionManager::on_disconnect() {
-    std::unique_ptr<OmniSession> to_free;
+    std::shared_ptr<OmniSession> to_free;
     {
         std::lock_guard<std::mutex> lock(mtx_);
 
@@ -146,8 +146,14 @@ bool SessionManager::has_active() const {
     return active_ && active_->state == SessionState::ACTIVE;
 }
 
+bool SessionManager::is_active(const std::string & session_id) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return active_ && active_->session_id == session_id &&
+           active_->state == SessionState::ACTIVE;
+}
+
 void SessionManager::shutdown() {
-    std::unique_ptr<OmniSession> to_free;
+    std::shared_ptr<OmniSession> to_free;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         to_free = std::move(active_);

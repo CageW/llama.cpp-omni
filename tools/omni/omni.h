@@ -16,6 +16,7 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <cstddef>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -207,6 +208,15 @@ inline int omni_effective_tts_top_k(const OmniSamplingConfig & config) {
     return config.top_k > 0
         ? std::max(config.top_k, config.min_tokens_to_keep)
         : config.top_k;
+}
+
+inline int omni_tts_min_new_tokens_for_chunk(const OmniGenerationConfig & config,
+                                             bool duplex_mode,
+                                             bool is_end_of_turn,
+                                             int tts_n_past_accumulated) {
+    return duplex_mode && !is_end_of_turn && tts_n_past_accumulated > 0
+        ? config.duplex_tts_min_audio_tokens
+        : 0;
 }
 
 struct OmniTextChunkPlan {
@@ -509,7 +519,6 @@ struct omni_context {
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
-    struct common_sampler * ctx_tts_sampler_bos = NULL;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     std::string token2wav_device = "gpu:0";
     
@@ -583,6 +592,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
 void omni_free(struct omni_context * ctx_omni);
 OmniGenerationConfig omni_python_base_generation_config(bool duplex_mode = false);
+bool omni_llm_token_should_update_repetition_history(
+    llama_token token, const llama_token * control_tokens, size_t control_count);
+bool omni_duplex_tts_uses_top_filters();
+int omni_duplex_tts_output_token_count_for_budget(int max_new_tokens);
 // Prepare a session-level Token2Wav voice from a reference WAV using the
 // native C++ frontend GGUF files in token2wav_model_dir.
 bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,

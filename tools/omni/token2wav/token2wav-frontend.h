@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,10 @@ class Token2WavFrontend {
                                                        std::string *                  error = nullptr);
     static bool validate_campplus_output_shape(const std::vector<int64_t> & shape,
                                                std::string *                  error = nullptr);
+
+    // Return the ggml metadata arena required for a graph with the given
+    // capacity, plus caller-owned extra metadata bytes.
+    static size_t compute_ggml_context_size(size_t graph_size, size_t extra_bytes = 0);
 
     // Run the native WAV frontend using the two GGUF frontend models.
     static bool prepare_prompt_bundle(const std::string & ref_wav_path,

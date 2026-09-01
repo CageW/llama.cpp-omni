@@ -383,8 +383,7 @@ int main(int argc, char ** argv) {
         std::string session_id = req.path_params.at("session_id");
         LOG_INF("Close session requested: %s\n", session_id.c_str());
 
-        auto * session = state.session_mgr.get(session_id);
-        if (!session || session->state != SessionState::ACTIVE) {
+        if (!state.session_mgr.is_active(session_id)) {
             res_error(res, format_error_response("session not found", "not_found"));
             res.status = 404;
             return;
@@ -396,7 +395,7 @@ int main(int argc, char ** argv) {
         // threads are stopped and the shared omni_context is safe to reuse.
         {
             std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
-            auto * closing = state.session_mgr.get(session_id);
+            auto closing = state.session_mgr.get(session_id);
             if (closing && closing->octx) {
                 closing->octx->break_event = true;
                 {

@@ -461,6 +461,33 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+void common_sampler_accept_without_penalty(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+    if (!gsmpl) {
+        return;
+    }
+
+    const auto tm = gsmpl->tm();
+    const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
+
+    if (gsmpl->rbudget && is_generated) {
+        llama_sampler_accept(gsmpl->rbudget, token);
+    }
+
+    if (gsmpl->grmr && accept_grammar) {
+        llama_sampler_accept(gsmpl->grmr, token);
+    }
+
+    const int n_samplers = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i < n_samplers; ++i) {
+        llama_sampler * sampler = llama_sampler_chain_get(gsmpl->chain, i);
+        if (sampler && std::strcmp(llama_sampler_name(sampler), "penalties") != 0) {
+            llama_sampler_accept(sampler, token);
+        }
+    }
+
+    gsmpl->prev.push_back(token);
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;

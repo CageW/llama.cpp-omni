@@ -5773,6 +5773,14 @@ int main(int argc, char ** argv) {
         }
         bool use_tts = json_value(data, "use_tts", true);
         bool duplex_mode = json_value(data, "duplex_mode", false);
+        std::string voice_audio;
+        if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
+            voice_audio = data.at("voice_audio").get<std::string>();
+        }
+        std::string tts_ref_audio;
+        if (data.contains("tts_ref_audio") && data.at("tts_ref_audio").is_string()) {
+            tts_ref_audio = data.at("tts_ref_audio").get<std::string>();
+        }
         
         // 模型目录配置
         std::string model_dir = json_value(data, "model_dir", std::string("./tools/omni/convert/gguf/"));
@@ -5850,42 +5858,56 @@ int main(int argc, char ** argv) {
             }
             // 传入已加载的 LLM 模型和上下文，避免重复加载（节省 GPU 显存）
             // 🔧 [多实例支持] 传递可配置的 output_dir
-            ctx_server.octx = omni_init(&params, media_type, use_tts, tts_bin_dir, tts_gpu_layers, token2wav_device, duplex_mode,
-                                        ctx_server.model, ctx_server.ctx, output_dir);
-            if (ctx_server.octx == nullptr) {
+            omni_context * new_octx = omni_init(
+                &params, media_type, use_tts, tts_bin_dir, tts_gpu_layers,
+                token2wav_device, duplex_mode, ctx_server.model, ctx_server.ctx,
+                output_dir);
+            if (new_octx == nullptr) {
                 res_error(res, format_error_response("omni_init failed", ERROR_TYPE_SERVER));
                 return;
             }
-            ctx_server.octx->async = true;
-            ctx_server.octx->duplex_mode = duplex_mode;  // 确保设置
+            new_octx->async = true;
+            new_octx->duplex_mode = duplex_mode;  // 确保设置
 
             // 外部传入 system prompt（优先于 C++ 内置默认值）
             if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
                 const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
-                ctx_server.octx->audio_voice_clone_prompt = vcp;
-                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                new_octx->audio_voice_clone_prompt = vcp;
+                new_octx->omni_voice_clone_prompt = vcp;
                 SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
             }
             if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
                 const std::string ap = data.at("assistant_prompt").get<std::string>();
-                ctx_server.octx->audio_assistant_prompt = ap;
-                ctx_server.octx->omni_assistant_prompt = ap;
+                new_octx->audio_assistant_prompt = ap;
+                new_octx->omni_assistant_prompt = ap;
                 SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
             }
 
+            new_octx->ref_audio_path = voice_audio;
+            if (use_tts && tts_ref_audio.empty()) {
+                tts_ref_audio = voice_audio;
+            }
+            if (use_tts && !tts_ref_audio.empty() &&
+                !omni_set_tts_reference_audio(new_octx, tts_ref_audio)) {
+                omni_free(new_octx);
+                res_error(res, format_error_response(
+                    "omni_set_tts_reference_audio failed", ERROR_TYPE_SERVER));
+                return;
+            }
+
             // optional: voice cloning audio during init, index=0
-            if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
-                const std::string voice_audio = data.at("voice_audio");
-                if (!voice_audio.empty()) {
-                    if (!stream_prefill(ctx_server.octx, voice_audio, /*img*/"", /*index*/0)) {
-                        res_error(res, format_error_response("stream_prefill(voice_audio) failed", ERROR_TYPE_SERVER));
-                        return;
-                    }
-                    if (ctx_server.octx->llm_thread_info) {
-                        ctx_server.octx->llm_thread_info->start = std::chrono::steady_clock::now();
-                    }
+            if (!voice_audio.empty()) {
+                if (!stream_prefill(new_octx, voice_audio, /*img*/"", /*index*/0)) {
+                    omni_free(new_octx);
+                    res_error(res, format_error_response(
+                        "stream_prefill(voice_audio) failed", ERROR_TYPE_SERVER));
+                    return;
+                }
+                if (new_octx->llm_thread_info) {
+                    new_octx->llm_thread_info->start = std::chrono::steady_clock::now();
                 }
             }
+            ctx_server.octx = new_octx;
         }
 
         json ack = {
@@ -5984,6 +6006,7 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: reset requested, clearing KV caches\n", __func__);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 清空 LLM KV cache
             if (ctx_server.octx->ctx_llama) {
@@ -6002,10 +6025,18 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: TTS KV cache cleared\n", __func__);
                 }
             }
+            common_sampler_reset(ctx_server.octx->ctx_sampler);
+            common_sampler_reset(ctx_server.octx->ctx_tts_sampler);
             
             // 3. 重置状态变量
             ctx_server.octx->n_past = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
+            ctx_server.octx->tts_token_buffer.clear();
+            ctx_server.octx->tts_n_past_accumulated = 0;
+            ctx_server.octx->tts_condition_saved = false;
+            ctx_server.octx->tts_condition_embeddings.clear();
+            ctx_server.octx->tts_condition_length = 0;
+            ctx_server.octx->tts_condition_n_embd = 0;
             ctx_server.octx->break_event = false;
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
@@ -6067,6 +6098,7 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: update_session_config requested\n", __func__);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 更新 media_type（如果提供）
             bool media_type_changed = false;
@@ -6156,11 +6188,19 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: TTS KV cache cleared\n", __func__);
                 }
             }
+            common_sampler_reset(ctx_server.octx->ctx_sampler);
+            common_sampler_reset(ctx_server.octx->ctx_tts_sampler);
             
             // 4. 重置状态变量
             ctx_server.octx->n_past = 0;
             ctx_server.octx->n_keep = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
+            ctx_server.octx->tts_token_buffer.clear();
+            ctx_server.octx->tts_n_past_accumulated = 0;
+            ctx_server.octx->tts_condition_saved = false;
+            ctx_server.octx->tts_condition_embeddings.clear();
+            ctx_server.octx->tts_condition_length = 0;
+            ctx_server.octx->tts_condition_n_embd = 0;
             ctx_server.octx->break_event = false;
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;

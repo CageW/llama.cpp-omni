@@ -1288,9 +1288,13 @@ static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_param
     return eval_tokens_with_hidden(ctx_omni, params, embd_inp, n_batch, n_past, hidden_states);
 }
 
+static void accept_llm_token(struct common_sampler * sampler,
+                             const omni_context * ctx_omni,
+                             llama_token token);
+
 static const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    common_sampler_accept(smpl, id, true);
+    accept_llm_token(smpl, ctx_omni, id);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -1303,7 +1307,7 @@ static const char * sample(struct common_sampler * smpl, struct omni_context * c
 
 static const char * sample_with_hidden(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    common_sampler_accept(smpl, id, true);
+    accept_llm_token(smpl, ctx_omni, id);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -1319,14 +1323,87 @@ static const char * llama_loop(struct omni_context * ctx_omni, common_params *pa
     return tmp;
 }
 
+static llama_token sample_with_distribution_only(struct common_sampler * sampler,
+                                                 llama_token_data_array * candidates,
+                                                 float temperature) {
+    llama_sampler * chain = common_sampler_get(sampler);
+    if (!chain || !candidates) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const int n_samplers = llama_sampler_chain_n(chain);
+    if (n_samplers <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    std::vector<llama_sampler *> stages;
+    stages.reserve(n_samplers);
+    for (int i = 0; i < n_samplers; ++i) {
+        stages.push_back(llama_sampler_chain_get(chain, i));
+    }
+    for (int i = n_samplers - 1; i >= 0; --i) {
+        llama_sampler_chain_remove(chain, i);
+    }
+
+    llama_token sampled = LLAMA_TOKEN_NULL;
+    llama_sampler * temperature_sampler = llama_sampler_init_temp(temperature);
+    llama_sampler * distribution_sampler = stages.back();
+    if (temperature_sampler &&
+        std::strcmp(llama_sampler_name(distribution_sampler), "dist") == 0) {
+        llama_sampler_apply(temperature_sampler, candidates);
+        llama_sampler_apply(distribution_sampler, candidates);
+        if (candidates->selected >= 0 &&
+            candidates->selected < static_cast<int>(candidates->size)) {
+            sampled = candidates->data[candidates->selected].id;
+        }
+    }
+    llama_sampler_free(temperature_sampler);
+
+    for (llama_sampler * stage : stages) {
+        llama_sampler_chain_add(chain, stage);
+    }
+    return sampled;
+}
+
 // 修改sample_with_hidden来返回token ID（通过引用参数）
 // 🔧 [双工模式] 支持 listen_prob_scale 参数，增加 <|listen|> 的采样概率
 // 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
 static const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states, llama_token & token_id) {
     float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    llama_token id = LLAMA_TOKEN_NULL;
+
+    if (ctx_omni->duplex_mode && logits != nullptr &&
+        ctx_omni->special_token_chunk_eos >= 0) {
+        const llama_vocab * vocab =
+            llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        if (ctx_omni->special_token_chunk_eos < n_vocab) {
+            std::vector<llama_token_data> raw_candidates;
+            raw_candidates.reserve(n_vocab);
+            for (llama_token token = 0; token < n_vocab; ++token) {
+                raw_candidates.push_back({token, logits[token], 0.0f});
+            }
+            llama_token_data_array raw_array = {
+                raw_candidates.data(), raw_candidates.size(), -1, false
+            };
+            const llama_token raw_token =
+                sample_with_distribution_only(smpl, &raw_array, 1.0f);
+            if (raw_token == LLAMA_TOKEN_NULL) {
+                LOG_ERR("LLM Duplex: raw chunk_eos sampling failed\n");
+                return nullptr;
+            }
+            if (raw_token == ctx_omni->special_token_chunk_eos) {
+                id = raw_token;
+            } else {
+                // Python masks chunk_eos before the final filtered sample when
+                // the independent raw sample did not choose it.
+                logits[ctx_omni->special_token_chunk_eos] = -INFINITY;
+            }
+        }
+    }
     
     // 🔧 [双工模式] 在采样前调整 logits
-    if (ctx_omni->duplex_mode) {
+    if (id == LLAMA_TOKEN_NULL && ctx_omni->duplex_mode) {
         if (logits != nullptr) {
             // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
             // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
@@ -1363,7 +1440,7 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     
     // 🔧 [Length Penalty] 调整 EOS token 的 logit 值（单工模式）
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    if (!ctx_omni->duplex_mode && ctx_omni->generation_config.length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
+    if (id == LLAMA_TOKEN_NULL && !ctx_omni->duplex_mode && ctx_omni->generation_config.length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
         if (logits != nullptr) {
             float eos_logit = logits[ctx_omni->special_token_tts_eos];
             if (eos_logit > 0) {
@@ -1376,9 +1453,11 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
         }
     }
     
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    if (id == LLAMA_TOKEN_NULL) {
+        id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    }
     token_id = id;  // 保存token ID
-    common_sampler_accept(smpl, id, true);
+    accept_llm_token(smpl, ctx_omni, id);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -1456,20 +1535,17 @@ static void apply_llm_sampling_config(common_params_sampling & sampling,
 }
 
 static common_params_sampling make_tts_sampling_params(const common_params_sampling & base,
-                                                        const OmniSamplingConfig & config) {
+                                                        const OmniSamplingConfig & config,
+                                                        bool duplex_mode) {
     // TTS applies its power-based repetition processor in the adapter. Its
     // Python gen_logits path does not apply min_p.
-    common_params_sampling result = make_sampling_params(base, config, false, true, false, true);
+    const bool include_filters = !duplex_mode || omni_duplex_tts_uses_top_filters();
+    common_params_sampling result = make_sampling_params(
+        base, config, false, include_filters, false, true);
     // Hugging Face TopKLogitsWarper keeps at least min_tokens_to_keep
     // candidates, even when top_k is smaller.
     result.top_k = omni_effective_tts_top_k(config);
     return result;
-}
-
-static common_params_sampling make_tts_first_token_sampling_params(
-        const common_params_sampling & base,
-        const OmniSamplingConfig & config) {
-    return make_sampling_params(base, config, false, false, false);
 }
 
 static std::vector<int32_t> make_token2wav_prefix(const omni_context * ctx_omni) {
@@ -1536,27 +1612,29 @@ static llama_token sample_tts_from_logits(struct common_sampler * sampler,
         candidates.data(), candidates.size(), -1, false
     };
 
-    common_sampler * effective_sampler = sampler;
-    if (skip_processors && ctx_omni->ctx_tts_sampler_bos) {
-        effective_sampler = ctx_omni->ctx_tts_sampler_bos;
-    }
-    llama_sampler * chain = common_sampler_get(effective_sampler);
+    llama_sampler * chain = common_sampler_get(sampler);
     if (!chain) {
         return LLAMA_TOKEN_NULL;
     }
-    llama_sampler_apply(chain, &candidate_array);
+
+    if (!skip_processors) {
+        llama_sampler_apply(chain, &candidate_array);
+    } else {
+        if (sample_with_distribution_only(
+                sampler, &candidate_array, config.temperature) == LLAMA_TOKEN_NULL) {
+            return LLAMA_TOKEN_NULL;
+        }
+    }
+
     if (candidate_array.selected < 0 ||
         candidate_array.selected >= static_cast<int>(candidate_array.size)) {
         return LLAMA_TOKEN_NULL;
     }
 
     const llama_token token = candidate_array.data[candidate_array.selected].id;
-    // Keep the normal sampler's history even when the first-token sampler was
-    // used to skip Python's processors and TopP/TopK filters.
+    // Accept on the restored chain so all persistent sampler state advances
+    // exactly once, including the shared distribution sampler.
     common_sampler_accept(sampler, token, true);
-    if (effective_sampler != sampler) {
-        common_sampler_accept(effective_sampler, token, true);
-    }
     return token;
 }
 
@@ -1567,8 +1645,57 @@ OmniGenerationConfig omni_python_base_generation_config(bool duplex_mode) {
         config.llm_sampling.top_k = 20;
         config.llm_sampling.repetition_penalty = 1.05f;
         config.llm_sampling.repetition_window = 512;
+        config.length_penalty = 1.1f;
     }
     return config;
+}
+
+bool omni_llm_token_should_update_repetition_history(
+        llama_token token, const llama_token * control_tokens, size_t control_count) {
+    if (control_tokens == nullptr) {
+        return true;
+    }
+    return std::find(control_tokens, control_tokens + control_count, token) ==
+           control_tokens + control_count;
+}
+
+bool omni_duplex_tts_uses_top_filters() {
+    // MiniCPMTTS::generate_chunk applies the repetition processor but does not
+    // apply the TopP/TopK warpers in the duplex Python base path.
+    return false;
+}
+
+int omni_duplex_tts_output_token_count_for_budget(int max_new_tokens) {
+    // Python generate_chunk returns new_tokens[:, 0:t, :] after a budget
+    // exhaustion, so the last loop slot is not part of the returned chunk.
+    return max_new_tokens > 0 ? max_new_tokens - 1 : 0;
+}
+
+static void accept_llm_token(struct common_sampler * sampler,
+                             const omni_context * ctx_omni,
+                             llama_token token) {
+    if (sampler == nullptr || ctx_omni == nullptr) {
+        return;
+    }
+
+    const std::array<llama_token, 10> control_tokens = {
+        ctx_omni->special_token_listen,
+        ctx_omni->special_token_speak,
+        ctx_omni->special_token_chunk_eos,
+        ctx_omni->special_token_chunk_tts_eos,
+        ctx_omni->special_token_turn_eos,
+        ctx_omni->special_token_tts_eos,
+        ctx_omni->special_token_eos,
+        ctx_omni->tts_bos_token_id,
+        ctx_omni->special_token_unit_end,
+        ctx_omni->special_token_tts_pad,
+    };
+    if (omni_llm_token_should_update_repetition_history(
+            token, control_tokens.data(), control_tokens.size())) {
+        common_sampler_accept(sampler, token, true);
+    } else {
+        common_sampler_accept_without_penalty(sampler, token, true);
+    }
 }
 
 static void apply_generation_config_to_params(common_params & params,
@@ -3705,6 +3832,26 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     return model;
 }
 
+static void omni_cleanup_llm_resources(
+        omni_context * ctx_omni,
+        llama_context *& ctx_llama,
+        llama_model *& model,
+        common_sampler *& sampler) {
+    common_sampler_free(sampler);
+    sampler = nullptr;
+
+    if (ctx_omni == nullptr || ctx_omni->owns_model) {
+        if (ctx_llama != nullptr) {
+            llama_free(ctx_llama);
+        }
+        if (model != nullptr) {
+            llama_free_model(model);
+        }
+    }
+    ctx_llama = nullptr;
+    model = nullptr;
+}
+
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
@@ -3778,6 +3925,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
     llama_model * model = nullptr;
     llama_context * ctx_llama = nullptr;
+    common_sampler * sampler = nullptr;
     
     // 支持模型复用（单工模式常用）
     if (existing_model != nullptr && existing_ctx != nullptr) {
@@ -3809,18 +3957,26 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         if (model == NULL) {
             return NULL;
         }
+        ctx_omni->owns_model = true;
         llama_context_params ctx_params = common_context_params_to_llama(*params);
         ctx_params.n_ctx                = params->n_ctx;
         
         ctx_llama = llama_new_context_with_model(model, ctx_params);
         if (ctx_llama == NULL) {
             LOG_ERR("%s: error: failed to create the llama_context\n" , __func__);
+            omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
+            delete ctx_omni;
             return NULL;
         }
-        ctx_omni->owns_model = true;  // 拥有模型，omni_free 时需要释放
     }
     
-    struct common_sampler * sampler = common_sampler_init(model, params->sampling);
+    sampler = common_sampler_init(model, params->sampling);
+    if (sampler == nullptr) {
+        LOG_ERR("%s: error: failed to initialize the LLM sampler\n", __func__);
+        omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
+        delete ctx_omni;
+        return NULL;
+    }
     ctx_omni->ctx_llama = ctx_llama;
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
@@ -3833,9 +3989,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         llama_model * tts_model = llama_init_tts(params, params->tts_model, tts_gpu_layers);
         if (tts_model == NULL) {
             LOG_ERR("%s: error: failed to init TTS model from %s\n", __func__, params->tts_model.c_str());
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
+            omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
             delete ctx_omni;
             return NULL;
         }
@@ -3852,30 +4006,25 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             LOG_ERR("%s: error: failed to create the TTS llama_context\n", __func__);
             llama_free_model(tts_model);
             // 清理已分配的资源
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
+            omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
             delete ctx_omni;
             return NULL;
         }
         
-        // Build the generic TTS sampler from the shared Python-compatible
-        // configuration. The first-token sampler intentionally omits the
-        // Python TopP/TopK and repetition processors.
+        // Build one persistent TTS sampler from the shared Python-compatible
+        // configuration. Its state is reset at turn boundaries and retained
+        // across text chunks.
         common_params_sampling tts_sampling =
-            make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
+            make_tts_sampling_params(
+                params->sampling,
+                ctx_omni->generation_config.tts_sampling,
+                duplex_mode);
         struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
-        common_params_sampling tts_first_sampling =
-            make_tts_first_token_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
-        struct common_sampler * tts_sampler_bos = common_sampler_init(tts_model, tts_first_sampling);
-        if (!tts_sampler || !tts_sampler_bos) {
+        if (!tts_sampler) {
             common_sampler_free(tts_sampler);
-            common_sampler_free(tts_sampler_bos);
             llama_free(ctx_tts_llama);
             llama_free_model(tts_model);
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
+            omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
             delete ctx_omni;
             return NULL;
         }
@@ -3888,7 +4037,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->model_tts = tts_model;
         ctx_omni->ctx_tts_llama = ctx_tts_llama;
         ctx_omni->ctx_tts_sampler = tts_sampler;
-        ctx_omni->ctx_tts_sampler_bos = tts_sampler_bos;
         
         // Load TTS weights from GGUF file
         print_with_timestamp("TTS: loading weights from GGUF (emb_code, emb_text, projector_semantic, head_code)...\n");
@@ -3897,10 +4045,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_tts_llama);
             llama_free_model(tts_model);
             common_sampler_free(tts_sampler);
-            common_sampler_free(tts_sampler_bos);
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
+            omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
             delete ctx_omni;
             return NULL;
         }
@@ -3926,11 +4071,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_omni->ctx_tts_llama);
             llama_free_model(ctx_omni->model_tts);
             common_sampler_free(ctx_omni->ctx_tts_sampler);
-            common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
         }
-        llama_free(ctx_llama);
-        llama_free_model(model);
-        common_sampler_free(sampler);
+        omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
         delete ctx_omni;
         return NULL;
     }
@@ -3943,11 +4085,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_omni->ctx_tts_llama);
             llama_free_model(ctx_omni->model_tts);
             common_sampler_free(ctx_omni->ctx_tts_sampler);
-            common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
         }
-        llama_free(ctx_llama);
-        llama_free_model(model);
-        common_sampler_free(sampler);
+        omni_cleanup_llm_resources(ctx_omni, ctx_llama, model, sampler);
         delete ctx_omni;
         return NULL;
     }
@@ -4486,7 +4625,6 @@ void omni_free(struct omni_context * ctx_omni) {
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
-        common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
 
         if (ctx_omni->tts_condition_graph.initialized) {
             tts_condition_graph_free(ctx_omni);
@@ -5063,6 +5201,7 @@ static bool generate_audio_tokens_local_simplex(
         ctx_omni->tts_n_past_accumulated = 0;
         ctx_omni->tts_all_generated_tokens.clear();
         ctx_omni->tts_token_buffer.clear();  // 🔧 [与 Python 对齐] 新轮对话清空 buffer
+        common_sampler_reset(ctx_omni->ctx_tts_sampler);
         print_with_timestamp("TTS Simplex: first chunk - cleared tts_all_generated_tokens and tts_token_buffer\n");
     } else {
         n_past_tts = ctx_omni->tts_n_past_accumulated;
@@ -5078,16 +5217,12 @@ static bool generate_audio_tokens_local_simplex(
     }
     print_with_timestamp("TTS Simplex: prefill completed, n_past_tts=%d\n", n_past_tts);
     
-    // Create the sampler from the shared Python-compatible TTS config.
-    common_params_sampling tts_sampling =
-        make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
-    
-    struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
+    struct common_sampler * tts_sampler = ctx_omni->ctx_tts_sampler;
     if (!tts_sampler) {
-        LOG_ERR("TTS Simplex: failed to create sampler\n");
+        LOG_ERR("TTS Simplex: persistent sampler is not initialized\n");
         return false;
     }
-    print_with_timestamp("TTS Simplex: sampler created\n");
+    print_with_timestamp("TTS Simplex: using persistent sampler\n");
     
     output_audio_tokens.clear();
     
@@ -5219,8 +5354,6 @@ static bool generate_audio_tokens_local_simplex(
         print_with_timestamp("TTS Simplex: 发送 is_chunk_end=true 信号\n");
     }
     
-    common_sampler_free(tts_sampler);
-    
     print_with_timestamp("TTS Simplex: generated %zu audio tokens for chunk %d\n",
                         output_audio_tokens.size(), chunk_idx);
     
@@ -5302,9 +5435,12 @@ static bool generate_audio_tokens_local(
     // TTS model constants
     const int audio_bos_token_id = 151687;
     const int num_audio_tokens = 6562;
-    const int max_audio_tokens = ctx_omni->duplex_mode
+    const int configured_max_audio_tokens = ctx_omni->duplex_mode
         ? ctx_omni->generation_config.duplex_tts_max_audio_tokens
         : ctx_omni->generation_config.tts_max_audio_tokens;
+    const int max_audio_tokens = ctx_omni->duplex_mode
+        ? omni_duplex_tts_output_token_count_for_budget(configured_max_audio_tokens)
+        : configured_max_audio_tokens;
     print_with_timestamp("TTS Local: mode=%s, max_audio_tokens=%d\n", 
                          ctx_omni->duplex_mode ? "duplex" : "simplex", max_audio_tokens);
     
@@ -5386,6 +5522,7 @@ static bool generate_audio_tokens_local(
         if (!ctx_omni->duplex_mode) {
             ctx_omni->tts_token_buffer.clear();  // 🔧 [与 Python 对齐] 新轮对话清空 buffer（仅单工模式）
         }
+        common_sampler_reset(ctx_omni->ctx_tts_sampler);
         print_with_timestamp("TTS Local: first chunk - cleared tts_all_generated_tokens and tts_token_buffer\n");
     } else {
         // 后续 chunk：保持 KV cache，继续使用累计的 n_past
@@ -5401,13 +5538,10 @@ static bool generate_audio_tokens_local(
     }
     print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d\n", n_past_tts);
     
-    // 2. Create the sampler from the shared Python-compatible TTS config.
-    common_params_sampling tts_sampling =
-        make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
-    
-    struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
+    // 2. Use the persistent sampler created with the TTS model.
+    struct common_sampler * tts_sampler = ctx_omni->ctx_tts_sampler;
     if (!tts_sampler) {
-        LOG_ERR("TTS Local: failed to create sampler\n");
+        LOG_ERR("TTS Local: persistent sampler is not initialized\n");
         return false;
     }
     
@@ -5422,9 +5556,11 @@ static bool generate_audio_tokens_local(
     
     // Duplex keeps the Python per-chunk minimum; turn-based generation lets
     // the TTS model stop naturally.
-    const int min_new_tokens = ctx_omni->duplex_mode && !is_end_of_turn
-        ? ctx_omni->generation_config.duplex_tts_min_audio_tokens
-        : 0;
+    const int min_new_tokens = omni_tts_min_new_tokens_for_chunk(
+        ctx_omni->generation_config,
+        ctx_omni->duplex_mode,
+        is_end_of_turn,
+        ctx_omni->tts_n_past_accumulated);
     
     // 🚀 流水线优化：Token2Wav需要28个tokens (25+3 lookahead)才能输出音频
     // 首批28个tokens后推送，后续每25个tokens推送一次
@@ -5544,9 +5680,6 @@ static bool generate_audio_tokens_local(
         }
         ctx_omni->t2w_thread_info->cv.notify_one();
     }
-    
-    // Cleanup sampler
-    common_sampler_free(tts_sampler);
     
     // 🔧 更新累计 n_past，用于下一个 chunk 的 KV cache 位置
     // Python: self.text_start_pos += condition_length + len(chunk_generated_tokens)
@@ -9540,7 +9673,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     if (ctx_omni->force_listen_used < ctx_omni->generation_config.force_listen_count) {
         ctx_omni->force_listen_used++;
         if (ctx_omni->special_token_listen >= 0) {
-            common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
+            accept_llm_token(
+                ctx_omni->ctx_sampler, ctx_omni, ctx_omni->special_token_listen);
             std::vector<llama_token> tokens = {ctx_omni->special_token_listen};
             eval_tokens(ctx_omni, params, tokens, params->n_batch, &ctx_omni->n_past);
         }
@@ -10493,7 +10627,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             {
                 std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
                 if (ctx_omni->special_token_listen >= 0) {
-                    common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
+                    accept_llm_token(
+                        ctx_omni->ctx_sampler, ctx_omni, ctx_omni->special_token_listen);
                     std::vector<llama_token> tokens = {ctx_omni->special_token_listen};
                     eval_tokens(ctx_omni, ctx_omni->params, tokens,
                                 ctx_omni->params->n_batch, &ctx_omni->n_past);

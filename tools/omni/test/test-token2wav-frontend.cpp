@@ -1,4 +1,5 @@
 #include "token2wav-frontend.h"
+#include "ggml.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -300,14 +301,14 @@ static void write_pcm16_wav(const std::string & path, int sample_rate, const std
     assert(file.good());
 }
 
-static void test_gguf_frontend_uses_both_model_files() {
+static bool test_gguf_frontend_uses_both_model_files() {
     const char * speech_path = std::getenv("OMNI_T2W_TEST_SPEECH_TOKENIZER_GGUF");
     const char * campplus_path = std::getenv("OMNI_T2W_TEST_CAMPPLUS_GGUF");
     if (!speech_path || !campplus_path || *speech_path == '\0' || *campplus_path == '\0') {
         std::fprintf(stderr,
                      "SKIP: set OMNI_T2W_TEST_SPEECH_TOKENIZER_GGUF and "
                      "OMNI_T2W_TEST_CAMPPLUS_GGUF to run the GGUF frontend test\n");
-        return;
+        return false;
     }
 
     const std::filesystem::path wav_path =
@@ -332,6 +333,16 @@ static void test_gguf_frontend_uses_both_model_files() {
     assert(bundle.prompt_tokens_bt.size() == static_cast<size_t>(bundle.T_prompt_token));
     assert(bundle.prompt_mel_btc.size() == static_cast<size_t>(bundle.T_prompt_mel * 80));
     assert(bundle.spk_bc.size() == 192);
+    return true;
+}
+
+static void test_compute_context_size_is_bounded_by_graph_requirements() {
+    const size_t graph_size = 4096;
+    const size_t metadata = omni::flow::Token2WavFrontend::compute_ggml_context_size(
+        graph_size, 64 * 1024);
+    assert(metadata >= ggml_graph_overhead_custom(graph_size, false));
+    assert(metadata >= graph_size * ggml_tensor_overhead());
+    assert(metadata < 64ULL * 1024ULL * 1024ULL);
 }
 
 static void write_float_file(const std::string & path, const std::vector<float> & values) {
@@ -423,7 +434,10 @@ int main(int argc, char ** argv) {
     test_frontend_output_shape_contracts_require_single_batch();
     test_load_wav_rejects_short_multichannel_frame();
     test_resample_rejects_unbounded_kernel_request();
-    test_gguf_frontend_uses_both_model_files();
+    test_compute_context_size_is_bounded_by_graph_requirements();
+    if (argc == 1 && !test_gguf_frontend_uses_both_model_files()) {
+        return 77;
+    }
     if (argc == 4) {
         test_native_frontend_with_real_models(argv[1], argv[2], argv[3]);
     } else {

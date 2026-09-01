@@ -59,7 +59,8 @@ target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 
 if (LLAMA_BUILD_TESTS)
-    add_executable(test-ws-context-cleanup test-ws-context-cleanup.cpp)
+    add_executable(test-ws-context-cleanup test-ws-context-cleanup.cpp session.cpp)
+    target_link_libraries(test-ws-context-cleanup PRIVATE omni llama-common)
     target_include_directories(test-ws-context-cleanup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_features(test-ws-context-cleanup PRIVATE cxx_std_17)
     add_test(NAME test-ws-context-cleanup COMMAND test-ws-context-cleanup)

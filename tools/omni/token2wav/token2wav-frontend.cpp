@@ -1,5 +1,6 @@
 #include "token2wav-frontend.h"
 #include "token2wav-frontend-gguf.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
@@ -286,6 +287,26 @@ bool Token2WavFrontend::validate_campplus_output_shape(const std::vector<int64_t
         return set_error(error, "CampPlus output must have shape [192] or [1, 192] with B=1");
     }
     return true;
+}
+
+size_t Token2WavFrontend::compute_ggml_context_size(size_t graph_size, size_t extra_bytes) {
+    constexpr size_t tensor_count_slack = 32;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (graph_size > (max_size - tensor_count_slack) / 2) {
+        return max_size;
+    }
+
+    const size_t tensor_count = graph_size * 2 + tensor_count_slack;
+    if (tensor_count > max_size / ggml_tensor_overhead()) {
+        return max_size;
+    }
+    const size_t tensor_bytes = tensor_count * ggml_tensor_overhead();
+    const size_t graph_bytes = ggml_graph_overhead_custom(graph_size, false);
+    if (tensor_bytes > max_size - graph_bytes ||
+        tensor_bytes + graph_bytes > max_size - extra_bytes) {
+        return max_size;
+    }
+    return tensor_bytes + graph_bytes + extra_bytes;
 }
 
 bool Token2WavFrontend::load_wav_mono(const std::string & path, AudioBuffer & out) {

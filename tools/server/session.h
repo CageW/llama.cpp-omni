@@ -43,7 +43,7 @@ public:
     bool activate(const std::string & session_id, omni_context * octx, bool owns_octx);
 
     // Get a session by id. Returns nullptr if not found.
-    OmniSession * get(const std::string & session_id);
+    std::shared_ptr<OmniSession> get(const std::string & session_id);
 
     // Register/trigger transport close without holding the manager lock while
     // invoking the callback.
@@ -58,12 +58,13 @@ public:
 
     // Check if an active session exists.
     bool has_active() const;
+    bool is_active(const std::string & session_id) const;
 
     // Close all sessions (shutdown cleanup).
     void shutdown();
 
 private:
     mutable std::mutex mtx_;
-    std::unique_ptr<OmniSession> active_;
+    std::shared_ptr<OmniSession> active_;
     std::string generate_uuid();
 };

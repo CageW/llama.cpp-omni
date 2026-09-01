@@ -1,4 +1,5 @@
 #include "ws_handler.h"
+#include "session.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -7,9 +8,33 @@
 #include <string>
 
 static int release_count = 0;
+static std::mutex * release_mutex = nullptr;
 
 static void record_release(omni_context *) {
     ++release_count;
+}
+
+static void record_release_after_lock(omni_context *) {
+    if (release_mutex != nullptr) {
+        std::lock_guard<std::mutex> lock(*release_mutex);
+    }
+    ++release_count;
+}
+
+static void test_session_handle_survives_manager_close() {
+    SessionManager manager;
+    const std::string session_id = manager.allocate();
+    assert(!session_id.empty());
+    assert(manager.activate(
+        session_id, reinterpret_cast<omni_context *>(0x1), false));
+
+    const std::shared_ptr<OmniSession> retained = manager.get(session_id);
+    assert(retained);
+    assert(manager.is_active(session_id));
+
+    manager.close(session_id);
+    assert(retained->state == SessionState::CLOSED);
+    assert(!manager.is_active(session_id));
 }
 
 int main() {
@@ -54,5 +79,13 @@ int main() {
         pending_octx, shared_octx, octx_mutex, record_release));
     assert(shared_octx == nullptr);
     assert(release_count == 2);
+    shared_octx = pending_octx;
+    release_mutex = &octx_mutex;
+    assert(release_unactivated_octx_if_owned(
+        pending_octx, shared_octx, octx_mutex, false, record_release_after_lock));
+    release_mutex = nullptr;
+    assert(shared_octx == nullptr);
+    assert(release_count == 3);
+    test_session_handle_survives_manager_close();
     return 0;
 }

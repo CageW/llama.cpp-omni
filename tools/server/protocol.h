@@ -112,7 +112,7 @@ struct ParsedInput {
     int max_new_tokens = 512;
     // Retained for wire compatibility; C++ generation uses its fixed
     // Python-base mode configuration.
-    float length_penalty = 1.1f;
+    float length_penalty = 1.0f;
     bool omni_mode = false;               // pass-through hints (§4.2)
     bool use_tts_template = false;        // emit speech for this turn (use_tts_template OR tts.enabled)
     bool enable_thinking = false;

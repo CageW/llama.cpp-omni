@@ -40,12 +40,15 @@ inline bool release_unactivated_octx_if_owned(
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(octx_mutex);
-    if (shared_octx != pending_octx) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(octx_mutex);
+        if (shared_octx != pending_octx) {
+            return false;
+        }
+
+        shared_octx = nullptr;
     }
 
-    shared_octx = nullptr;
     release_fn(pending_octx);
     return true;
 }

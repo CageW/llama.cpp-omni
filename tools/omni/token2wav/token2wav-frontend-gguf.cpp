@@ -762,8 +762,9 @@ bool FrontendGGUFModels::run_speech(const AudioFeatures & features,
     }
 
     ggml_backend_cpu_set_n_threads(backend_.get(), std::max(1, num_threads));
+    constexpr size_t graph_size = GGML_DEFAULT_GRAPH_SIZE * 16;
     ggml_init_params params = {
-        /*.mem_size   =*/ 1024ull * 1024ull * 1024ull,
+        /*.mem_size   =*/ Token2WavFrontend::compute_ggml_context_size(graph_size, 256 * 1024),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -796,7 +797,7 @@ bool FrontendGGUFModels::run_speech(const AudioFeatures & features,
         power_values[i] = power_values[i - 1] * 3.0f;
     }
     ggml_tensor * code_values = ggml_sum_rows(ctx.get(), ggml_mul(ctx.get(), quantized, powers));
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), GGML_DEFAULT_GRAPH_SIZE * 16, false);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
     ggml_build_forward_expand(graph, code_values);
     ggml_set_output(code_values);
 
@@ -858,8 +859,9 @@ bool FrontendGGUFModels::run_campplus(const AudioFeatures & features,
     }
 
     ggml_backend_cpu_set_n_threads(backend_.get(), std::max(1, num_threads));
+    constexpr size_t graph_size = GGML_DEFAULT_GRAPH_SIZE * 32;
     ggml_init_params params = {
-        /*.mem_size   =*/ 1024ull * 1024ull * 1024ull,
+        /*.mem_size   =*/ Token2WavFrontend::compute_ggml_context_size(graph_size, 1024 * 1024),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -878,7 +880,7 @@ bool FrontendGGUFModels::run_campplus(const AudioFeatures & features,
         return fail(error, "GGUF CampPlus: graph produced an invalid output shape");
     }
     ggml_set_output(output);
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), GGML_DEFAULT_GRAPH_SIZE * 512, false);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
     ggml_build_forward_expand(graph, output);
 
     ggml_backend_buffer_ptr buffer(

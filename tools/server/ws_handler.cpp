@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "omni.h"
 #include "common.h"
+#include "sampling.h"
 #include "llama.h"
 #include "log.h"
 #include "audition.h"
@@ -174,6 +175,11 @@ static void stop_reusable_octx_threads(omni_context * octx) {
 static bool reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
                                    const std::string & output_dir) {
     stop_reusable_octx_threads(octx);
+
+    // Reused contexts keep their loaded models, so explicitly reset sampler
+    // history and RNG state before serving the next session.
+    common_sampler_reset(octx->ctx_sampler);
+    common_sampler_reset(octx->ctx_tts_sampler);
 
     // A reused context must not carry a dynamic voice into a session that did
     // not provide a new reference audio. Restore the static cache before
@@ -927,6 +933,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             double prefill_ms = 0.0;
             double generate_ms = 0.0;
             int n_past_before_decode = 0;
+            std::string prefill_failure_reason;
 
             // Prefill with text + audio + image/video frames
             {
@@ -940,38 +947,37 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);
                 if (!octx->system_prompt_initialized) {
                     if (!stream_prefill(octx, /*aud*/"", /*img*/"", /*index*/0)) {
-                        octx->use_tts = prev_use_tts;
-                        tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
-                        for (const auto & path : turn_temp_paths) fs::remove(path);
-                        fail_fast(session_id, "system_prefill_failed");
-                        return;
+                        prefill_failure_reason = "system_prefill_failed";
                     }
                 }
-                int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                    input_index, parsed_input.max_slice_nums, prompt)) {
-                    octx->use_tts = prev_use_tts;
-                    tmp_files.cleanup();
-                    for (const auto & path : extra_image_paths) fs::remove(path);
-                    for (const auto & path : turn_temp_paths) fs::remove(path);
-                    fail_fast(session_id, "prefill_failed");
-                    return;
+                if (prefill_failure_reason.empty()) {
+                    int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
+                    if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                                        input_index, parsed_input.max_slice_nums, prompt)) {
+                        prefill_failure_reason = "prefill_failed";
+                    }
                 }
                 for (const auto & image_path : extra_image_paths) {
+                    if (!prefill_failure_reason.empty()) {
+                        break;
+                    }
                     if (!stream_prefill(octx, /*aud*/"", image_path,
                                         ++msg_counter, parsed_input.max_slice_nums, /*text*/"")) {
-                        octx->use_tts = prev_use_tts;
-                        tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
-                        for (const auto & path : turn_temp_paths) fs::remove(path);
-                        fail_fast(session_id, "video_frame_prefill_failed");
-                        return;
+                        prefill_failure_reason = "video_frame_prefill_failed";
                     }
                 }
                 octx->use_tts = prev_use_tts;
-                n_past_before_decode = octx->n_past;
-                prefill_ms = elapsed_ms(t_prefill_start);
+                if (prefill_failure_reason.empty()) {
+                    n_past_before_decode = octx->n_past;
+                    prefill_ms = elapsed_ms(t_prefill_start);
+                }
+            }
+            if (!prefill_failure_reason.empty()) {
+                tmp_files.cleanup();
+                for (const auto & path : extra_image_paths) fs::remove(path);
+                for (const auto & path : turn_temp_paths) fs::remove(path);
+                fail_fast(session_id, prefill_failure_reason);
+                return;
             }
 
             if (!tmp_files.audio_path.empty()) retained_media_files.push_back(tmp_files.audio_path);
@@ -1142,16 +1148,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             // Prefill
+            bool prefill_ok = false;
             {
                 const auto t_prefill_start = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> lock(octx_mutex);
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                    input_index, parsed_input.max_slice_nums)) {
-                    tmp_files.cleanup();
-                    fail_fast(session_id, "prefill_failed");
-                    return;
+                prefill_ok = stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                                            input_index, parsed_input.max_slice_nums);
+                if (prefill_ok) {
+                    prefill_ms = elapsed_ms(t_prefill_start);
                 }
-                prefill_ms = elapsed_ms(t_prefill_start);
+            }
+            if (!prefill_ok) {
+                tmp_files.cleanup();
+                fail_fast(session_id, "prefill_failed");
+                return;
             }
 
             if (!tmp_files.audio_path.empty()) retained_media_files.push_back(tmp_files.audio_path);
@@ -1297,7 +1307,7 @@ cleanup:
     // for the next session. Then drop the session and clean up temp media.
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
-        OmniSession * session = session_mgr.get(session_id);
+        auto session = session_mgr.get(session_id);
         if (session && session->octx) {
             session->octx->break_event = true;
             {
