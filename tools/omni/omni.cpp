@@ -42,7 +42,6 @@
 #include <chrono>
 #include <cmath>
 #include <sstream>
-#include <random>
 #include <cstdarg>
 #include <signal.h>
 
@@ -1337,7 +1336,7 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
                 // 这里我们使用加法而不是乘法，因为 logit 可能是负数
                 // 添加一个偏置值来增加 listen 的概率
                 // listen_prob_bias = log(listen_prob_scale) ≈ (listen_prob_scale - 1.0) for small values
-                float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
+                float listen_bias = (ctx_omni->generation_config.listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
                 logits[ctx_omni->special_token_listen] += listen_bias;
             }
             
@@ -1351,12 +1350,12 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             }
 
             // 3. Duplex 模式下对 <|turn_eos|> 应用长度惩罚，让 Python 透传的配置真正生效
-            if (ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
+            if (ctx_omni->generation_config.length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
                 float eos_logit = logits[ctx_omni->special_token_turn_eos];
                 if (eos_logit > 0) {
-                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->length_penalty;
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->generation_config.length_penalty;
                 } else {
-                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->length_penalty;
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->generation_config.length_penalty;
                 }
             }
         }
@@ -1364,15 +1363,15 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     
     // 🔧 [Length Penalty] 调整 EOS token 的 logit 值（单工模式）
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    if (!ctx_omni->duplex_mode && ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
+    if (!ctx_omni->duplex_mode && ctx_omni->generation_config.length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
         if (logits != nullptr) {
             float eos_logit = logits[ctx_omni->special_token_tts_eos];
             if (eos_logit > 0) {
                 // logit > 0 时，除以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit / ctx_omni->length_penalty;
+                logits[ctx_omni->special_token_tts_eos] = eos_logit / ctx_omni->generation_config.length_penalty;
             } else {
                 // logit <= 0 时，乘以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
+                logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->generation_config.length_penalty;
             }
         }
     }
@@ -1406,12 +1405,219 @@ static const char * llama_loop_with_hidden_and_token(struct omni_context * ctx_o
 // TTS specific helper functions
 //
 
-// Helper function to get RNG from sampler chain for multinomial sampling
-// Uses common_sampler_get_rng() from common/sampling.cpp
-// This ensures audio_bos sampling uses the same RNG as non-audio_bos sampling
-static std::mt19937* get_sampler_rng(struct common_sampler * smpl) {
-    void* rng_ptr = common_sampler_get_rng(smpl);
-    return static_cast<std::mt19937*>(rng_ptr);
+static common_params_sampling make_sampling_params(const common_params_sampling & base,
+                                                   const OmniSamplingConfig & config,
+                                                   bool include_penalties,
+                                                   bool include_filters,
+                                                   bool include_min_p = true,
+                                                   bool tts_order = false) {
+    common_params_sampling result = base;
+    result.temp = config.temperature;
+    result.top_p = config.top_p;
+    result.top_k = config.top_k;
+    result.min_p = config.min_p;
+    result.min_keep = config.min_tokens_to_keep;
+    result.penalty_last_n = include_penalties ? config.repetition_window : 0;
+    result.penalty_repeat = include_penalties ? config.repetition_penalty : 1.0f;
+    result.penalty_freq = 0.0f;
+    result.penalty_present = 0.0f;
+    result.mirostat = 0;
+
+    if (include_filters) {
+        result.samplers.clear();
+        for (const OmniSamplingStage stage : omni_python_sampling_order(tts_order)) {
+            switch (stage) {
+                case OmniSamplingStage::Temperature:
+                    result.samplers.push_back(COMMON_SAMPLER_TYPE_TEMPERATURE);
+                    break;
+                case OmniSamplingStage::TopK:
+                    result.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_K);
+                    break;
+                case OmniSamplingStage::TopP:
+                    result.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_P);
+                    break;
+            }
+        }
+        if (include_min_p && config.min_p > 0.0f) {
+            result.samplers.push_back(COMMON_SAMPLER_TYPE_MIN_P);
+        }
+    } else {
+        result.samplers = {COMMON_SAMPLER_TYPE_TEMPERATURE};
+    }
+    if (include_penalties) {
+        result.samplers.insert(result.samplers.begin(), COMMON_SAMPLER_TYPE_PENALTIES);
+    }
+    return result;
+}
+
+static void apply_llm_sampling_config(common_params_sampling & sampling,
+                                      const OmniSamplingConfig & config) {
+    sampling = make_sampling_params(sampling, config, true, true, false, false);
+}
+
+static common_params_sampling make_tts_sampling_params(const common_params_sampling & base,
+                                                        const OmniSamplingConfig & config) {
+    // TTS applies its power-based repetition processor in the adapter. Its
+    // Python gen_logits path does not apply min_p.
+    common_params_sampling result = make_sampling_params(base, config, false, true, false, true);
+    // Hugging Face TopKLogitsWarper keeps at least min_tokens_to_keep
+    // candidates, even when top_k is smaller.
+    result.top_k = omni_effective_tts_top_k(config);
+    return result;
+}
+
+static common_params_sampling make_tts_first_token_sampling_params(
+        const common_params_sampling & base,
+        const OmniSamplingConfig & config) {
+    return make_sampling_params(base, config, false, false, false);
+}
+
+static std::vector<int32_t> make_token2wav_prefix(const omni_context * ctx_omni) {
+    const int prefix_size = ctx_omni == nullptr
+        ? 0
+        : std::max(0, ctx_omni->generation_config.audio_prelook_size);
+    return std::vector<int32_t>(static_cast<size_t>(prefix_size), 4218);
+}
+
+static void apply_python_repetition_penalty(std::vector<float> & logits,
+                                            const std::vector<llama_token> * history,
+                                            const OmniSamplingConfig & config,
+                                            int audio_bos_token_id) {
+    if (!history || history->empty() || config.repetition_penalty == 1.0f ||
+        config.repetition_window <= 0) {
+        return;
+    }
+
+    const int start = std::max(0, static_cast<int>(history->size()) - config.repetition_window);
+    std::vector<int> frequency(logits.size(), 0);
+    for (int i = start; i < static_cast<int>(history->size()); ++i) {
+        const int relative = (*history)[i] - audio_bos_token_id;
+        if (relative >= 0 && relative < static_cast<int>(frequency.size())) {
+            frequency[relative]++;
+        }
+    }
+
+    for (size_t i = 0; i < logits.size(); ++i) {
+        if (frequency[i] == 0) {
+            continue;
+        }
+        const float alpha = std::pow(config.repetition_penalty,
+                                    static_cast<float>(frequency[i]));
+        logits[i] = logits[i] < 0.0f ? logits[i] * alpha : logits[i] / alpha;
+    }
+}
+
+static llama_token sample_tts_from_logits(struct common_sampler * sampler,
+                                          struct omni_context * ctx_omni,
+                                          std::vector<float> logits,
+                                          const std::vector<llama_token> * history,
+                                          bool skip_processors,
+                                          bool force_no_eos,
+                                          int audio_bos_token_id,
+                                          int num_audio_tokens) {
+    if (!sampler || !ctx_omni) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const OmniSamplingConfig & config = ctx_omni->generation_config.tts_sampling;
+    if (!skip_processors) {
+        apply_python_repetition_penalty(logits, history, config, audio_bos_token_id);
+    }
+    if (force_no_eos && !logits.empty()) {
+        logits.back() = -std::numeric_limits<float>::infinity();
+    }
+
+    std::vector<llama_token_data> candidates;
+    candidates.reserve(logits.size());
+    for (int i = 0; i < num_audio_tokens; ++i) {
+        candidates.push_back({audio_bos_token_id + i, logits[i], 0.0f});
+    }
+    llama_token_data_array candidate_array = {
+        candidates.data(), candidates.size(), -1, false
+    };
+
+    common_sampler * effective_sampler = sampler;
+    if (skip_processors && ctx_omni->ctx_tts_sampler_bos) {
+        effective_sampler = ctx_omni->ctx_tts_sampler_bos;
+    }
+    llama_sampler * chain = common_sampler_get(effective_sampler);
+    if (!chain) {
+        return LLAMA_TOKEN_NULL;
+    }
+    llama_sampler_apply(chain, &candidate_array);
+    if (candidate_array.selected < 0 ||
+        candidate_array.selected >= static_cast<int>(candidate_array.size)) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const llama_token token = candidate_array.data[candidate_array.selected].id;
+    // Keep the normal sampler's history even when the first-token sampler was
+    // used to skip Python's processors and TopP/TopK filters.
+    common_sampler_accept(sampler, token, true);
+    if (effective_sampler != sampler) {
+        common_sampler_accept(effective_sampler, token, true);
+    }
+    return token;
+}
+
+OmniGenerationConfig omni_python_base_generation_config() {
+    return OmniGenerationConfig{};
+}
+
+static void apply_generation_config_to_params(common_params & params,
+                                              const OmniGenerationConfig & config) {
+    apply_llm_sampling_config(params.sampling, config.llm_sampling);
+}
+
+bool omni_apply_generation_config(struct omni_context * ctx_omni,
+                                  struct common_params * params,
+                                  const OmniGenerationConfig & config) {
+    if (!ctx_omni) {
+        return false;
+    }
+
+    common_params * effective_params = params ? params : ctx_omni->params;
+    if (effective_params) {
+        apply_generation_config_to_params(*effective_params, config);
+    }
+
+    common_sampler * new_llm_sampler = nullptr;
+    common_sampler * new_tts_sampler = nullptr;
+    common_sampler * new_tts_sampler_bos = nullptr;
+
+    if (ctx_omni->model && effective_params) {
+        new_llm_sampler = common_sampler_init(ctx_omni->model, effective_params->sampling);
+        if (!new_llm_sampler) {
+            return false;
+        }
+    }
+
+    if (ctx_omni->model_tts && effective_params) {
+        common_params_sampling tts_sampling =
+            make_tts_sampling_params(effective_params->sampling, config.tts_sampling);
+        common_params_sampling tts_first_sampling =
+            make_tts_first_token_sampling_params(effective_params->sampling, config.tts_sampling);
+        new_tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
+        new_tts_sampler_bos = common_sampler_init(ctx_omni->model_tts, tts_first_sampling);
+        if (!new_tts_sampler || !new_tts_sampler_bos) {
+            common_sampler_free(new_llm_sampler);
+            common_sampler_free(new_tts_sampler);
+            common_sampler_free(new_tts_sampler_bos);
+            return false;
+        }
+    }
+
+    common_sampler_free(ctx_omni->ctx_sampler);
+    common_sampler_free(ctx_omni->ctx_tts_sampler);
+    common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
+    ctx_omni->ctx_sampler = new_llm_sampler;
+    ctx_omni->ctx_tts_sampler = new_tts_sampler;
+    ctx_omni->ctx_tts_sampler_bos = new_tts_sampler_bos;
+    ctx_omni->generation_config = config;
+    if (effective_params) {
+        ctx_omni->params = effective_params;
+    }
+    return true;
 }
 
 // ==============================================================================
@@ -1976,43 +2182,8 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 return false;
             }
             
-            // CRITICAL FIX: The conversion script transposes head_code weight to [768, 6562] before saving,
-            // but the GGUF metadata shape may still be [6562, 768] due to how add_tensor works.
-            // We need to detect the actual data format by testing both layouts.
-            // 
-            // Strategy: Try both formats and see which one produces correct logits.
-            // But a simpler approach: Since the conversion script always transposes to [768, 6562],
-            // and the actual data is stored in that format, we should always use the data as-is
-            // (treating it as [768, 6562]) regardless of metadata shape.
-            //
-            // However, to be safe, we'll check: if metadata says [6562, 768], the data might be
-            // in that format (old conversion) or already transposed (new conversion).
-            // We'll use a heuristic: check if the first few values match what we expect.
-            
-            const float * src_data = (const float *)head_code_tensor->data;
-            bool need_transpose = false;
-            
-            // CRITICAL FIX: Based on conversion script analysis, the script always transposes
-            // head_code to [768, 6562] before saving. So the actual data is always [768, 6562],
-            // regardless of metadata shape. We should NOT transpose based on metadata.
-            //
-            // However, if metadata says [6562, 768], it might be an old conversion that didn't transpose.
-            // We'll use a simple heuristic: if metadata says [6562, 768], assume data needs transpose.
-            // If metadata says [768, 6562], assume data is already correct.
-            
-            if (dim0 == expected_hidden_size && dim1 == expected_num_audio_tokens) {
-                // Metadata says (768, 6562) - data should already be in correct format
-                need_transpose = false;
-            } else if (dim0 == expected_num_audio_tokens && dim1 == expected_hidden_size) {
-                // Metadata says (6562, 768) - but conversion script may have already transposed the data
-                // We need to check: if conversion script transposed, data is actually [768, 6562] and we should NOT transpose
-                // If conversion script didn't transpose, data is [6562, 768] and we SHOULD transpose
-                //
-                // Since the conversion script ALWAYS transposes (line 351: W_transposed = W.T),
-                // the data is always [768, 6562] regardless of metadata.
-                // So we should NOT transpose.
-                need_transpose = false;  // CRITICAL FIX: Don't transpose, data is already [768, 6562]
-            } else {
+            if (!((dim0 == expected_hidden_size && dim1 == expected_num_audio_tokens) ||
+                  (dim0 == expected_num_audio_tokens && dim1 == expected_hidden_size))) {
                 LOG_ERR("TTS: head_code.0.weight has unexpected shape [%ld, %ld], expected [%d, %d] or [%d, %d]\n",
                        dim0, dim1, expected_hidden_size, expected_num_audio_tokens, expected_num_audio_tokens, expected_hidden_size);
                 // Clean up
@@ -2033,33 +2204,20 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 return false;
             }
             
-            // Check tensor type and copy/convert accordingly
-            // ⚡ 优化：转置存储为 [6562, 768]，使每个output token的权重连续存储
-            // 这样在计算logits时可以用高效的向量点积
-            // 原始: weight[j * 6562 + i] = W[j, i]  (j=hidden, i=output)
-            // 转置后: weight[i * 768 + j] = W[i, j] (i=output, j=hidden)
+            // convert_tts.py writes a [6562, 768] row-major array and stores
+            // reversed GGUF dimensions. The raw data is already laid out as
+            // one contiguous 768-element row per audio token.
             enum ggml_type tensor_type = head_code_tensor->type;
-            int64_t total_elements = expected_hidden_size * expected_num_audio_tokens;
-            
-            print_with_timestamp("TTS: head_code shape: dim0=%ld, dim1=%ld, will transpose to [%ld, %ld]\n", 
+            print_with_timestamp("TTS: head_code shape: dim0=%ld, dim1=%ld, using row-major [%ld, %ld]\n",
                                 dim0, dim1, expected_num_audio_tokens, expected_hidden_size);
-            
-            // Transpose: [hidden, audio_tokens] -> [audio_tokens, hidden]
+
             if (tensor_type == GGML_TYPE_F32) {
                 const float * src_data = (const float *)head_code_tensor->data;
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = src_data[j * expected_num_audio_tokens + i];
-                    }
-                }
+                memcpy(ctx_omni->head_code_weight, src_data, head_code_size);
             } else {
                 std::vector<float> tmp(expected_hidden_size * expected_num_audio_tokens);
                 ggml_tensor_to_f32(head_code_tensor, tmp.data(), expected_hidden_size * expected_num_audio_tokens);
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = tmp[j * expected_num_audio_tokens + i];
-                    }
-                }
+                memcpy(ctx_omni->head_code_weight, tmp.data(), head_code_size);
             }
             
             ctx_omni->head_code_hidden_size = expected_hidden_size;
@@ -2373,7 +2531,7 @@ static bool eval_string_tts(struct omni_context * ctx_omni, common_params* param
 }
 
 // 使用embedding作为TTS输入的prefill函数（类似prefill_with_emb，但针对TTS模型）
-bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts) {
+bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, const float* embed, int n_pos, int n_batch, int* n_past_tts) {
     // 🔧 [安全检查] 验证输入参数
     if (n_pos <= 0) {
         LOG_ERR("%s: invalid n_pos=%d, skipping\n", __func__, n_pos);
@@ -2427,7 +2585,9 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
         
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
-        batch.embd = (embed + i * n_embd);  // 使用embedding作为输入
+        // llama_batch still exposes embeddings as mutable memory, although
+        // decoding only reads this input buffer.
+        batch.embd = const_cast<float *>(embed + i * n_embd);
         
         // 设置pos值以确保正确的KV cache位置
         // Python: pos_ids = torch.arange(text_start_pos, text_start_pos + condition_length)
@@ -2518,264 +2678,6 @@ static void save_hidden_states_to_file(const char* filepath, const float* hidden
     fclose(f);
 }
 
-// ========== RAS (Repetition Aware Sampling) Implementation ==========
-// Ported from Python: tts_streaming_generate.py
-// Key idea: Use nucleus sampling (top_p + top_k), but if too many recent tokens repeat,
-// fall back to random sampling to break the pattern.
-
-// Nucleus sampling (top-p + top-k)
-// Returns a sampled token index from the logits
-static int nucleus_sampling_tts(const float* logits, int num_tokens, float top_p, int top_k, std::mt19937& rng) {
-    // 1. Compute softmax probabilities
-    float max_logit = logits[0];
-    for (int i = 1; i < num_tokens; ++i) {
-        if (logits[i] > max_logit) max_logit = logits[i];
-    }
-    
-    std::vector<float> probs(num_tokens);
-    float sum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
-    }
-    
-    // 2. Sort by probability descending
-    std::vector<std::pair<float, int>> sorted_probs;
-    sorted_probs.reserve(num_tokens);
-    for (int i = 0; i < num_tokens; ++i) {
-        sorted_probs.push_back({probs[i], i});
-    }
-    std::sort(sorted_probs.begin(), sorted_probs.end(), 
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // 3. Collect tokens within top_p and top_k
-    std::vector<float> filtered_probs;
-    std::vector<int> filtered_indices;
-    float cum_prob = 0.0f;
-    
-    for (const auto& p : sorted_probs) {
-        if (cum_prob < top_p && (int)filtered_probs.size() < top_k) {
-            cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
-        } else {
-            break;
-        }
-    }
-    
-    // 4. Renormalize filtered probs
-    float filtered_sum = 0.0f;
-    for (float p : filtered_probs) {
-        filtered_sum += p;
-    }
-    for (float& p : filtered_probs) {
-        p /= filtered_sum;
-    }
-    
-    // 5. Multinomial sampling
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-    float cum = 0.0f;
-    for (size_t i = 0; i < filtered_probs.size(); ++i) {
-        cum += filtered_probs[i];
-        if (r <= cum) {
-            return filtered_indices[i];
-        }
-    }
-    return filtered_indices.back();  // Fallback
-}
-
-// Random sampling (uniform multinomial from all tokens)
-static int random_sampling_tts(const float* logits, int num_tokens, std::mt19937& rng) {
-    // 1. Compute softmax probabilities
-    float max_logit = logits[0];
-    for (int i = 1; i < num_tokens; ++i) {
-        if (logits[i] > max_logit) max_logit = logits[i];
-    }
-    
-    std::vector<float> probs(num_tokens);
-    float sum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
-    }
-    
-    // 2. Multinomial sampling
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-    float cum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        cum += probs[i];
-        if (r <= cum) {
-            return i;
-        }
-    }
-    return num_tokens - 1;  // Fallback
-}
-
-// RAS: Repetition Aware Sampling
-// If the sampled token repeats too often in recent history, use random sampling instead
-// 🔧 [与 Python TTSSamplingParams 对齐] (modeling_minicpmo.py line 69-76)
-static int ras_sampling_tts(
-    const float* logits, 
-    int num_tokens, 
-    const std::vector<int>& decoded_tokens,  // Recent tokens (relative indices)
-    std::mt19937& rng,
-    float top_p = 0.85f,   // TTSSamplingParams.top_p = 0.85
-    int top_k = 25,        // TTSSamplingParams.top_k = 25
-    int win_size = 16,     // TTSSamplingParams.win_size = 16
-    float tau_r = 0.1f     // TTSSamplingParams.tau_r = 0.1
-) {
-    // 1. First, do nucleus sampling to get a candidate
-    int top_id = nucleus_sampling_tts(logits, num_tokens, top_p, top_k, rng);
-    
-    // 2. Count how many times this token appears in the recent window
-    int start_idx = std::max(0, (int)decoded_tokens.size() - win_size);
-    int rep_num = 0;
-    for (int i = start_idx; i < (int)decoded_tokens.size(); ++i) {
-        if (decoded_tokens[i] == top_id) {
-            rep_num++;
-        }
-    }
-    
-    // 3. If repetition exceeds threshold, switch to random sampling
-    // Python: if rep_num >= win_size * tau_r
-    if (rep_num >= (int)(win_size * tau_r)) {
-        return random_sampling_tts(logits, num_tokens, rng);
-    }
-    
-    return top_id;
-}
-
-// Apply repetition penalty to logits - matching Python's CustomRepetitionPenaltyLogitsProcessorRepeat
-// Python implementation:
-//   freq = F.one_hot(input_ids, num_tokens).sum(1)  # count frequency
-//   alpha = torch.pow(penalty, freq)
-//   inp = scores.multiply(alpha)  # for negative scores
-//   oth = scores.divide(alpha)    # for positive scores
-//   out = torch.where(scores < 0, inp, oth)
-static void apply_repetition_penalty_tts(
-    float* logits, 
-    int num_tokens,
-    const std::vector<int>& decoded_tokens,  // Recent tokens (relative indices)
-    float penalty,
-    int past_window = 16
-) {
-    if (decoded_tokens.empty() || penalty == 1.0f) {
-        return;
-    }
-    
-    // Get the window of recent tokens
-    int start_idx = std::max(0, (int)decoded_tokens.size() - past_window);
-    
-    // Count frequency of each token in the window
-    std::vector<int> freq(num_tokens, 0);
-    for (int i = start_idx; i < (int)decoded_tokens.size(); ++i) {
-        int tok = decoded_tokens[i];
-        if (tok >= 0 && tok < num_tokens) {
-            freq[tok]++;
-        }
-    }
-    
-    // Apply penalty: alpha = penalty ^ freq
-    // For positive logits: divide by alpha (makes them smaller, lower probability)
-    // For negative logits: multiply by alpha (makes them more negative, lower probability)
-    for (int i = 0; i < num_tokens; ++i) {
-        if (freq[i] > 0) {
-            float alpha = powf(penalty, (float)freq[i]);
-            if (logits[i] < 0) {
-                logits[i] *= alpha;  // More negative
-            } else {
-                logits[i] /= alpha;  // Smaller positive
-            }
-        }
-    }
-}
-
-// Nucleus sampling with min_tokens_to_keep (matching Python's TopPLogitsWarper and TopKLogitsWarper)
-static int nucleus_sampling_with_min_keep_tts(
-    const float* logits, 
-    int num_tokens, 
-    float top_p, 
-    int top_k, 
-    int min_tokens_to_keep,  // Python default: 3
-    std::mt19937& rng
-) {
-    // 1. Compute softmax probabilities
-    float max_logit = logits[0];
-    for (int i = 1; i < num_tokens; ++i) {
-        if (logits[i] > max_logit) max_logit = logits[i];
-    }
-    
-    std::vector<float> probs(num_tokens);
-    float sum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
-    }
-    
-    // 2. Sort by probability descending
-    std::vector<std::pair<float, int>> sorted_probs;
-    sorted_probs.reserve(num_tokens);
-    for (int i = 0; i < num_tokens; ++i) {
-        sorted_probs.push_back({probs[i], i});
-    }
-    std::sort(sorted_probs.begin(), sorted_probs.end(), 
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // 3. Collect tokens within top_p and top_k, but keep at least min_tokens_to_keep
-    std::vector<float> filtered_probs;
-    std::vector<int> filtered_indices;
-    float cum_prob = 0.0f;
-    
-    for (const auto& p : sorted_probs) {
-        // Always keep min_tokens_to_keep tokens
-        if ((int)filtered_probs.size() < min_tokens_to_keep) {
-            cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
-        }
-        // After min_tokens_to_keep, apply top_p and top_k
-        else if (cum_prob < top_p && (int)filtered_probs.size() < top_k) {
-            cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
-        } else {
-            break;
-        }
-    }
-    
-    // 4. Renormalize filtered probs
-    float filtered_sum = 0.0f;
-    for (float p : filtered_probs) {
-        filtered_sum += p;
-    }
-    for (float& p : filtered_probs) {
-        p /= filtered_sum;
-    }
-    
-    // 5. Multinomial sampling
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-    float cum = 0.0f;
-    for (size_t i = 0; i < filtered_probs.size(); ++i) {
-        cum += filtered_probs[i];
-        if (r <= cum) {
-            return filtered_indices[i];
-        }
-    }
-    return filtered_indices.back();  // Fallback
-}
-
 // ==================== 单工版本的 sample_tts_token ====================
 // 直接从 omni_sinplex.cpp 复制，保证单工模式行为完全一致
 // 🔧 [与 Python 对齐] 添加 is_final_text_chunk 参数：
@@ -2842,102 +2744,20 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
         audio_logits[i] = sum;
     }
     
-    std::mt19937* rng = get_sampler_rng(smpl);
-    std::mt19937 local_rng;
-    if (rng == nullptr) {
-        local_rng = std::mt19937(std::random_device{}());
-        rng = &local_rng;
+    const llama_token id = sample_tts_from_logits(
+        smpl,
+        ctx_omni,
+        std::move(audio_logits),
+        all_generated_tokens,
+        is_audio_bos,
+        force_no_eos,
+        audio_bos_token_id,
+        num_audio_tokens);
+    if (id == LLAMA_TOKEN_NULL) {
+        LOG_ERR("TTS simplex: sampler failed to select an audio token\n");
+        return 0;
     }
-    
-    // 单工版本：使用 all_generated_tokens 做 repetition penalty
-    std::vector<int> decoded_tokens_relative;
-    if (all_generated_tokens != nullptr) {
-        for (llama_token tid : *all_generated_tokens) {
-            int relative_idx = tid - audio_bos_token_id;
-            if (relative_idx >= 0 && relative_idx < num_audio_tokens) {
-                decoded_tokens_relative.push_back(relative_idx);
-            }
-        }
-    }
-    
-    // 🔧 [与 Python streaming 对齐] TTS 采样参数
-    // Python tts_streaming_generate.py 使用：
-    // - temperature (从 TTSSamplingParams 传入，默认 0.8)
-    // - repetition_penalty = 1.05
-    // - window = 8 (recent_ids = logits_token[:, -8:])
-    // - multinomial 采样 (无 top-p/top-k)
-    float temperature = 0.8f;
-    float repetition_penalty = 1.05f;
-    int win_size = 8;  // 🔧 [与 Python 对齐] Python: recent_ids = logits_token[:, -8:]
-    
-    bool use_argmax = (params->sampling.temp <= 0.0f);
-    
-    int selected_relative_idx;
-    if (use_argmax) {
-        float max_logit = audio_logits[0];
-        selected_relative_idx = 0;
-        for (int i = 1; i < num_audio_tokens; ++i) {
-            if (audio_logits[i] > max_logit) {
-                max_logit = audio_logits[i];
-                selected_relative_idx = i;
-            }
-        }
-    } else {
-        // Step 1: 应用 temperature
-        // Python: logits /= self.temperature
-        for (int i = 0; i < num_audio_tokens; ++i) {
-            audio_logits[i] /= temperature;
-        }
-        
-        // Step 2: 只有 t > 0 时才应用 repetition penalty
-        // Python: if t > 0: ... recent_ids = logits_token[:, -8:]
-        if (!is_audio_bos && !decoded_tokens_relative.empty()) {
-            // 🔧 [与 Python 对齐] 获取最近 win_size 个 tokens
-            int start_idx = std::max(0, (int)decoded_tokens_relative.size() - win_size);
-            
-            // 🔧 [与 Python 对齐] 使用 bool mask 而不是频率计数
-            // Python: occurred = F.one_hot(recent_ids, ...).sum(dim=1).bool()
-            std::vector<bool> occurred(num_audio_tokens, false);
-            for (int i = start_idx; i < (int)decoded_tokens_relative.size(); ++i) {
-                int tok = decoded_tokens_relative[i];
-                if (tok >= 0 && tok < num_audio_tokens) {
-                    occurred[tok] = true;
-                }
-            }
-            
-            // 🔧 [与 Python 对齐] 应用 repetition penalty
-            // Python: logits = torch.where(occurred & (logits >= 0), logits / penalty, logits)
-            //         logits = torch.where(occurred & (logits < 0), logits * penalty, logits)
-            for (int i = 0; i < num_audio_tokens; ++i) {
-                if (occurred[i]) {
-                    if (audio_logits[i] >= 0) {
-                        audio_logits[i] /= repetition_penalty;
-                    } else {
-                        audio_logits[i] *= repetition_penalty;
-                    }
-                }
-            }
-        }
-        
-        // Step 3: 如果 force_no_eos=true，将 EOS logit 设为 -inf
-        if (force_no_eos) {
-            audio_logits[eos_relative_idx] = -std::numeric_limits<float>::infinity();
-        }
-        
-        // Step 4: 🔧 [与 Python 对齐] 使用 multinomial 采样 (无 top-p/top-k)
-        // Python: scores = F.softmax(logits, dim=-1)
-        //         next_token = torch.multinomial(scores, num_samples=1)
-        selected_relative_idx = random_sampling_tts(audio_logits.data(), num_audio_tokens, *rng);
-    }
-    
-    if (selected_relative_idx < 0 || selected_relative_idx >= num_audio_tokens) {
-        selected_relative_idx = 0;
-    }
-    
-    const llama_token id = audio_bos_token_id + selected_relative_idx;
-    int relative_idx = selected_relative_idx;
-    
-    common_sampler_accept(smpl, id, true);
+    const int relative_idx = static_cast<int>(id - audio_bos_token_id);
     
     // 🔧 [与 Python 对齐] 检测是否采样到 EOS
     bool is_eos = (relative_idx == eos_relative_idx);
@@ -2983,7 +2803,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     return id;
 }
 
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk = false) {
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk) {
     // Debug: Save logits directory (set via environment variable)
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
@@ -3115,8 +2935,6 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         audio_logits[i] = sum;
     }
     
-    int eos_relative_idx = num_audio_tokens - 1;  // EOS token relative index: 6561
-    
     // Debug: Save raw logits to file for Python comparison
     if (logits_debug_dir != nullptr) {
         save_logits_to_file(logits_debug_dir, audio_logits.data(), num_audio_tokens, token_index_in_chunk);
@@ -3146,29 +2964,13 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         }
     }
     
-    // 4. 采样流程 - 与 Python MiniCPMTTS.generate() 完全对齐
-    // Python 采样流程:
-    //   1. logits /= temperature (默认 0.8)
-    //   2. if not audio_bos: apply repetition_penalty (penalty=1.05, past_window=16)
-    //   3. if not audio_bos: apply TopP (0.85) + TopK (25) warper (min_tokens_to_keep=3)
-    //   4. softmax + multinomial
-    
-    // Get RNG from sampler
-    std::mt19937* rng = get_sampler_rng(smpl);
-    std::mt19937 local_rng;
-    if (rng == nullptr) {
-        // Fallback to local RNG
-        LOG_WRN("TTS: sampler RNG not available, using local RNG\n");
-        local_rng = std::mt19937(std::random_device{}());
-        rng = &local_rng;
-    }
-    
-    // 🔧 [单双工适配] Collect decoded tokens (relative indices) for repetition penalty
+    // Apply the Python-compatible repetition processor, then let the
+    // upstream llama sampler chain perform temperature, TopP, TopK, and
+    // distribution sampling.
     // - 双工模式：使用 chunk_generated_tokens（当前 chunk 内的 tokens）
     //   Python generate_chunk: input_ids_sliced = new_tokens[:, 0:t]
     // - 单工模式：使用 all_generated_tokens（所有生成的 tokens）
     //   Python TTSStreamingGenerator: self.all_generated_tokens
-    std::vector<int> decoded_tokens_relative;
     const std::vector<llama_token> * tokens_for_penalty;
     if (ctx_omni->duplex_mode) {
         // 双工模式：优先使用当前 chunk 的 tokens
@@ -3177,86 +2979,20 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         // 单工模式：使用所有生成的 tokens
         tokens_for_penalty = all_generated_tokens;
     }
-    if (tokens_for_penalty != nullptr) {
-        for (llama_token tid : *tokens_for_penalty) {
-            // Convert absolute token ID to relative index
-            int relative_idx = tid - audio_bos_token_id;
-            if (relative_idx >= 0 && relative_idx < num_audio_tokens) {
-                decoded_tokens_relative.push_back(relative_idx);
-            }
-        }
+    const llama_token id = sample_tts_from_logits(
+        smpl,
+        ctx_omni,
+        std::move(audio_logits),
+        tokens_for_penalty,
+        skip_processors,
+        force_no_eos,
+        audio_bos_token_id,
+        num_audio_tokens);
+    if (id == LLAMA_TOKEN_NULL) {
+        LOG_ERR("TTS: sampler failed to select an audio token\n");
+        return 0;
     }
-    
-    // 🔧 [与 Python TTSSamplingParams 对齐] (modeling_minicpmo.py line 69-76)
-    float temperature = 0.8f;       // TTSSamplingParams.temperature = 0.8
-    float top_p = 0.85f;            // TTSSamplingParams.top_p = 0.85
-    int top_k = 25;                 // TTSSamplingParams.top_k = 25
-    float repetition_penalty = 1.05f; // TTSSamplingParams.repetition_penalty = 1.05
-    int win_size = 16;              // TTSSamplingParams.win_size = 16
-    float tau_r = 0.1f;             // TTSSamplingParams.tau_r = 0.1
-    int min_tokens_to_keep = 3;     // Python: TopPLogitsWarper/TopKLogitsWarper default
-    
-    // Get temperature from params if specified (for argmax mode)
-    bool use_argmax = (params->sampling.temp <= 0.0f);
-    
-    int selected_relative_idx;
-    if (use_argmax) {
-        // Deterministic sampling: select argmax (highest logit)
-        float max_logit = audio_logits[0];
-        selected_relative_idx = 0;
-        for (int i = 1; i < num_audio_tokens; ++i) {
-            if (audio_logits[i] > max_logit) {
-                max_logit = audio_logits[i];
-                selected_relative_idx = i;
-            }
-        }
-    } else {
-        // Step 1: Apply temperature
-        for (int i = 0; i < num_audio_tokens; ++i) {
-            audio_logits[i] /= temperature;
-        }
-        
-        // 🔧 [单双工适配] Step 2 & 3: Apply repetition penalty and TopP/TopK
-        // - 双工模式：每个 chunk 的第一个 token 跳过
-        // - 单工模式：只有整个生成过程的第一个 token 跳过
-        if (!skip_processors && !decoded_tokens_relative.empty()) {
-            // Apply repetition penalty (matching Python's CustomRepetitionPenaltyLogitsProcessorRepeat)
-            apply_repetition_penalty_tts(audio_logits.data(), num_audio_tokens, 
-                                        decoded_tokens_relative, repetition_penalty, win_size);
-        }
-        
-        // 🔧 [差异1修复] 在采样前阻止 EOS token 被采样
-        // Python generate_chunk: if force_no_stop or t < min_new_tokens: logits[:, eos_token] = -torch.inf
-        // 这样可以确保在达到 min_new_tokens 之前不会生成 EOS
-        if (ctx_omni->duplex_mode && force_no_eos) {
-            int eos_relative_idx = num_audio_tokens - 1;  // EOS token relative index: 6561
-            audio_logits[eos_relative_idx] = -std::numeric_limits<float>::infinity();
-        }
-        
-        // Step 4: Nucleus sampling with min_tokens_to_keep (matching Python's warpers)
-        selected_relative_idx = nucleus_sampling_with_min_keep_tts(
-            audio_logits.data(), 
-            num_audio_tokens, 
-            top_p,
-            top_k,
-            min_tokens_to_keep,
-            *rng
-        );
-    }
-    
-    // 5. 验证采样结果在有效范围内
-    if (selected_relative_idx < 0 || selected_relative_idx >= num_audio_tokens) {
-        LOG_ERR("TTS: invalid selected index %d, should be in [0, %d)\n", 
-                selected_relative_idx, num_audio_tokens);
-        // Fallback: use first token
-        selected_relative_idx = 0;
-    }
-    
-    // Convert relative index to absolute token ID
-    const llama_token id = audio_bos_token_id + selected_relative_idx;
-    int relative_idx = selected_relative_idx;
-    
-    common_sampler_accept(smpl, id, true);
+    const int relative_idx = static_cast<int>(id - audio_bos_token_id);
     
     // 🔧 [与 Python 对齐] 检测是否采样到 EOS
     int eos_relative_idx_check = num_audio_tokens - 1;  // EOS token relative index: 6561
@@ -4016,7 +3752,8 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
-                                const std::string & base_output_dir) {
+                                const std::string & base_output_dir,
+                                const OmniGenerationConfig & generation_config) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -4032,6 +3769,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->duplex_mode = duplex_mode;
     ctx_omni->token2wav_device = token2wav_device;
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
+    ctx_omni->generation_config = generation_config;
+    apply_generation_config_to_params(*params, ctx_omni->generation_config);
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
     // Python default_tts_chat_template:
@@ -4165,24 +3904,36 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             return NULL;
         }
         
-        // 创建 TTS 的采样器
-        // 🔧 TTS流式采样参数 - 与 Python ras_sampling 对齐：
-        // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
-        common_params_sampling tts_sampling = params->sampling;
-        tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
-        tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
-        tts_sampling.top_k = 25;               // top_k = 25 (ras_sampling 参数)
-        tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
-        tts_sampling.min_p = 0.01f;            // min_p = 0.01
-        // Python: CustomRepetitionPenaltyLogitsProcessorRepeat(repetition_penalty, num_code, 16)
-        tts_sampling.penalty_last_n = 16;      // past_window = 16 (与Python对齐)
+        // Build the generic TTS sampler from the shared Python-compatible
+        // configuration. The first-token sampler intentionally omits the
+        // Python TopP/TopK and repetition processors.
+        common_params_sampling tts_sampling =
+            make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
         struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
+        common_params_sampling tts_first_sampling =
+            make_tts_first_token_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
+        struct common_sampler * tts_sampler_bos = common_sampler_init(tts_model, tts_first_sampling);
+        if (!tts_sampler || !tts_sampler_bos) {
+            common_sampler_free(tts_sampler);
+            common_sampler_free(tts_sampler_bos);
+            llama_free(ctx_tts_llama);
+            llama_free_model(tts_model);
+            llama_free(ctx_llama);
+            llama_free_model(model);
+            common_sampler_free(sampler);
+            delete ctx_omni;
+            return NULL;
+        }
         print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n",
-                            tts_sampling.temp, tts_sampling.top_p, tts_sampling.top_k, tts_sampling.penalty_repeat);
+                            ctx_omni->generation_config.tts_sampling.temperature,
+                            ctx_omni->generation_config.tts_sampling.top_p,
+                            ctx_omni->generation_config.tts_sampling.top_k,
+                            ctx_omni->generation_config.tts_sampling.repetition_penalty);
         
         ctx_omni->model_tts = tts_model;
         ctx_omni->ctx_tts_llama = ctx_tts_llama;
         ctx_omni->ctx_tts_sampler = tts_sampler;
+        ctx_omni->ctx_tts_sampler_bos = tts_sampler_bos;
         
         // Load TTS weights from GGUF file
         print_with_timestamp("TTS: loading weights from GGUF (emb_code, emb_text, projector_semantic, head_code)...\n");
@@ -4191,6 +3942,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_tts_llama);
             llama_free_model(tts_model);
             common_sampler_free(tts_sampler);
+            common_sampler_free(tts_sampler_bos);
             llama_free(ctx_llama);
             llama_free_model(model);
             common_sampler_free(sampler);
@@ -4219,6 +3971,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_omni->ctx_tts_llama);
             llama_free_model(ctx_omni->model_tts);
             common_sampler_free(ctx_omni->ctx_tts_sampler);
+            common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
         }
         llama_free(ctx_llama);
         llama_free_model(model);
@@ -4235,6 +3988,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_free(ctx_omni->ctx_tts_llama);
             llama_free_model(ctx_omni->model_tts);
             common_sampler_free(ctx_omni->ctx_tts_sampler);
+            common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
         }
         llama_free(ctx_llama);
         llama_free_model(model);
@@ -4404,12 +4158,17 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, coreml_model_path);
+                    vocoder_gguf, device_token2mel, device_vocoder,
+                    ctx_omni->generation_config.tts_n_timesteps,
+                    ctx_omni->generation_config.token2wav_temperature,
+                    coreml_model_path);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                        vocoder_gguf, device_token2mel, device_vocoder,
+                        ctx_omni->generation_config.tts_n_timesteps,
+                        ctx_omni->generation_config.token2wav_temperature);
             }
             // Fallback to CPU
             if (!init_ok) {
@@ -4418,15 +4177,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+                        vocoder_gguf, "cpu", "cpu",
+                        ctx_omni->generation_config.tts_n_timesteps,
+                        ctx_omni->generation_config.token2wav_temperature);
             }
             
             if (init_ok) {
                 ctx_omni->token2wav_initialized = true;
-                // Initialize token2wav buffer with 3 silence tokens (4218) as Python does
-                // Python: buffer = [4218] * 3  # 预先放入3个前缀静音token
+                // Match the configured Python pre-lookahead prefix.
                 ctx_omni->token2wav_buffer.clear();
-                ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+                ctx_omni->token2wav_buffer = make_token2wav_prefix(ctx_omni);
                 ctx_omni->token2wav_wav_idx = 0;
                 print_with_timestamp("Token2Wav: initialized successfully\n");
             } else {
@@ -4771,6 +4531,7 @@ void omni_free(struct omni_context * ctx_omni) {
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
+        common_sampler_free(ctx_omni->ctx_tts_sampler_bos);
 
         if (ctx_omni->tts_condition_graph.initialized) {
             tts_condition_graph_free(ctx_omni);
@@ -5283,7 +5044,11 @@ static bool generate_audio_tokens_local_simplex(
     const int num_audio_tokens = 6562;
     // 🔧 [与 Python 对齐] Python: max_new_token=500，每个 LLM condition 生成直到 EOS
     // 然后每 25 个 tokens yield 一次
-    const int max_audio_tokens = 500;
+    const int max_audio_tokens = std::min(
+        ctx_omni->generation_config.tts_max_audio_tokens,
+        std::max(
+            ctx_omni->generation_config.tts_min_audio_tokens,
+            n_tokens * ctx_omni->generation_config.tts_max_audio_tokens_per_text_token));
     
     if (!ctx_omni->ctx_tts_llama || !ctx_omni->model_tts) {
         LOG_ERR("TTS Simplex: TTS model not loaded\n");
@@ -5301,31 +5066,30 @@ static bool generate_audio_tokens_local_simplex(
         return false;
     }
     
-    // 🔧 [修复] 在 prefill 之前动态添加 audio_bos embedding
-    // Python 中 audio_bos 是在 TTS 类内部（TTSStreamingGenerator.generate_with_buffer）添加的
-    // 每个 chunk 都会加 audio_bos: condition = torch.cat([condition, self.audio_bos_embeds], dim=1)
-    std::vector<float> condition_with_bos = merged_embeddings;  // 复制一份
-    int extra_tokens = 0;  // 额外添加的 tokens 数量
-    
-    // 🔧 [修复 text_eos_embed 时机] text_eos_embed 不再在 condition 构建阶段添加
-    // 原因：一个 text chunk 会生成多个 audio chunk，text_eos_embed 放在 condition 中
-    // 会导致所有 audio chunk 都受到影响。正确做法是在第一轮 audio 生成结束（EOS）后，
-    // 再注入 text_eos_embed + audio_bos 做第二轮生成，这样只影响最后一批 audio tokens。
+    // Python TTSStreamingGenerator.generate_with_buffer builds exactly one
+    // condition per text chunk: text condition, optional text EOS, then audio BOS.
+    std::vector<float> text_eos_embed;
     const int text_eos_token_id = 151692;  // TTS 的 text_eos_token_id
-    
-    // 🔧 [与 Python 对齐] 只添加 audio_bos（总是添加）
-    // Python: condition = torch.cat([condition, self.audio_bos_embeds], dim=1)
-    std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
-    if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
-        condition_with_bos.insert(condition_with_bos.end(), 
-                                  audio_bos_embed.begin(), audio_bos_embed.end());
-        extra_tokens++;
-        print_with_timestamp("TTS Simplex: 在 prefill 前添加 audio_bos (chunk_idx=%d, new_size=%zu)\n", 
-                            chunk_idx, condition_with_bos.size() / tts_n_embd);
-    } else {
-        LOG_ERR("TTS Simplex: failed to get audio_bos embedding\n");
+    if (is_final_text_chunk) {
+        text_eos_embed.resize(tts_n_embd);
+        if (!tts_emb_text(ctx_omni, text_eos_token_id, text_eos_embed.data(), tts_n_embd)) {
+            LOG_ERR("TTS Simplex: failed to get text_eos embedding\n");
+            text_eos_embed.clear();
+        }
     }
-    int n_tokens_with_bos = n_tokens + extra_tokens;  // 包含 audio_bos
+
+    std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
+    if (!tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
+        LOG_ERR("TTS Simplex: failed to get audio_bos embedding\n");
+        audio_bos_embed.clear();
+    }
+
+    const std::vector<float> condition_with_bos =
+        omni_build_tts_condition(merged_embeddings, text_eos_embed, audio_bos_embed,
+                                 is_final_text_chunk);
+    const int n_tokens_with_bos = static_cast<int>(condition_with_bos.size() / tts_n_embd);
+    print_with_timestamp("TTS Simplex: condition tokens=%d (text=%d, text_finished=%d)\n",
+                         n_tokens_with_bos, n_tokens, is_final_text_chunk);
     
     // Save condition embeddings (包含 audio_bos)
     ctx_omni->tts_condition_embeddings = condition_with_bos;
@@ -5359,15 +5123,9 @@ static bool generate_audio_tokens_local_simplex(
     }
     print_with_timestamp("TTS Simplex: prefill completed, n_past_tts=%d\n", n_past_tts);
     
-    // Create sampler - matching Python TTSStreamingGenerator
-    // Create sampler - matching Python TTSStreamingGenerator
-    // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
-    common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
-    tts_sampling.top_k = 25;
-    tts_sampling.penalty_repeat = 1.05f;
-    tts_sampling.min_p = 0.01f;
-    tts_sampling.penalty_last_n = 16;
+    // Create the sampler from the shared Python-compatible TTS config.
+    common_params_sampling tts_sampling =
+        make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
     
     struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
     if (!tts_sampler) {
@@ -5380,18 +5138,13 @@ static bool generate_audio_tokens_local_simplex(
     
     // 🔧 [与 Python 对齐] 统一使用 tts_token_buffer 管理，和 Python _token_buffer 一致
     // Python chunk_size=25，每凑够 25 个才 yield
-    const int CHUNK_SIZE = 25;  // 与 Python TTSStreamingGenerator.chunk_size=25 对齐
+    const int CHUNK_SIZE = ctx_omni->generation_config.audio_token_chunk_size;
     
     // 🔧 [与 Python 对齐] 不强制最小生成数量，让 TTS 自然决定何时结束
     const int min_new_tokens = 0;
     
-    // 🔧 [修复 text_eos_embed 时机] 两阶段生成：
-    // Phase 1: 不带 text_eos_embed，正常生成 audio tokens 直到 EOS
-    // Phase 2 (仅 is_final_text_chunk): 注入 text_eos_embed + audio_bos，生成最后一批 audio tokens
-    // 这样 text_eos_embed 只影响最后一批 audio tokens，而非整个 text chunk 的所有 audio
-    bool need_phase2 = false;  // 是否需要第二阶段生成
-    
-    // ===== Phase 1: 正常生成（不带 text_eos_embed） =====
+    // The final condition already contains text_eos_embed before this loop,
+    // so every text chunk is generated in one pass like Python base.
     for (int t = 0; t < max_audio_tokens; ++t) {
         // 🔧 [P0-立即打断] 检测 break_event，立即停止 TTS 生成
         if (ctx_omni->break_event.load()) {
@@ -5402,7 +5155,6 @@ static bool generate_audio_tokens_local_simplex(
         // 🔧 [修复过早EOS] 如果还没达到 min_new_tokens，阻止 EOS 被采样
         bool force_no_eos = (t < min_new_tokens);
         
-        // Phase 1 始终使用 is_final_text_chunk=false：EOS 不 prefill，保持 KV cache 干净
         llama_token sampled_token_abs = sample_tts_token_simplex(
             tts_sampler,
             ctx_omni,
@@ -5411,7 +5163,7 @@ static bool generate_audio_tokens_local_simplex(
             &ctx_omni->tts_all_generated_tokens,
             t,
             force_no_eos,
-            false  // Phase 1: 不 prefill EOS，留给 Phase 2 处理
+            is_final_text_chunk
         );
         
         if (sampled_token_abs == 0) {
@@ -5431,14 +5183,9 @@ static bool generate_audio_tokens_local_simplex(
         // 🔧 [与 Python 对齐] EOS token 检测
         bool is_eos = (relative_idx == num_audio_tokens - 1);
         if (is_eos) {
-            print_with_timestamp("TTS Simplex Phase1: EOS token at step %d\n", t + 1);
+            print_with_timestamp("TTS Simplex: EOS token at step %d\n", t + 1);
             output_audio_tokens.pop_back();
             ctx_omni->tts_all_generated_tokens.pop_back();
-            // 如果是最后一个 text chunk，需要进入 Phase 2
-            if (is_final_text_chunk) {
-                need_phase2 = true;
-                print_with_timestamp("TTS Simplex: is_final_text_chunk=true, will enter Phase 2 for text_eos_embed\n");
-            }
         } else {
             // 🔧 [与 Python 对齐] 非 EOS token 加入 tts_token_buffer
             ctx_omni->tts_token_buffer.push_back(relative_idx);
@@ -5458,111 +5205,19 @@ static bool generate_audio_tokens_local_simplex(
             }
             ctx_omni->t2w_thread_info->cv.notify_one();
             
-            print_with_timestamp("TTS Simplex Phase1: yield %d tokens 到 T2W (step %d, buffer=%zu)\n", 
+            print_with_timestamp("TTS Simplex: yield %d tokens 到 T2W (step %d, buffer=%zu)\n",
                                 CHUNK_SIZE, t + 1, ctx_omni->tts_token_buffer.size());
             ctx_omni->tts_token_buffer.erase(ctx_omni->tts_token_buffer.begin(), 
                                               ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
         }
         
         if (t < 5 || (t + 1) % 25 == 0) {
-            print_with_timestamp("TTS Simplex Phase1: token %d/%d: rel_id=%d\n", t + 1, max_audio_tokens, relative_idx);
+            print_with_timestamp("TTS Simplex: token %d/%d: rel_id=%d\n", t + 1, max_audio_tokens, relative_idx);
         }
         
         // 如果是 EOS，退出 Phase 1 循环
         if (is_eos) {
             break;
-        }
-    }
-    
-    // ===== Phase 2: 注入 text_eos_embed，生成最后一批 audio tokens =====
-    // 仅在 is_final_text_chunk 且 Phase 1 正常结束（EOS）时执行
-    if (need_phase2 && !ctx_omni->break_event.load()) {
-        print_with_timestamp("TTS Simplex Phase2: injecting text_eos_embed + audio_bos at n_past=%d\n", n_past_tts);
-        
-        // 注入 text_eos_embed 到 TTS KV cache
-        std::vector<float> text_eos_embed(tts_n_embd, 0.0f);
-        bool inject_ok = false;
-        if (tts_emb_text(ctx_omni, text_eos_token_id, text_eos_embed.data(), tts_n_embd)) {
-            if (prefill_with_emb_tts(ctx_omni, params, text_eos_embed.data(), 1, 1, &n_past_tts)) {
-                print_with_timestamp("TTS Simplex Phase2: text_eos_embed injected, n_past=%d\n", n_past_tts);
-                
-                // 再注入 audio_bos，开始新一轮 audio 生成
-                std::vector<float> audio_bos_embed2(tts_n_embd, 0.0f);
-                if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed2.data(), tts_n_embd)) {
-                    if (prefill_with_emb_tts(ctx_omni, params, audio_bos_embed2.data(), 1, 1, &n_past_tts)) {
-                        print_with_timestamp("TTS Simplex Phase2: audio_bos injected, n_past=%d, starting final generation\n", n_past_tts);
-                        inject_ok = true;
-                    }
-                }
-            }
-        }
-        
-        if (inject_ok) {
-            // Phase 2 生成循环：text_eos_embed 已注入，生成最后的 audio tokens
-            for (int t2 = 0; t2 < max_audio_tokens; ++t2) {
-                if (ctx_omni->break_event.load()) {
-                    print_with_timestamp("TTS Simplex Phase2: break_event at step %d\n", t2);
-                    break;
-                }
-                
-                // Phase 2 使用 is_final_text_chunk=true：EOS 会被 prefill
-                llama_token sampled_token_abs = sample_tts_token_simplex(
-                    tts_sampler,
-                    ctx_omni,
-                    params,
-                    &n_past_tts,
-                    &ctx_omni->tts_all_generated_tokens,
-                    t2,
-                    false,  // 不强制阻止 EOS
-                    true    // Phase 2: is_final，EOS 会被 prefill
-                );
-                
-                if (sampled_token_abs == 0) {
-                    LOG_ERR("TTS Simplex Phase2: sample failed at step %d\n", t2);
-                    break;
-                }
-                
-                int relative_idx = sampled_token_abs - audio_bos_token_id;
-                if (relative_idx < 0 || relative_idx >= num_audio_tokens) {
-                    LOG_ERR("TTS Simplex Phase2: invalid token %d at step %d\n", sampled_token_abs, t2);
-                    break;
-                }
-                
-                output_audio_tokens.push_back(relative_idx);
-                ctx_omni->tts_all_generated_tokens.push_back(sampled_token_abs);
-                
-                bool is_eos = (relative_idx == num_audio_tokens - 1);
-                if (is_eos) {
-                    print_with_timestamp("TTS Simplex Phase2: EOS at step %d (final end)\n", t2 + 1);
-                    output_audio_tokens.pop_back();
-                    ctx_omni->tts_all_generated_tokens.pop_back();
-                } else {
-                    ctx_omni->tts_token_buffer.push_back(relative_idx);
-                }
-                
-                // yield audio chunks
-                while ((int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
-                    T2WOut *t2w_out = new T2WOut();
-                    t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
-                                                 ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
-                    t2w_out->is_final = false;
-                    t2w_out->round_idx = ctx_omni->simplex_round_idx;
-                    {
-                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
-                        ctx_omni->t2w_thread_info->queue.push(t2w_out);
-                    }
-                    ctx_omni->t2w_thread_info->cv.notify_one();
-                    print_with_timestamp("TTS Simplex Phase2: yield %d tokens 到 T2W\n", CHUNK_SIZE);
-                    ctx_omni->tts_token_buffer.erase(ctx_omni->tts_token_buffer.begin(), 
-                                                      ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
-                }
-                
-                if (is_eos) {
-                    break;
-                }
-            }
-        } else {
-            LOG_ERR("TTS Simplex Phase2: failed to inject text_eos_embed/audio_bos\n");
         }
     }
     
@@ -5692,10 +5347,9 @@ static bool generate_audio_tokens_local(
     // TTS model constants
     const int audio_bos_token_id = 151687;
     const int num_audio_tokens = 6562;
-    // 🔧 [单双工适配] max_audio_tokens:
-    // - 双工模式: 26 (与 Python 对齐，max_token_per_chunk = 25 + 1)
-    // - 单工模式: 500 (允许更长的生成，靠 EOS 结束)
-    const int max_audio_tokens = ctx_omni->duplex_mode ? 26 : 500;
+    const int max_audio_tokens = ctx_omni->duplex_mode
+        ? ctx_omni->generation_config.duplex_tts_max_audio_tokens
+        : ctx_omni->generation_config.tts_max_audio_tokens;
     print_with_timestamp("TTS Local: mode=%s, max_audio_tokens=%d\n", 
                          ctx_omni->duplex_mode ? "duplex" : "simplex", max_audio_tokens);
     
@@ -5792,16 +5446,9 @@ static bool generate_audio_tokens_local(
     }
     print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d\n", n_past_tts);
     
-    // 2. Create sampler for TTS with correct TTS sampling parameters
-    // 🔧 TTS流式采样参数 - 与 Python TTSStreamingGenerator 对齐
-    // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
-    common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
-    tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
-    tts_sampling.top_k = 25;               // top_k = 25
-    tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
-    tts_sampling.min_p = 0.01f;            // min_p = 0.01
-    tts_sampling.penalty_last_n = 16;      // past_window = 16 (与Python对齐)
+    // 2. Create the sampler from the shared Python-compatible TTS config.
+    common_params_sampling tts_sampling =
+        make_tts_sampling_params(params->sampling, ctx_omni->generation_config.tts_sampling);
     
     struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
     if (!tts_sampler) {
@@ -5818,21 +5465,16 @@ static bool generate_audio_tokens_local(
     // Python generate_chunk: input_ids_sliced = new_tokens[:, 0:t]  # 只用当前 chunk 内的 tokens
     std::vector<llama_token> chunk_generated_tokens;
     
-    // 🔧 [单双工适配] min_new_tokens 逻辑
-    // - 双工模式: 与 Python streaming_generate 对齐
-    //   max_token_per_chunk = 25 + 1  # 26
-    //   min_token_per_chunk = 25 + 1  # 26
-    //   if end_of_turn: min_token_per_chunk = 0
-    // - 单工模式: 设置最小 100 个 tokens，防止 TTS 过早生成 EOS
-    //   10 个中文字约需要 100-150 个 audio tokens (每字 10-15 tokens)
-    const int min_new_tokens = ctx_omni->duplex_mode ? 
-        (is_end_of_turn ? 0 : 26) : 
-        100;  // 🔧 单工模式：至少生成 100 个 tokens 防止过早 EOS
+    // Duplex keeps the Python per-chunk minimum; turn-based generation lets
+    // the TTS model stop naturally.
+    const int min_new_tokens = ctx_omni->duplex_mode && !is_end_of_turn
+        ? ctx_omni->generation_config.duplex_tts_min_audio_tokens
+        : 0;
     
     // 🚀 流水线优化：Token2Wav需要28个tokens (25+3 lookahead)才能输出音频
     // 首批28个tokens后推送，后续每25个tokens推送一次
-    const int STREAM_CHUNK_SIZE = 25;
-    const int FIRST_CHUNK_SIZE = 28;  // 首批推送阈值，减少首响时间
+    const int STREAM_CHUNK_SIZE = ctx_omni->generation_config.audio_token_chunk_size;
+    const int FIRST_CHUNK_SIZE = STREAM_CHUNK_SIZE + ctx_omni->generation_config.audio_prelook_size;
     bool first_chunk_pushed = false;
     std::vector<int32_t> stream_buffer;
     
@@ -6917,8 +6559,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     const int text_eos_token_id = 151692;  // 用于文本结束检测
     const int spk_emb_token_id = 21143;
     const int num_audio_tokens = 6562;
-    const int max_audio_tokens = 1000;  // Maximum audio tokens to generate per text chunk
-    
     // WAV timing log file (will be created in current round directory)
     auto create_wav_timing_file = [&]() {
         std::string wav_timing_file = tts_wav_output_dir + "/wav_timing.txt";
@@ -7888,10 +7528,10 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         // 接下来LLM再生成10个token → TTS再生成25个token，以此类推
         int text_token_count = (int)text_tokens.size();
         // Fixed at 25 tokens per chunk (matching Python's audio_token_chunk_size=25)
-        int max_audio_tokens_for_text = 25;
+        int max_audio_tokens_for_text = ctx_omni->generation_config.audio_token_chunk_size;
         
         // Buffer for accumulating audio tokens (yield when reaching 25 tokens, matching Python chunk_size=25)
-        const int audio_token_chunk_size = 25;  // Yield size matching Python
+        const int audio_token_chunk_size = ctx_omni->generation_config.audio_token_chunk_size;
         std::vector<llama_token> audio_token_buffer;
         
         // 🔧 [差异3修复] 当前 chunk 的 tokens，用于 repetition penalty
@@ -8210,9 +7850,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     }
                 }
                 
-                // Reset buffer for next round (re-initialize with 3 silence tokens)
+                // Reset buffer for next round.
                 ctx_omni->token2wav_buffer.clear();
-                ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+                ctx_omni->token2wav_buffer = make_token2wav_prefix(ctx_omni);
                 ctx_omni->token2wav_wav_idx = 0;
             }
             
@@ -8639,14 +8279,14 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
             speech_tokenizer_gguf,
             campplus_gguf,
             frontend_threads,
-            5,
-            1.0f)) {
+            ctx_omni->generation_config.tts_n_timesteps,
+            ctx_omni->generation_config.token2wav_temperature)) {
         LOG_ERR("omni_set_tts_reference_audio: native GGUF frontend failed\n");
         return false;
     }
 
     ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
-    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    ctx_omni->token2wav_buffer = make_token2wav_prefix(ctx_omni);
     return true;
 }
 
@@ -8668,7 +8308,9 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
     const std::string prompt_cache_gguf =
         ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
     if (!ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
-            prompt_cache_gguf, 5, 1.0f)) {
+            prompt_cache_gguf,
+            ctx_omni->generation_config.tts_n_timesteps,
+            ctx_omni->generation_config.token2wav_temperature)) {
         LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
         return false;
     }
@@ -8678,7 +8320,7 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
     }
     ctx_omni->tts_ref_audio_path.clear();
     ctx_omni->tts_ref_audio_owned = false;
-    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    ctx_omni->token2wav_buffer = make_token2wav_prefix(ctx_omni);
     return true;
 }
 
@@ -8979,13 +8621,12 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     auto& cv = ctx_omni->t2w_thread_info->cv;
     
     // Token2Wav sliding window parameters
-    constexpr int32_t CHUNK_SIZE = 25;      // Main chunk size (25 tokens = 1s audio)
-    constexpr int32_t PRE_LOOKAHEAD = 3;    // Lookahead for overlap
-    constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;  // 28
+    const int32_t CHUNK_SIZE = ctx_omni->generation_config.audio_token_chunk_size;
+    const int32_t PRE_LOOKAHEAD = ctx_omni->generation_config.audio_prelook_size;
+    const int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;
     
-    // Buffer to accumulate tokens (for sliding window)
-    // Python: buffer = [4218] * 3  # 预先放入3个前缀静音token
-    std::vector<int32_t> token_buffer = {4218, 4218, 4218};
+    // Buffer to accumulate tokens (for sliding window).
+    std::vector<int32_t> token_buffer = make_token2wav_prefix(ctx_omni);
     
     // 🔧 [多实例支持] 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
@@ -9025,7 +8666,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             }
             // 重置 break_event 后继续等待新任务
             ctx_omni->break_event = false;
-            token_buffer = {4218, 4218, 4218};  // 重置 buffer
+            token_buffer = make_token2wav_prefix(ctx_omni);
             wav_idx = 0;  // 重置 wav index
             
             // 🔧 [修复竞态条件] 在 T2W 线程处理完打断后递增 wav_turn_base
@@ -9111,7 +8752,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             // 重置轮次相关状态
             wav_idx = 0;                                                    // WAV 文件编号从 0 开始
             ctx_omni->wav_turn_base = effective_round_idx * 1000;           // 更新全局 WAV 编号基数
-            token_buffer = {4218, 4218, 4218};                              // 重置 token buffer（3个静音前缀）
+            token_buffer = make_token2wav_prefix(ctx_omni);
             
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
             
@@ -9301,8 +8942,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     // 🔧 [关键] 不调用 Token2WavSession::reset()
                     // 原因：reset() 会把 stream_started_=false，导致下一轮 feed_window 失败
                     // 单工和双工模式都只重置 token_buffer，保持 Token2Wav 的 stream 状态
-                    // 重新初始化buffer（3个静音token作为前缀）
-                    token_buffer = {4218, 4218, 4218};
+                    // Re-initialize the configured silence prefix.
+                    token_buffer = make_token2wav_prefix(ctx_omni);
                     
                     // 🔧 [修复竞态条件] 在 T2W 线程处理完 is_final 后递增 wav_turn_base
                     // 原因：确保当前轮次的所有 wav 文件使用旧的编号，然后再切换到新编号
@@ -9941,7 +9582,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     int decode_start_cache_len = ctx_omni->n_past;
 
     // ---- force_listen：会话开局强制 LISTEN N 次 ----
-    if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+    if (ctx_omni->force_listen_used < ctx_omni->generation_config.force_listen_count) {
         ctx_omni->force_listen_used++;
         if (ctx_omni->special_token_listen >= 0) {
             common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
@@ -9959,7 +9600,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->speek_done = true;
         }
         print_with_timestamp("Duplex decode: force_listen %d/%d, emit __IS_LISTEN__\n",
-                             ctx_omni->force_listen_used, ctx_omni->force_listen_count);
+                             ctx_omni->force_listen_used, ctx_omni->generation_config.force_listen_count);
         {
             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
             ctx_omni->text_queue.push_back("__IS_LISTEN__");
@@ -9972,11 +9613,11 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     // ---- 采样主循环（搬自老 stream_decode duplex 分支） ----
     const int max_tgt_len = params->n_predict < 0 ? params->n_ctx : params->n_predict;
-    const int step_size   = 10;   // chunk 推送给 TTS 的 LLM token 数量
+    const int step_size   = ctx_omni->generation_config.llm_text_chunk_size;
     bool llm_finish                  = false;
     bool local_is_end_of_turn        = false;
     int  current_chunk_tokens        = 0;
-    const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
+    const int max_chunk_tokens       = ctx_omni->generation_config.max_new_speak_tokens_per_chunk;
     bool chunk_limit_reached         = false;
     const int llm_n_embd             = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
@@ -10892,7 +10533,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 组合导致模型第一个 chunk 直接 SPEAK。
         // 这里直接发 __IS_LISTEN__ 到 text_queue 走 LISTEN 分支，不启动 LLM 采样。
         // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
-        if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+        if (ctx_omni->force_listen_used < ctx_omni->generation_config.force_listen_count) {
             ctx_omni->force_listen_used++;
             {
                 std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
@@ -10915,7 +10556,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 ctx_omni->speek_done = true;
             }
             print_with_timestamp("LLM Duplex: force_listen %d/%d, skip generation and emit __IS_LISTEN__\n",
-                                 ctx_omni->force_listen_used, ctx_omni->force_listen_count);
+                                 ctx_omni->force_listen_used, ctx_omni->generation_config.force_listen_count);
             if (ctx_omni->async) {
                 std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
                 ctx_omni->text_queue.push_back("__IS_LISTEN__");
@@ -10955,7 +10596,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // 注意：step_size影响TTS条件长度，可能影响音质
     // step_size=5: 首响更快(612ms)但可能影响音质
     // step_size=10: 首响稍慢(791ms)但音质更稳定
-    int step_size = 10;  // 恢复原始值
+    const int step_size = ctx_omni->generation_config.llm_text_chunk_size;
     std::string response = "";
     
     // tts streaming memory
@@ -10967,6 +10608,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     tts_output.resize(1/* batch_size */ * (ctx_omni->params->n_ctx /* seq_len */ * 2) * 256);
     bool llm_finish = false;
     bool llm_first_token_logged = false;
+    bool has_pending_tts_token = false;
+    llama_token pending_tts_token = LLAMA_TOKEN_NULL;
+    std::vector<float> pending_tts_hidden_state;
+    std::string pending_tts_piece;
     
     // 🔧 [修复双工缺字问题] 记录当前 chunk 是否是 turn 的结束
     // 此变量随 LLMOut 一起传递给 TTS 线程，避免全局状态的时序问题
@@ -10988,13 +10633,27 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 打断逻辑通过 need_speek 或其他机制处理。
         fflush(stdout);
         
-        int jl = 0;  // 计数有效的 TTS token 数量
         int total_tokens_generated = 0;  // 计数总共生成的 token 数量（包括被过滤的）
         // 收集当前chunk的token IDs和hidden states用于TTS条件生成
         // 🔧 [优化] 只收集有效的 TTS token，确保每次给 TTS 的都是 step_size 个有效 token
         std::vector<llama_token> chunk_token_ids;
         std::vector<float> chunk_hidden_states;
         int llm_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+        const OmniTextChunkPlan chunk_plan =
+            omni_text_chunk_plan(step_size, has_pending_tts_token);
+        if (has_pending_tts_token) {
+            chunk_token_ids.push_back(pending_tts_token);
+            chunk_hidden_states = pending_tts_hidden_state;
+            response = pending_tts_piece;
+            pending_tts_token = LLAMA_TOKEN_NULL;
+            pending_tts_hidden_state.clear();
+            pending_tts_piece.clear();
+            has_pending_tts_token = false;
+        }
+        int condition_tokens_collected = chunk_plan.prefix_tokens;
+        bool need_lookahead = !ctx_omni->duplex_mode &&
+                              chunk_plan.generated_tokens > chunk_plan.condition_tokens;
         
         // 🔧 [修复双工缺字问题] 每个 chunk 开始时重置 is_end_of_turn 状态
         // 只有当检测到 TURN_EOS/TTS_EOS/EOS 时才会在下面设置为 true
@@ -11003,14 +10662,17 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 🔧 [单双工适配] chunk 限制只在双工模式下生效
         // - 双工模式: 每个 chunk 最多 max_new_speak_tokens_per_chunk 个 tokens，便于及时响应打断
         // - 单工模式: 无限制，LLM 生成直到 EOS
-        int max_chunk_tokens = ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
+        int max_chunk_tokens = ctx_omni->duplex_mode ? ctx_omni->generation_config.max_new_speak_tokens_per_chunk : 0;
         bool chunk_limit_reached = (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens);
         {
             fflush(stdout);
-            // 🔧 [重要] 循环直到收集到 step_size 个有效 token，而不是生成 step_size 个 token
+            // Python generates one lookahead token at every non-final chunk
+            // boundary. The lookahead is fed into the LLM cache, but its text
+            // and hidden state are emitted with the next TTS condition.
             // 🔧 [P0-打断检测] 检测 break_event，支持双工模式下的打断
             // 🔧 [P2-chunk限制] 检测 max_new_speak_tokens_per_chunk，便于及时响应打断
-            while (jl < step_size && !llm_finish && !ctx_omni->break_event.load() && !chunk_limit_reached) {
+            while ((condition_tokens_collected < step_size || need_lookahead) &&
+                   !llm_finish && !ctx_omni->break_event.load() && !chunk_limit_reached) {
                 // streaming llm
                 const char * tmp = nullptr;
                 float * hidden_states = nullptr;
@@ -11024,52 +10686,12 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 
                 total_tokens_generated++;
                 
-                // 🔧 [过滤逻辑] 只收集有效的 TTS token
-                // 特殊 token（如 <think>, </think>, 换行等）不计入 step_size
-                if (tmp != nullptr && hidden_states != nullptr) {
-                    if (is_valid_tts_token(sampled_token)) {
-                        // 有效 token：收集并计入计数
-                        chunk_token_ids.push_back(sampled_token);
-                        chunk_hidden_states.insert(chunk_hidden_states.end(), hidden_states, hidden_states + llm_n_embd);
-                        jl++;  // 只有有效 token 才增加计数
-                        
-                        // 🔧 [调试] 打印收集的 token 和 hidden states 摘要
-                        
-                        // 🔧 [P2-chunk限制] 更新当前 chunk 的 token 计数
-                        current_chunk_tokens++;
-                        
-                        // 检查是否达到 chunk 限制
-                        if (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens) {
-                            chunk_limit_reached = true;
-                        }
-                    } else {
-                        // 🔧 [调试] 打印被过滤的 token
-                    }
-                }
-                
-                // if (hidden_states != nullptr) {
-                //     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-                //     // 打印第一个 embedding 的前5个数字
-                //     printf("First embedding (first 5): ");
-                //     for (int i = 0; i < 5 && i < n_embd; i++) {
-                //         printf("%.6f ", hidden_states[i]);
-                //     }
-                //     printf("\n");
-                //     // 打印最后一个 embedding 的后5个数字 (这里只有1个token，所以第一个和最后一个是同一个)
-                //     printf("Last embedding (last 5): ");
-                //     for (int i = n_embd - 5; i < n_embd; i++) {
-                //         if (i >= 0) {
-                //             printf("%.6f ", hidden_states[i]);
-                //         }
-                //     }
-                //     printf("\n");
-                //     free(hidden_states);
-                // }
                 if (!llm_first_token_logged) {
                     llm_first_token_logged = true;
                 }
                 if (tmp == nullptr) {
                     LOG_ERR("llama_loop returned nullptr!");
+                    free(hidden_states);
                     break;
                 }
                 
@@ -11154,12 +10776,39 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     }
                     
                     // Don't add end tokens to response
+                    free(hidden_states);
                     break;
                 }
 
                 // Copy tmp to a local string immediately to avoid issues with static string
                 std::string tmp_str(tmp);
+                const bool valid_tts_token = is_valid_tts_token(sampled_token);
+                if (!ctx_omni->duplex_mode &&
+                    need_lookahead &&
+                    condition_tokens_collected >= step_size &&
+                    valid_tts_token) {
+                    pending_tts_token = sampled_token;
+                    pending_tts_hidden_state.assign(hidden_states, hidden_states + llm_n_embd);
+                    pending_tts_piece = tmp_str;
+                    has_pending_tts_token = true;
+                    need_lookahead = false;
+                    free(hidden_states);
+                    break;
+                }
+
                 response += tmp_str;
+                if (valid_tts_token) {
+                    chunk_token_ids.push_back(sampled_token);
+                    chunk_hidden_states.insert(chunk_hidden_states.end(),
+                                               hidden_states, hidden_states + llm_n_embd);
+                    condition_tokens_collected++;
+                    current_chunk_tokens++;
+
+                    if (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens) {
+                        chunk_limit_reached = true;
+                    }
+                }
+                free(hidden_states);
                 fflush(stdout);
             }
             fflush(stdout);

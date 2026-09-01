@@ -13,6 +13,7 @@
 #include "ws_handler.h"
 #include "session.h"
 #include "protocol.h"
+#include "generation_config.h"
 #include "omni.h"
 #include "common.h"
 #include "llama.h"
@@ -247,35 +248,15 @@ static bool reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
 
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
 // context and params. Unknown/missing keys are left at model defaults.
-static void apply_session_config(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
-    if (!init.config.is_object()) {
-        return;
+static bool apply_session_config(common_params & params,
+                                 omni_context * octx,
+                                 const OmniGenerationConfig & config) {
+    if (!omni_apply_generation_config(octx, &params, config)) {
+        LOG_ERR("apply_session_config: failed to rebuild generation samplers\n");
+        return false;
     }
-    if (init.config.contains("length_penalty") && init.config.at("length_penalty").is_number()) {
-        octx->length_penalty = init.config.at("length_penalty").get<float>();
-    }
-    if (init.config.contains("listen_prob_scale") && init.config.at("listen_prob_scale").is_number()) {
-        octx->listen_prob_scale = init.config.at("listen_prob_scale").get<float>();
-    }
-    if (init.config.contains("force_listen_count") && init.config.at("force_listen_count").is_number_integer()) {
-        octx->force_listen_count = init.config.at("force_listen_count").get<int>();
-        octx->force_listen_used = 0;
-    }
-    if (init.config.contains("max_new_speak_tokens_per_chunk") && init.config.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
-        octx->max_new_speak_tokens_per_chunk = init.config.at("max_new_speak_tokens_per_chunk").get<int>();
-    }
-    if (init.config.contains("tts_temperature") && init.config.at("tts_temperature").is_number()) {
-        octx->tts_temperature = init.config.at("tts_temperature").get<float>();
-    }
-    if (init.config.contains("temperature") && init.config.at("temperature").is_number()) {
-        params.sampling.temp = init.config.at("temperature").get<float>();
-    }
-    if (init.config.contains("top_p") && init.config.at("top_p").is_number()) {
-        params.sampling.top_p = init.config.at("top_p").get<float>();
-    }
-    if (init.config.contains("top_k") && init.config.at("top_k").is_number_integer()) {
-        params.sampling.top_k = init.config.at("top_k").get<int>();
-    }
+    octx->force_listen_used = 0;
+    return true;
 }
 
 // ============================================================================
@@ -541,6 +522,8 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
+    const OmniGenerationConfig generation_config =
+        omni_generation_config_from_json(init.config);
 
     // Build params for omni_init
     auto & p = params;
@@ -554,7 +537,9 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
             LOG_ERR("create_session_octx: failed to reset reused context\n");
             return nullptr;
         }
-        apply_session_config(p, shared_octx, init);
+        if (!apply_session_config(p, shared_octx, generation_config)) {
+            return nullptr;
+        }
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
                 duplex_mode, output_dir.c_str());
         return shared_octx;
@@ -567,7 +552,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
                                      /*token2wav_device*/"gpu:0", duplex_mode,
-                                     model, ctx, output_dir);
+                                     model, ctx, output_dir, generation_config);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;
@@ -575,7 +560,6 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 
     octx->async = true;
     octx->duplex_mode = duplex_mode;
-    apply_session_config(p, octx, init);
 
     // Voice clone / system prompt
     if (!init.system_prompt.empty()) {
@@ -971,7 +955,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 if (octx->params) {
                     octx->params->n_predict = parsed_input.max_new_tokens;
                 }
-                octx->length_penalty = parsed_input.length_penalty;
+                    octx->generation_config.length_penalty = parsed_input.length_penalty;
                 const bool prev_use_tts = octx->use_tts;
                 octx->use_tts = parsed_input.use_tts_template;
                 configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);

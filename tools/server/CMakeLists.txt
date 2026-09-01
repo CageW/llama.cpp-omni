@@ -66,6 +66,17 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-ws-context-cleanup PRIVATE cxx_std_17)
     add_test(NAME test-ws-context-cleanup COMMAND test-ws-context-cleanup)
     set_tests_properties(test-ws-context-cleanup PROPERTIES LABELS "main;omni")
+
+    add_executable(test-generation-config test-generation-config.cpp)
+    target_include_directories(test-generation-config PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../omni
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/vendor
+    )
+    target_compile_features(test-generation-config PRIVATE cxx_std_17)
+    add_test(NAME test-generation-config COMMAND test-generation-config)
+    set_tests_properties(test-generation-config PROPERTIES LABELS "main;omni;tts")
 endif()
 
 # llama-tts-server executable (standalone VoxCPM2 TTS HTTP API)

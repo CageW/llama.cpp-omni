@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "session.h"
 #include "ws_handler.h"
+#include "generation_config.h"
 
 #include <mutex>
 #include <thread>
@@ -152,6 +153,12 @@ int main(int argc, char ** argv) {
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
         std::string voice_audio = data.value("voice_audio", "");
         std::string tts_ref_audio = data.value("tts_ref_audio", voice_audio);
+        OmniGenerationConfig generation_config =
+            omni_generation_config_from_json(data);
+        if (data.contains("config") && data.at("config").is_object()) {
+            generation_config =
+                omni_generation_config_from_json(data.at("config"), generation_config);
+        }
 
         // validate key files
         auto check_file = [&](const std::string & role, const std::string & path) -> bool {
@@ -189,7 +196,8 @@ int main(int argc, char ** argv) {
 
         omni_context * octx = omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers,
                                          token2wav_device, duplex_mode,
-                                         /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
+                                         /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
+                                         output_dir, generation_config);
         if (!octx) {
             res_error(res, format_error_response("omni_init failed"));
             return;
@@ -285,7 +293,7 @@ int main(int argc, char ** argv) {
             float lp = data.at("length_penalty").get<float>();
             std::lock_guard<std::mutex> lock(state.octx_mutex);
             if (state.octx != nullptr) {
-                state.octx->length_penalty = lp;
+                state.octx->generation_config.length_penalty = lp;
             }
         }
 

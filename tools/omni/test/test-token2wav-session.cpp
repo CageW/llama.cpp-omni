@@ -111,7 +111,7 @@ int main(int argc, char ** argv) {
     const fs::path voice2              = argc == 1 ? configured_args[4] : argv[5];
     const fs::path output_dir          = argc == 1 ? configured_args[5] : argv[6];
     const std::string device            = argc >= 8 ? argv[7] : "gpu:0";
-    const int n_timesteps              = argc >= 9 ? std::stoi(argv[8]) : 5;
+    const int n_timesteps              = argc >= 9 ? std::stoi(argv[8]) : 10;
 
     fs::create_directories(output_dir);
     const std::string encoder = (model_dir / "encoder.gguf").string();

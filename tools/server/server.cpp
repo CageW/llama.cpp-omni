@@ -5663,7 +5663,7 @@ int main(int argc, char ** argv) {
             {
                 std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
                 if (ctx_server.octx != nullptr) {
-                    ctx_server.octx->length_penalty = lp;
+                    ctx_server.octx->generation_config.length_penalty = lp;
                 }
             }
             SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);

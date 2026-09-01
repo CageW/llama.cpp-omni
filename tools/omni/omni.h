@@ -1,7 +1,11 @@
+#pragma once
+
 #include "ggml.h"
 #include "llama.h"
 #include "tts-condition-graph.h"
 
+#include <algorithm>
+#include <array>
 #include <thread>
 #include <memory>
 #include <vector>
@@ -148,6 +152,93 @@ struct projector_model {
     bool initialized = false;
 };
 
+// Python base-compatible generation settings shared by LLM, TTS, Token2Wav,
+// and duplex session setup. These defaults mirror the active Python base
+// configuration rather than the generic llama.cpp defaults.
+struct OmniSamplingConfig {
+    float temperature = 0.7f;
+    float top_p = 0.8f;
+    int top_k = 100;
+    float min_p = 0.0f;
+    float repetition_penalty = 1.05f;
+    int repetition_window = 512;
+    int min_tokens_to_keep = 1;
+};
+
+struct OmniGenerationConfig {
+    OmniSamplingConfig llm_sampling{};
+    // TTSSamplingParams keeps min_p=0.01, but gen_logits does not apply it.
+    OmniSamplingConfig tts_sampling{0.8f, 0.85f, 25, 0.01f, 1.05f, 16, 3};
+
+    int tts_n_timesteps = 10;
+    float token2wav_temperature = 1.0f;
+    int audio_token_chunk_size = 25;
+    int audio_prelook_size = 3;
+    int tts_max_audio_tokens = 500;
+    int tts_max_audio_tokens_per_text_token = 30;
+    int tts_min_audio_tokens = 75;
+    int duplex_tts_max_audio_tokens = 26;
+    int duplex_tts_min_audio_tokens = 26;
+    int llm_text_chunk_size = 10;
+
+    int max_new_speak_tokens_per_chunk = 20;
+    float listen_prob_scale = 1.0f;
+    int force_listen_count = 0;
+    float length_penalty = 1.0f;
+};
+
+enum class OmniSamplingStage {
+    Temperature,
+    TopK,
+    TopP,
+};
+
+inline std::array<OmniSamplingStage, 3> omni_python_sampling_order(bool tts) {
+    if (tts) {
+        return {OmniSamplingStage::Temperature,
+                OmniSamplingStage::TopP,
+                OmniSamplingStage::TopK};
+    }
+    return {OmniSamplingStage::Temperature,
+            OmniSamplingStage::TopK,
+            OmniSamplingStage::TopP};
+}
+
+inline int omni_effective_tts_top_k(const OmniSamplingConfig & config) {
+    return config.top_k > 0
+        ? std::max(config.top_k, config.min_tokens_to_keep)
+        : config.top_k;
+}
+
+struct OmniTextChunkPlan {
+    int prefix_tokens = 0;
+    int condition_tokens = 0;
+    int generated_tokens = 0;
+};
+
+inline OmniTextChunkPlan omni_text_chunk_plan(int chunk_size, bool has_pending_token) {
+    const int prefix_tokens = has_pending_token ? 1 : 0;
+    const int condition_tokens = std::max(0, chunk_size - prefix_tokens);
+    return {
+        prefix_tokens,
+        condition_tokens,
+        condition_tokens + 1,
+    };
+}
+
+inline std::vector<float> omni_build_tts_condition(
+        const std::vector<float> & condition,
+        const std::vector<float> & text_eos_embed,
+        const std::vector<float> & audio_bos_embed,
+        bool text_finished) {
+    std::vector<float> result = condition;
+    if (text_finished) {
+        result.insert(result.end(), text_eos_embed.begin(), text_eos_embed.end());
+    }
+    result.insert(result.end(), audio_bos_embed.begin(), audio_bos_embed.end());
+    return result;
+}
+
 // ============================================================================
 // Audio output callback type
 // Called by T2W threads when a chunk of audio is generated.
@@ -171,10 +262,8 @@ struct omni_context {
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
 
-    // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    // length_penalty < 1.0 会增加 EOS 概率，让模型更早结束
-    float length_penalty = 1.0f;
+    // Generation settings shared by all LLM/TTS/duplex paths.
+    OmniGenerationConfig generation_config;
 
     struct llama_context * ctx_tts_llama = NULL;
     struct llama_model * model_tts = NULL;
@@ -295,22 +384,19 @@ struct omni_context {
     // ==================== 双工模式参数 ====================
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
     // 设置为 0 表示无限制
-    int max_new_speak_tokens_per_chunk = 26;
+    // The active generation limits live in generation_config.
     
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认
-    float listen_prob_scale = 1.0f;
+    // The active listen probability scale lives in generation_config.
 
     // 会话开局强制 LISTEN 的 chunk 数（与 Python duplex_config.force_listen_count 对齐）
     // 防止 browser 打开 MediaStreamTrack 时的瞬态噪声 + 强 system prompt 组合
     // 导致模型在第一 chunk 就 SPEAK 产生"抢答"。
     // 每次 update_session_config 时重置 force_listen_used=0。
-    int force_listen_count = 3;
     int force_listen_used  = 0;
 
-    // TTS 采样温度（与 Python TTSSamplingParams.temperature 对齐，默认 0.8）
-    // 通过 /v1/stream/update_session_config 的 "tts_temperature" 字段透传
-    float tts_temperature = 0.8f;
+    // TTS sampling settings are stored in generation_config.tts_sampling.
 
     // 是否启用双工模式
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
@@ -392,7 +478,7 @@ struct omni_context {
     
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
-    float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    float * head_code_weight = nullptr;  // (6562, 768) - one row per audio token
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -424,6 +510,7 @@ struct omni_context {
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
+    struct common_sampler * ctx_tts_sampler_bos = NULL;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     std::string token2wav_device = "gpu:0";
     
@@ -450,8 +537,9 @@ struct omni_context {
     std::mutex tts_voice_mtx;
     
     // Token2Wav sliding window buffer (跨 chunk 保持状态)
-    // Python 逻辑: buffer 初始填充 3 个静音 token (4218)
-    // 每次取 28 个 tokens (25 main + 3 lookahead)，处理后移动 25 个，保留 3 个重叠
+    // Python 逻辑: buffer 初始填充 audio_prelook_size 个静音 token (4218)
+    // 每次取 audio_token_chunk_size + audio_prelook_size 个 tokens，
+    // 处理后移动 audio_token_chunk_size 个，保留 audio_prelook_size 个重叠
     std::vector<int32_t> token2wav_buffer;
     int token2wav_wav_idx = 0;  // 输出 WAV 文件计数器
     int wav_turn_base = 0;      // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
@@ -492,9 +580,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output");
+                                const std::string & base_output_dir = "./tools/omni/output",
+                                const OmniGenerationConfig & generation_config = {});
 
 void omni_free(struct omni_context * ctx_omni);
+OmniGenerationConfig omni_python_base_generation_config();
+bool omni_apply_generation_config(struct omni_context * ctx_omni,
+                                  struct common_params * params,
+                                  const OmniGenerationConfig & config);
 // Prepare a session-level Token2Wav voice from a reference WAV using the
 // native C++ frontend GGUF files in token2wav_model_dir.
 bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
@@ -608,13 +701,13 @@ bool clean_kvcache(struct omni_context * ctx_omni);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);
-bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts);
+bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, const float* embed, int n_pos, int n_batch, int* n_past_tts);
 // sample_tts_token 参数说明：
 // - all_generated_tokens: 跨 chunk 累积的所有 tokens（用于判断是否是整个过程的第一个 token，即 re-forward condition）
 // - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
 // - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
 // - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false, bool is_final_text_chunk = false);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);

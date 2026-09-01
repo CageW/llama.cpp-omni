@@ -8990,7 +8990,12 @@ bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
         return false;
     }
 
-    const int   use_nt   = (n_timesteps > 0) ? n_timesteps : n_ts_file;
+    const int use_nt = n_ts_file > 0 ? n_ts_file : n_timesteps;
+    if (n_timesteps > 0 && n_ts_file > 0 && n_timesteps != n_ts_file) {
+        LOG_INFO("Token2Mel.start_stream_with_prompt_cache_gguf: requested n_timesteps=%d "
+                 "does not match cache metadata=%d; using cache metadata for the precomputed voice\n",
+                 n_timesteps, n_ts_file);
+    }
     const float use_temp = (temperature > 0.0f) ? temperature : temp_file;
 
     n_timesteps_ = use_nt;
