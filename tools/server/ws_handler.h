@@ -30,6 +30,10 @@ inline bool should_materialize_tts_ref_audio(bool use_tts,
     return use_tts && !tts_ref_audio_b64.empty();
 }
 
+inline bool should_flush_full_duplex_speak_responses(bool sent_listen_delta) {
+    return sent_listen_delta;
+}
+
 inline bool release_unactivated_octx_if_owned(
         omni_context * pending_octx,
         omni_context *& shared_octx,

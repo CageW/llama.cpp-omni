@@ -761,7 +761,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         // response.done.audio (full_audio_b64) instead of streaming deltas.
         bool accumulate = false;
         std::vector<float> accum;
-        bool emitted_audio = false;
     };
     auto audio_state = std::make_shared<AudioCbState>();
     audio_state->session_id = session_id;
@@ -788,7 +787,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 std::lock_guard<std::mutex> lk(audio_state->mtx);
                 response_id = audio_state->response_id;
                 response_start = audio_state->response_start;
-                audio_state->emitted_audio = true;
             }
             std::string b64 = float32_pcm_to_b64(samples, n_samples);
             ProtocolMetrics metrics = make_runtime_metrics(
@@ -796,6 +794,33 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             json ev = make_audio_delta(audio_state->session_id, response_id, b64, metrics);
             audio_state->ws->send(ev.dump());
         }
+    };
+
+    struct PendingSpeakResponse {
+        std::string response_id;
+        std::string text;
+        ProtocolMetrics metrics;
+    };
+    std::deque<PendingSpeakResponse> pending_speak_responses;
+
+    auto flush_pending_speak_responses = [&]() {
+        if (pending_speak_responses.empty()) {
+            return;
+        }
+
+        // TTS/T2W runs asynchronously. Wait until queued and in-flight audio
+        // has been delivered before terminalizing any response from this turn.
+        if (!omni_duplex_drain_tts_audio(octx, /*max_wait_ms*/120000, /*idle_ms*/3000)) {
+            LOG_WRN("WS /backend: timed out draining pending full-duplex audio for session %s\n",
+                    session_id.c_str());
+        }
+
+        for (const auto & pending : pending_speak_responses) {
+            send_event(make_response_done(
+                session_id, pending.response_id, pending.text, /*audio_base64*/"",
+                "turn_end", pending.metrics));
+        }
+        pending_speak_responses.clear();
     };
 
     // ================================================================
@@ -845,7 +870,6 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             std::lock_guard<std::mutex> lk(audio_state->mtx);
             audio_state->response_id = response_id; // update for audio callback
             audio_state->response_start = t_request_start;
-            audio_state->emitted_audio = false;
         }
 
         // Branch: full_duplex vs turn_based. The input shape MUST match the
@@ -1199,6 +1223,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Collect full text for response.done
             std::string full_text;
             std::string utf8_pending;
+            bool sent_listen_delta = false;
 
             // Poll text_queue
             while (true) {
@@ -1222,12 +1247,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 if (!frag.empty()) {
                     if (frag == "__IS_LISTEN__") {
                         // Model switched to listen
-                        send_event(make_listen_delta(
-                            session_id, response_id,
-                            make_runtime_metrics(octx, prefill_ms,
-                                                 elapsed_ms(t_generate_start),
-                                                 elapsed_ms(t_request_start), 0,
-                                                 turn_vision_slices)));
+                        sent_listen_delta = true;
                         break; // Done for this input
                     } else if (frag == "__END_OF_TURN__") {
                         // Turn ended — will be handled by response.done
@@ -1273,20 +1293,20 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                              turn_vision_slices)));
                 }
             }
-            bool emitted_audio = false;
-            {
-                std::lock_guard<std::mutex> lk(audio_state->mtx);
-                emitted_audio = audio_state->emitted_audio;
-            }
-            if (!full_text.empty() || emitted_audio) {
-                // Full-duplex speak responses also need an explicit completion
-                // boundary; pure listen steps are represented by listen delta only.
-                send_event(make_response_done(
-                    session_id, response_id, full_text, /*audio_base64*/"",
-                    "turn_end",
-                    make_runtime_metrics(octx, prefill_ms, generate_ms,
-                                         elapsed_ms(t_request_start), 0,
-                                         turn_vision_slices)));
+            ProtocolMetrics response_metrics = make_runtime_metrics(
+                octx, prefill_ms, generate_ms, elapsed_ms(t_request_start), 0,
+                turn_vision_slices);
+            if (should_flush_full_duplex_speak_responses(sent_listen_delta)) {
+                // Complete the previous SPEAK turn before exposing this
+                // LISTEN terminal, preserving response ordering.
+                flush_pending_speak_responses();
+                send_event(make_listen_delta(
+                    session_id, response_id, response_metrics));
+            } else {
+                // A SPEAK turn can span multiple input.append requests. Keep
+                // each completion pending until the turn's audio has drained.
+                pending_speak_responses.push_back(
+                    {response_id, full_text, response_metrics});
             }
         }
     }

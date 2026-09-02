@@ -37,6 +37,14 @@ static void test_session_handle_survives_manager_close() {
     assert(!manager.is_active(session_id));
 }
 
+static void test_full_duplex_speak_completion_boundary() {
+    // Full-duplex audio is asynchronous and a SPEAK turn may contain several
+    // input responses. Flush their response.done events at the following
+    // LISTEN boundary, after all audio for the turn has drained.
+    assert(should_flush_full_duplex_speak_responses(true));
+    assert(!should_flush_full_duplex_speak_responses(false));
+}
+
 int main() {
     assert(!should_remove_prefill_audio(
         "/tmp/voice.wav", "/tmp/voice.wav", true));
@@ -87,5 +95,6 @@ int main() {
     assert(shared_octx == nullptr);
     assert(release_count == 3);
     test_session_handle_survives_manager_close();
+    test_full_duplex_speak_completion_boundary();
     return 0;
 }
