@@ -1,5 +1,7 @@
 #include "omni-impl.h"
 #include "vision.h"
+#include "backend-lock.h"
+#include <mutex>
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -203,6 +205,7 @@ struct vision_ctx {
     ggml_backend_buffer_ptr buf;
 
     int max_nodes = 8192;
+    std::mutex encode_mtx;   // multi-session: one vision_ctx is shared by all sessions on a GPU
     
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
@@ -2291,6 +2294,7 @@ int vision_n_mmproj_embd(const struct vision_ctx * ctx) {
 // vision forward
 //
 bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const vision_image_f32_batch * imgs_c_ptr, float * vec) {
+    std::lock_guard<std::mutex> encode_lock(omni_backend_mutex(ctx->backend));
     const vision_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 

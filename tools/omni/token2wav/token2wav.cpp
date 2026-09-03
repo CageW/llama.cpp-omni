@@ -37,6 +37,17 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
     return true;
 }
 
+bool Token2WavSession::init_from_shared(const Token2WavSession & parent,
+                                        const std::string & prompt_cache_gguf_path,
+                                        int                 n_timesteps,
+                                        float               temperature) {
+    reset();
+    if (!t2w.attach_shared_models(parent.t2w.shared_t2m_loader(), parent.t2w.shared_voc_model())) {
+        return false;
+    }
+    return t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature);
+}
+
 bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
                                                const std::string & flow_matching_gguf,
                                                const std::string & flow_extra_gguf,

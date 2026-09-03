@@ -1,5 +1,6 @@
 #include "omni-impl.h"
 #include "audition.h"
+#include "backend-lock.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -8,6 +9,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <mutex>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -226,6 +228,10 @@ struct audition_ctx {
     // Whisper KV cache for streaming
     struct whisper_kv_cache whisper_kv_cache;
     bool whisper_streaming_mode = true;
+    // multi-session: this ctx borrows model weights (ctx_data/buf/backends) from `weights_owner`
+    // and must not free them; it owns only its KV cache and sched.
+    struct audition_ctx * weights_owner = nullptr;
+    std::mutex encode_mtx;   // serializes graph compute on this ctx's sched
 
     // for debugging
     bool debug_graph = false;
@@ -269,6 +275,13 @@ struct audition_ctx {
 
     ~audition_ctx() {
         audition_whisper_free_kv_cache(this);
+        if (weights_owner) {
+            // borrowed weights: drop our references without freeing
+            buf.release();
+            ctx_data.release();
+            ctx_gguf.release();
+            return;   // backends belong to the owner
+        }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -1317,6 +1330,48 @@ void audition_free(audition_ctx * ctx) {
     delete ctx;
 }
 
+// Create a second streaming context on the same weights: shares tensors/backends with `owner`,
+// allocates its own scheduler (compute buffers) and its own Whisper KV cache.
+struct audition_ctx * audition_clone_shared(struct audition_ctx * owner) {
+    if (!owner) return nullptr;
+    audition_context_params p{ /*use_gpu*/ false, GGML_LOG_LEVEL_INFO };
+    audition_ctx * c = nullptr;
+    try {
+        c = new audition_ctx(p);            // creates only a CPU backend + sched; replaced below
+    } catch (...) {
+        return nullptr;
+    }
+    // drop the throw-away CPU backend/sched created by the ctor
+    c->sched.reset();
+    if (c->backend_cpu) { ggml_backend_free(c->backend_cpu); }
+    c->backend_ptrs.clear(); c->backend_buft.clear();
+    c->backend      = owner->backend;
+    c->backend_cpu  = owner->backend_cpu;
+    c->backend_ptrs = owner->backend_ptrs;
+    c->backend_buft = owner->backend_buft;
+    c->sched.reset(ggml_backend_sched_new(c->backend_ptrs.data(), c->backend_buft.data(), c->backend_ptrs.size(), 8192, false, true));
+    c->weights_owner = owner;
+    c->model = owner->model;                // tensor pointers into owner's buffers (shallow copy)
+    c->ctx_gguf.reset(owner->ctx_gguf.get());
+    c->ctx_data.reset(owner->ctx_data.get());
+    c->buf.reset(owner->buf.get());
+    c->buf_compute_meta = owner->buf_compute_meta;
+    c->max_nodes = owner->max_nodes;
+    c->whisper_streaming_mode = owner->whisper_streaming_mode;
+    const auto & hp = c->model.hparams;
+    audition_whisper_init_kv_cache(c, hp.n_embd, (int) c->model.whisper_layers.size(), hp.n_ctx);
+    // reserve compute buffers with a warmup graph (same as alloc_compute_meta)
+    {
+        audition_audio_f32_batch batch;
+        audition_audio_f32_ptr audio(audition_audio_f32_init());
+        audio->nx = hp.warmup_audio_size; audio->ny = hp.n_mel_bins;
+        batch.entries.push_back(std::move(audio));
+        ggml_cgraph * gf = audition_audio_build_graph(c, batch);
+        ggml_backend_sched_reserve(c->sched.get(), gf);
+    }
+    return c;
+}
+
 
 //
 // audition processor
@@ -1406,6 +1461,7 @@ int audition_n_mmproj_embd(const struct audition_ctx * ctx) {
 // audition forward
 //
 bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const audition_audio_f32_batch * audios_c_ptr, float * vec) {
+    std::lock_guard<std::mutex> encode_lock(omni_backend_mutex(ctx->backend));
     const audition_audio_f32_batch & audios = *audios_c_ptr;
     int batch_size = audios.entries.size();
 

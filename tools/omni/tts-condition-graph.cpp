@@ -1,4 +1,5 @@
 #include "tts-condition-graph.h"
+#include "backend-lock.h"
 
 #include "omni.h"
 
@@ -178,6 +179,7 @@ bool tts_condition_graph_forward(
         int llm_n_embd,
         std::vector<float> & merged_embeddings,
         int & tts_n_embd) {
+    std::lock_guard<std::mutex> backend_lock(omni_backend_mutex(ctx_omni->tts_condition_graph.backend ? ctx_omni->tts_condition_graph.backend : ctx_omni->projector.backend));
     merged_embeddings.clear();
     tts_n_embd = 0;
 

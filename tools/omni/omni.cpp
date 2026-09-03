@@ -2,6 +2,7 @@
 #include "vision.h"
 #include "audition.h"
 #include "omni.h"
+#include "backend-lock.h"
 #include "token2wav/token2wav-impl.h"
 
 #include "llama.h"
@@ -1595,6 +1596,7 @@ static struct ggml_cgraph * projector_build_graph(projector_model & model, struc
 }
 
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens) {
+    std::lock_guard<std::mutex> backend_lock(omni_backend_mutex(model.backend));
     const int in_dim = model.hparams.in_dim;
     const int out_dim = model.hparams.out_dim;
     
@@ -3917,16 +3919,10 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
 //
 // omni main
 //
-std::condition_variable g_decode_cv;
-bool prefill_done = true;
-std::mutex speek_mtx;
-std::condition_variable speek_cv;
-bool last_speek_done_flag = false;
+// (per-context now: see omni_context::{ctx_omni->g_decode_cv, ctx_omni->prefill_done, ctx_omni->speek_mtx, ctx_omni->speek_cv, ctx_omni->last_speek_done_flag})
 
 // 让 thread 可以结束
-std::atomic<bool> llm_thread_running(true);
-std::atomic<bool> tts_thread_running(true);
-std::atomic<bool> t2w_thread_running(true);
+// (per-context now: omni_context::{llm,tts,t2w}_thread_running)
 
 // ============================================================================
 // ===== DUPLEX PIPELINE - 前置声明与结构体定义 ===============================
@@ -4010,7 +4006,7 @@ static bool duplex_decode(omni_context * ctx_omni,
                           int round_idx);
 
 // 读取 omni_output 互斥
-std::mutex buffer_mutex;
+// (per-context now: omni_context::ctx_omni->buffer_mutex)
 
 void print_with_timestamp(const char* format, ...)
 {
@@ -4723,9 +4719,9 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
 // 停止所有线程（发送信号，不等待）
 void omni_stop_threads(struct omni_context * ctx_omni) {
     // 发送停止信号
-    llm_thread_running = false;
-    tts_thread_running = false;
-    t2w_thread_running = false;
+    ctx_omni->llm_thread_running = false;
+    ctx_omni->tts_thread_running = false;
+    ctx_omni->t2w_thread_running = false;
 
     // 唤醒所有等待的线程
     if (ctx_omni->llm_thread_info) {
@@ -4762,7 +4758,7 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
     }
     duplex_stop_threads(ctx_omni);
 
-    llm_thread_running = false;
+    ctx_omni->llm_thread_running = false;
     if (ctx_omni->llm_thread_info) {
         ctx_omni->llm_thread_info->cv.notify_all();
     }
@@ -4770,7 +4766,7 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
         ctx_omni->llm_thread.join();
     }
 
-    tts_thread_running = false;
+    ctx_omni->tts_thread_running = false;
     if (ctx_omni->tts_thread_info) {
         ctx_omni->tts_thread_info->cv.notify_all();
     }
@@ -4778,7 +4774,7 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
         ctx_omni->tts_thread.join();
     }
 
-    t2w_thread_running = false;
+    ctx_omni->t2w_thread_running = false;
     if (ctx_omni->t2w_thread_info) {
         ctx_omni->t2w_thread_info->cv.notify_all();
     }
@@ -4824,31 +4820,44 @@ void omni_free(struct omni_context * ctx_omni) {
     duplex_stop_threads(ctx_omni);
 
     // 等待 llm 和 tts thread 停止
-    llm_thread_running = false; // Signal the thread to stop
+    ctx_omni->llm_thread_running = false; // Signal the thread to stop
     if (ctx_omni->llm_thread.joinable()) {
         ctx_omni->llm_thread_info->cv.notify_all(); // Wake up the thread if it's waiting
         ctx_omni->llm_thread.join(); // Wait for the thread to finish
     }
  
     if (ctx_omni->use_tts) {
-        tts_thread_running = false; // Signal the thread to stop
+        ctx_omni->tts_thread_running = false; // Signal the thread to stop
         if (ctx_omni->tts_thread.joinable()) {
             ctx_omni->tts_thread_info->cv.notify_all(); // Wake up the thread if it's waiting
             ctx_omni->tts_thread.join(); // Wait for the thread to finish
         }
         
         // Stop T2W thread
-        t2w_thread_running = false; // Signal the thread to stop
+        ctx_omni->t2w_thread_running = false; // Signal the thread to stop
         if (ctx_omni->t2w_thread.joinable()) {
             ctx_omni->t2w_thread_info->cv.notify_all(); // Wake up the thread if it's waiting
             ctx_omni->t2w_thread.join(); // Wait for the thread to finish
         }
     }
     
-    vision_free(ctx_omni->ctx_vision);
-    audition_free(ctx_omni->ctx_audio);
-    
-    if (ctx_omni->use_tts) {
+    if (ctx_omni->owns_vision) {
+        vision_free(ctx_omni->ctx_vision);
+    }
+    audition_free(ctx_omni->ctx_audio);   // a clone's audition ctx only frees its own KV cache
+
+    if (ctx_omni->use_tts && !ctx_omni->owns_tts_weights) {
+        // session clone: free per-session TTS state only (weights belong to the parent)
+        llama_free(ctx_omni->ctx_tts_llama);
+        common_sampler_free(ctx_omni->ctx_tts_sampler);
+        if (ctx_omni->tts_condition_graph.initialized) {
+            tts_condition_graph_free(ctx_omni);
+        }
+        if (ctx_omni->token2wav_session) {
+            ctx_omni->token2wav_session.reset();
+            ctx_omni->token2wav_initialized = false;
+        }
+    } else if (ctx_omni->use_tts) {
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
@@ -4939,6 +4948,100 @@ void omni_free(struct omni_context * ctx_omni) {
 // ==================== 语言设置函数 ====================
 // 设置语言并更新 system prompt（zh=中文，en=英文）
 // 基于 Python MiniCPM-o-4_5 modeling_minicpmo.py 中的 audio_assistant 模式 prompt
+struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
+                                         const std::string & base_output_dir) {
+    if (!parent || !parent->model || !parent->ctx_llama) {
+        LOG_ERR("omni_session_clone: invalid parent\n");
+        return nullptr;
+    }
+    auto * c = new omni_context();
+    c->params          = params;
+    c->media_type      = parent->media_type;
+    c->use_tts         = parent->use_tts;
+    c->duplex_mode     = parent->duplex_mode;
+    c->base_output_dir = base_output_dir;
+    c->parent          = parent;
+    c->owns_model       = false;
+    c->owns_tts_weights = false;
+    c->owns_vision      = false;
+    c->audio_voice_clone_prompt = parent->audio_voice_clone_prompt;
+    c->audio_assistant_prompt   = parent->audio_assistant_prompt;
+    c->omni_voice_clone_prompt  = parent->omni_voice_clone_prompt;
+    c->omni_assistant_prompt    = parent->omni_assistant_prompt;
+    c->language    = parent->language;
+    c->tts_bin_dir = parent->tts_bin_dir;
+    c->is_o5 = parent->is_o5; c->llm_n_embd = parent->llm_n_embd; c->n_pos_per_embd = parent->n_pos_per_embd;
+    c->tts_audio_bos_token_id = parent->tts_audio_bos_token_id;
+    c->tts_text_eos_token_id  = parent->tts_text_eos_token_id;
+    c->tts_num_audio_tokens   = parent->tts_num_audio_tokens;
+    c->special_token_threshold = parent->special_token_threshold;
+    c->special_token_speak = parent->special_token_speak; c->special_token_listen = parent->special_token_listen;
+    c->special_token_chunk_eos = parent->special_token_chunk_eos; c->special_token_chunk_tts_eos = parent->special_token_chunk_tts_eos;
+    c->special_token_turn_eos = parent->special_token_turn_eos; c->special_token_tts_eos = parent->special_token_tts_eos;
+    c->special_token_eos = parent->special_token_eos; c->tts_bos_token_id = parent->tts_bos_token_id;
+    c->special_token_unit_end = parent->special_token_unit_end; c->special_token_tts_pad = parent->special_token_tts_pad;
+    c->max_new_speak_tokens_per_chunk = parent->max_new_speak_tokens_per_chunk;
+    c->listen_prob_scale = parent->listen_prob_scale; c->force_listen_count = parent->force_listen_count;
+    c->length_penalty = parent->length_penalty;
+
+    // ---- LLM: shared model, private context ----
+    c->model = parent->model;
+    {
+        llama_context_params cp = common_context_params_to_llama(*params);
+        cp.n_ctx = params->n_ctx;
+        c->ctx_llama = llama_new_context_with_model(c->model, cp);
+        if (!c->ctx_llama) { LOG_ERR("omni_session_clone: llama_new_context failed\n"); delete c; return nullptr; }
+        c->ctx_sampler = common_sampler_init(c->model, params->sampling);
+    }
+    c->omni_emb.resize((64 + 10 + 1) * c->llm_n_embd);
+    c->audio_emb.resize((10 + 1) * c->llm_n_embd);
+
+    // ---- TTS: shared model + host weight tables + projector; private context/sampler ----
+    if (c->use_tts) {
+        c->model_tts = parent->model_tts;
+        llama_context_params tp = common_context_params_to_llama(*params);
+        tp.n_ctx = params->n_ctx;
+        c->ctx_tts_llama = llama_new_context_with_model(c->model_tts, tp);
+        if (!c->ctx_tts_llama) { LOG_ERR("omni_session_clone: TTS llama_new_context failed\n"); omni_free(c); return nullptr; }
+        common_params_sampling ts = params->sampling;
+        ts.temp = parent->tts_temperature; ts.top_p = 0.85f; ts.top_k = 25; ts.penalty_repeat = 1.05f; ts.min_p = 0.01f; ts.penalty_last_n = 16;
+        c->ctx_tts_sampler = common_sampler_init(c->model_tts, ts);
+        c->tts_temperature = parent->tts_temperature;
+        c->emb_code_weight = parent->emb_code_weight; c->emb_code_vocab_size = parent->emb_code_vocab_size;
+        c->emb_code_hidden_size = parent->emb_code_hidden_size; c->emb_code_stored_as_transposed = parent->emb_code_stored_as_transposed;
+        c->emb_text_weight = parent->emb_text_weight; c->emb_text_vocab_size = parent->emb_text_vocab_size; c->emb_text_hidden_size = parent->emb_text_hidden_size;
+        c->projector_semantic_linear1_weight = parent->projector_semantic_linear1_weight; c->projector_semantic_linear1_bias = parent->projector_semantic_linear1_bias;
+        c->projector_semantic_linear2_weight = parent->projector_semantic_linear2_weight; c->projector_semantic_linear2_bias = parent->projector_semantic_linear2_bias;
+        c->projector_semantic_input_dim = parent->projector_semantic_input_dim; c->projector_semantic_output_dim = parent->projector_semantic_output_dim;
+        c->head_code_weight = parent->head_code_weight; c->head_code_hidden_size = parent->head_code_hidden_size; c->head_code_num_audio_tokens = parent->head_code_num_audio_tokens;
+        c->projector = parent->projector;   // device weights shared; projector_forward allocates per-call compute buffers
+        c->token2wav_model_dir = parent->token2wav_model_dir;
+        if (parent->token2wav_initialized && parent->token2wav_session) {
+            c->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
+            std::string prompt_cache_gguf = c->token2wav_model_dir + "/prompt_cache.gguf";
+            if (c->token2wav_session->init_from_shared(*parent->token2wav_session, prompt_cache_gguf, 5, 1.0f)) {
+                c->token2wav_initialized = true;
+            } else {
+                LOG_ERR("omni_session_clone: Token2Wav init_from_shared failed\n");
+                c->token2wav_session.reset();
+            }
+        }
+        c->tts_thread_info = new TTSThreadInfo(1);
+        c->omni_output     = new omni_output();
+        c->t2w_thread_info = new T2WThreadInfo(25);
+    }
+    c->llm_thread_info = new LLMThreadInfo(1000);
+
+    // ---- APM: shared weights, private streaming KV ----
+    c->ctx_audio = parent->ctx_audio ? audition_clone_shared(parent->ctx_audio) : nullptr;
+    // ---- VPM: stateless, shared (encode serialized inside vision.cpp) ----
+    c->ctx_vision = parent->ctx_vision;
+
+    c->async = true;
+    print_with_timestamp("=== omni_session_clone: session ctx %p created on parent %p\n", (void*) c, (void*) parent);
+    return c;
+}
+
 void omni_set_language(struct omni_context * ctx_omni, const std::string & lang) {
     if (ctx_omni == nullptr) {
         print_with_timestamp("omni_set_language: ctx_omni is null\n");
@@ -5007,7 +5110,7 @@ void eval_prefix_with_hidden(struct omni_context* ctx_omni, common_params* param
  * 4. 协调与解码线程的同步
  * 
  * 运行逻辑：
- * - 主循环持续运行，直到 llm_thread_running 为 false
+ * - 主循环持续运行，直到 ctx_omni->llm_thread_running 为 false
  * - 等待条件：队列不为空 OR need_speek 为 true OR 线程需要停止
  * - 两个主要分支：
  *   分支1：队列不为空 -> 处理嵌入数据的前缀填充
@@ -5019,7 +5122,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
     const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
     
     // ========== 主循环：持续处理嵌入数据 ==========
-    while(llm_thread_running){
+    while(ctx_omni->llm_thread_running){
         // 获取队列的互斥锁，保护共享资源
         std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
         auto& queue = ctx_omni->llm_thread_info->queue;
@@ -5030,13 +5133,13 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
         // 等待以下任一条件满足：
         // 1. 队列不为空（有新嵌入数据需要处理）
         // 2. need_speek 为 true（需要开始生成文本）
-        // 3. llm_thread_running 为 false（线程需要停止）
+        // 3. ctx_omni->llm_thread_running 为 false（线程需要停止）
         ctx_omni->llm_thread_info->cv.wait(lock, [&] { 
-            return !queue.empty() || ctx_omni->need_speek || !llm_thread_running; 
+            return !queue.empty() || ctx_omni->need_speek || !ctx_omni->llm_thread_running; 
         });
         
         // 检查是否需要停止线程
-        if (!llm_thread_running) {
+        if (!ctx_omni->llm_thread_running) {
             break;
         }
 
@@ -5054,7 +5157,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->n_past);
             
             // 标记前缀填充未完成，防止解码线程过早开始
-            prefill_done = false;
+            ctx_omni->prefill_done = false;
             
             // 步骤1：批量取出队列中的所有嵌入数据
             // 这样可以一次性处理多个嵌入，提高效率
@@ -5207,7 +5310,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
 
         if (queue.empty() && ctx_omni->need_speek){
             // 标记前缀填充完成
-            prefill_done = true;
+            ctx_omni->prefill_done = true;
             
             // 如果使用TTS，重置speek_done标志，允许TTS线程开始工作
             if (ctx_omni->use_tts && !ctx_omni->duplex_mode) {
@@ -5218,7 +5321,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             ctx_omni->need_speek = false;
             
             // 通知等待的解码线程：前缀填充已完成，可以开始生成文本了
-            g_decode_cv.notify_all();
+            ctx_omni->g_decode_cv.notify_all();
         }
     }
 }
@@ -6337,8 +6440,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     print_with_timestamp("TTS thread (duplex mode) started\n");
 
     // Multi Round Persistent Loop
-    while(tts_thread_running) {
-        if (!tts_thread_running) {
+    while(ctx_omni->tts_thread_running) {
+        if (!ctx_omni->tts_thread_running) {
             break;
         }
         
@@ -6387,7 +6490,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
             auto& queue = ctx_omni->tts_thread_info->queue;
             ctx_omni->tts_thread_info->cv.wait(lock, [&] { 
-                return !queue.empty() || !tts_thread_running || ctx_omni->break_event.load(); 
+                return !queue.empty() || !ctx_omni->tts_thread_running || ctx_omni->break_event.load(); 
             });
             
             if (ctx_omni->break_event.load()) {
@@ -6395,7 +6498,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 continue;
             }
                 
-            if (!tts_thread_running) {
+            if (!ctx_omni->tts_thread_running) {
                 break;
             }
             
@@ -6536,7 +6639,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
         if (text_tokens.empty() && response.empty() && llm_finish) {
             ctx_omni->speek_done = true;
             ctx_omni->warmup_done = true;
-            speek_cv.notify_all();
+            ctx_omni->speek_cv.notify_all();
             
             if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                 // LISTEN/CHUNK_EOS
@@ -6791,7 +6894,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 tts_finish = true;
                 ctx_omni->speek_done = true;
                 ctx_omni->warmup_done = true;
-                speek_cv.notify_all();
+                ctx_omni->speek_cv.notify_all();
                 
                 merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
                 
@@ -6893,7 +6996,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             tts_finish = false;
             ctx_omni->speek_done = true;
             ctx_omni->warmup_done = true;
-            speek_cv.notify_all();
+            ctx_omni->speek_cv.notify_all();
             
             llm_text.clear();
             response.clear();
@@ -7015,9 +7118,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     bool break_round_incremented = false;
 
     // Multi Round Persistent Loop
-    while(tts_thread_running) {
+    while(ctx_omni->tts_thread_running) {
         
-        if (!tts_thread_running) {
+        if (!ctx_omni->tts_thread_running) {
             break;
         }
         
@@ -7078,7 +7181,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             auto& queue = ctx_omni->tts_thread_info->queue;
             // 🔧 [P0-打断检测] 在等待时也监听 break_event
             ctx_omni->tts_thread_info->cv.wait(lock, [&] { 
-                return !queue.empty() || !tts_thread_running || ctx_omni->break_event.load(); 
+                return !queue.empty() || !ctx_omni->tts_thread_running || ctx_omni->break_event.load(); 
             });
             
             // 检测到 break_event 时跳过当前处理
@@ -7087,7 +7190,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 continue;
             }
                 
-            if (!tts_thread_running) {
+            if (!ctx_omni->tts_thread_running) {
                 break;
             }
             // 🔧 [关键修复] 每次只处理一个 chunk，不要一次性取出所有
@@ -7259,7 +7362,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             ctx_omni->speek_done = true;
             ctx_omni->warmup_done = true;  // 第一轮对话结束，后续 prefill 需要等待
-            speek_cv.notify_all();
+            ctx_omni->speek_cv.notify_all();
             print_with_timestamp("TTS: finished processing all chunks (llm_finish with no data path)\n");
             // 非双工模式或真正的轮次结束：完全重置
             tts_finish = false;
@@ -7590,7 +7693,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 tts_finish = true;
                 ctx_omni->speek_done = true;
                 ctx_omni->warmup_done = true;  // 第一轮对话结束，后续 prefill 需要等待
-                speek_cv.notify_all();
+                ctx_omni->speek_cv.notify_all();
                 print_with_timestamp("TTS: finished processing all chunks\n");
                 
                 // Merge all WAV files into a single file
@@ -8048,7 +8151,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 
                 if (!res->buffer.empty()) {
                     // 读写使用 mutex 保护
-                    std::unique_lock<std::mutex> lock(buffer_mutex);
+                    std::unique_lock<std::mutex> lock(ctx_omni->buffer_mutex);
                     ctx_omni->omni_output->output.push_back(res);
                     ctx_omni->omni_output->idx += 1;
                 } else {
@@ -8132,7 +8235,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             if (!res->buffer.empty()) {
                 // 读写使用 mutex 保护
-                std::unique_lock<std::mutex> lock(buffer_mutex);
+                std::unique_lock<std::mutex> lock(ctx_omni->buffer_mutex);
                 ctx_omni->omni_output->output.push_back(res);
                 ctx_omni->omni_output->idx += 1;
             } else {
@@ -8302,7 +8405,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
 
             ctx_omni->speek_done = true;
             ctx_omni->warmup_done = true;  // 第一轮对话结束，后续 prefill 需要等待
-            speek_cv.notify_all();
+            ctx_omni->speek_cv.notify_all();
         } else if (audio_gen_finish && !llm_finish) {
             // Current chunk finished (either reached 25 tokens or EOS token) but LLM is still generating
             // Reset audio_gen_finish to allow processing next chunk from LLM
@@ -8707,7 +8810,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         cross_platform_mkdir_p(tts_wav_output_dir);
     }
     
-    while (t2w_thread_running) {
+    while (ctx_omni->t2w_thread_running) {
         // 检测打断事件
         if (ctx_omni->break_event.load()) {
             std::lock_guard<std::mutex> lock(mtx);
@@ -8736,9 +8839,9 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         }
         
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running; });
+        cv.wait(lock, [&] { return !queue.empty() || !ctx_omni->t2w_thread_running; });
         
-        if (!t2w_thread_running && queue.empty()) {
+        if (!ctx_omni->t2w_thread_running && queue.empty()) {
             break;
         }
         
@@ -8995,7 +9098,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     int wav_idx = 0;
     const int sample_rate = omni::flow::Token2Wav::kSampleRate;
     
-    while (t2w_thread_running) {
+    while (ctx_omni->t2w_thread_running) {
         // 🔧 [P0-打断检测] 检测 break_event 并清空队列
         if (ctx_omni->break_event.load()) {
             std::lock_guard<std::mutex> lock(mtx);
@@ -9027,10 +9130,10 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         std::unique_lock<std::mutex> lock(mtx);
         
         // Wait for queue to have data or thread to stop
-        cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load(); });
+        cv.wait(lock, [&] { return !queue.empty() || !ctx_omni->t2w_thread_running || ctx_omni->break_event.load(); });
         auto dequeue_time = std::chrono::steady_clock::now();
         
-        if (!t2w_thread_running && queue.empty()) {
+        if (!ctx_omni->t2w_thread_running && queue.empty()) {
             break;
         }
         
@@ -10377,12 +10480,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             print_with_timestamp("TTS: break_event active, skipping wait for previous round\n");
             ctx_omni->speek_done = true;
             ctx_omni->break_event.store(false);
-            speek_cv.notify_all();
+            ctx_omni->speek_cv.notify_all();
         }
         print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
-        std::unique_lock<std::mutex> lock(speek_mtx);
+        std::unique_lock<std::mutex> lock(ctx_omni->speek_mtx);
         // 添加超时等待，避免永久卡住
-        auto wait_result = speek_cv.wait_for(lock, std::chrono::seconds(5), [&]{return ctx_omni->speek_done || ctx_omni->break_event.load(); });
+        auto wait_result = ctx_omni->speek_cv.wait_for(lock, std::chrono::seconds(5), [&]{return ctx_omni->speek_done || ctx_omni->break_event.load(); });
         if (!wait_result) {
             // 强制设置为 true 以继续
             ctx_omni->speek_done = true;
@@ -10563,14 +10666,14 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             } else {
                 // simplex 路径保持原状
                 if (!ctx_omni->llm_thread.joinable()) {
-                    llm_thread_running = true;
+                    ctx_omni->llm_thread_running = true;
                     ctx_omni->llm_thread = std::thread(llm_thread_func, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create llm thread success\n");
                 }
             }
 
             if (ctx_omni->use_tts && !ctx_omni->tts_thread.joinable()) {
-                tts_thread_running = true;
+                ctx_omni->tts_thread_running = true;
                 // 🔧 [双工模式] 根据 duplex_mode 选择不同的 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
@@ -10583,7 +10686,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
 
             // Start T2W thread if TTS is enabled and thread is not already running
             if (ctx_omni->use_tts && ctx_omni->t2w_thread_info && !ctx_omni->t2w_thread.joinable()) {
-                t2w_thread_running = true;
+                ctx_omni->t2w_thread_running = true;
                 ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("create t2w thread success\n");
             }
@@ -10801,7 +10904,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     if (ctx_omni->async){
         // 🔧 确保线程已启动（如果 prefill 是同步模式执行的，线程可能还没启动）
         if (!ctx_omni->tts_thread.joinable() && ctx_omni->use_tts) {
-            tts_thread_running = true;
+            ctx_omni->tts_thread_running = true;
             if (ctx_omni->duplex_mode) {
                 ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
@@ -10811,7 +10914,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             }
         }
         if (!ctx_omni->t2w_thread.joinable() && ctx_omni->use_tts && ctx_omni->t2w_thread_info) {
-            t2w_thread_running = true;
+            ctx_omni->t2w_thread_running = true;
             ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
             print_with_timestamp("stream_decode: create t2w thread\n");
         }
@@ -10821,8 +10924,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         ctx_omni->llm_thread_info->cv.notify_all();
         print_with_timestamp("wait prefill done\n");
         std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-        g_decode_cv.wait(lock, []{ return prefill_done; });
-        prefill_done = false;
+        ctx_omni->g_decode_cv.wait(lock, [&]{ return ctx_omni->prefill_done; });
+        ctx_omni->prefill_done = false;
     }
 
     // 🔧 [unit 记账] 现在 prefill 已经写完 KV、unit_history 里也已经

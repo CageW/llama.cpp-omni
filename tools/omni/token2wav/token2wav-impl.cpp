@@ -1,6 +1,7 @@
 
 
 #include "token2wav-impl.h"
+#include "../backend-lock.h"
 #include "token2wav-profile.h"
 
 #include <atomic>
@@ -7591,8 +7592,7 @@ void flowGGUFModelRunner::reset() {
         sess_enc_only_->clear();
         sess_enc_only_.reset();
     }
-    loader_.~flowGGUFModelLoader();
-    new (&loader_) flowGGUFModelLoader();
+    loader_ = std::make_shared<flowGGUFModelLoader>();
     num_threads_           = 1;
     export_caches_to_host_ = true;
 }
@@ -7601,17 +7601,23 @@ bool flowGGUFModelRunner::load_from_gguf(const std::string & encoder_gguf_path,
                                          const std::string & flow_extra_gguf_path,
                                          const std::string & device) {
     reset();
-    if (!loader_.load_from_gguf(encoder_gguf_path, flow_matching_gguf_path, flow_extra_gguf_path, device)) {
+    if (!loader_->load_from_gguf(encoder_gguf_path, flow_matching_gguf_path, flow_extra_gguf_path, device)) {
         return false;
     }
     set_num_threads(num_threads_);
     reset_stream();
     return true;
 }
+void flowGGUFModelRunner::attach_loader(std::shared_ptr<flowGGUFModelLoader> loader) {
+    if (sess_) { sess_->clear(); sess_.reset(); }
+    if (sess_enc_only_) { sess_enc_only_->clear(); sess_enc_only_.reset(); }
+    loader_ = loader ? loader : std::make_shared<flowGGUFModelLoader>();
+    set_num_threads(num_threads_);
+}
 void flowGGUFModelRunner::set_num_threads(int n_threads) {
     num_threads_ = n_threads > 0 ? n_threads : 1;
-    if (loader_.backend() && !runner_backend_is_device(loader_.backend())) {
-        ggml_backend_cpu_set_n_threads(loader_.backend(), num_threads_);
+    if (loader_->backend() && !runner_backend_is_device(loader_->backend())) {
+        ggml_backend_cpu_set_n_threads(loader_->backend(), num_threads_);
     }
 }
 void flowGGUFModelRunner::reset_stream() {
@@ -7623,7 +7629,7 @@ void flowGGUFModelRunner::reset_stream() {
         sess_enc_only_->clear();
         sess_enc_only_.reset();
     }
-    if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_.decoder()) {
+    if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_->decoder()) {
         dec->reset_stream_state();
     }
 }
@@ -7650,7 +7656,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         LOG_ERROR( "flowGGUFModelRunner.setup_cache: expected C_spk=192, got %lld\n", (long long) C_spk);
         return false;
     }
-    if (!loader_.backend() || !loader_.model()) {
+    if (!loader_->backend() || !loader_->model()) {
         return false;
     }
     const int64_t T_chunk_token = 28;
@@ -7669,7 +7675,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         sess_->T_chunk_token  = T_chunk_token;
         sess_->n_timesteps    = n_timesteps;
         sess_->temperature    = temperature;
-        if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_.decoder()) {
+        if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_->decoder()) {
             dec->reset_stream_state();
         }
         ggml_init_params p{};
@@ -7692,7 +7698,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         flow_matching::fmCFMCache est_cache_setup_out;
         est_cache_setup_out.clear();
         auto out0 =
-            loader_.model()->build_setup_cache_graph(sess_->ctx, sess_->prompt_token_ids_tb, sess_->prompt_mel_ctb,
+            loader_->model()->build_setup_cache_graph(sess_->ctx, sess_->prompt_token_ids_tb, sess_->prompt_mel_ctb,
                                                      sess_->spk_cb, n_timesteps, temperature, &est_cache_setup_out);
         if (!out0.conformer_cnn_cache || !out0.conformer_att_cache || !est_cache_setup_out.cnn_cache ||
             !est_cache_setup_out.att_cache) {
@@ -7737,7 +7743,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         est_in.att_cache = sess_->est_att_cache;
         flow_matching::fmCFMCache est_out_nonlast;
         est_out_nonlast.clear();
-        auto out1 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
+        auto out1 = loader_->model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  false, sess_->conf_cnn_cache, sess_->conf_att_cache,
                                                                  &est_in, n_timesteps, temperature, &est_out_nonlast);
         if (!out1.feat_ctb || !out1.conformer_cnn_cache || !out1.conformer_att_cache || !est_out_nonlast.cnn_cache ||
@@ -7770,7 +7776,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
         flow_matching::fmCFMCache est_out_last;
         est_out_last.clear();
-        auto out2 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
+        auto out2 = loader_->model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  true, sess_->conf_cnn_cache, sess_->conf_att_cache,
                                                                  &est_in, n_timesteps, temperature, &est_out_last);
         if (!out2.feat_ctb || !out2.conformer_cnn_cache || !out2.conformer_att_cache || !est_out_last.cnn_cache ||
@@ -7817,7 +7823,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_2);
         ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
 
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_->backend());
         sess_->galloc = ggml_gallocr_new(buft);
         if (!sess_->galloc) {
             sess_->clear();
@@ -7834,22 +7840,22 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
     runner_bc_to_cb(spk_bc, B, C_spk, spk_cb);
     std::vector<float> mel_ctb;
     runner_btc_to_ctb(mel_btc, B, T_mel, C_mel, mel_ctb);
-    backend_tensor_set(loader_.backend(), sess_->prompt_token_ids_tb, token_tb.data(),
+    backend_tensor_set(loader_->backend(), sess_->prompt_token_ids_tb, token_tb.data(),
                                      token_tb.size() * sizeof(int32_t));
-    backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
-    backend_tensor_set(loader_.backend(), sess_->prompt_mel_ctb, mel_ctb.data(),
+    backend_tensor_set(loader_->backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
+    backend_tensor_set(loader_->backend(), sess_->prompt_mel_ctb, mel_ctb.data(),
                                      mel_ctb.size() * sizeof(float));
-    runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
-    runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, sess_->call_id_setup, n_timesteps, temperature, 0,
+    runner_feed_enc_stream_pos(loader_->backend(), sess_->ctx, loader_->encoder());
+    runner_feed_cfm_noise_ts(loader_->backend(), sess_->ctx, sess_->call_id_setup, n_timesteps, temperature, 0,
                                  C_mel, T_mel, B);
-    const ggml_status st = ggml_backend_graph_compute(loader_.backend(), sess_->gf_setup);
+    const ggml_status st = ggml_backend_graph_compute(loader_->backend(), sess_->gf_setup);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
     }
     cache_out.n_timesteps = n_timesteps;
     if (export_caches_to_host_) {
-        if (runner_backend_is_device(loader_.backend())) {
-            ggml_backend_synchronize(loader_.backend());
+        if (runner_backend_is_device(loader_->backend())) {
+            ggml_backend_synchronize(loader_->backend());
         }
         cache_out.conformer_cnn_ne = { sess_->conf_cnn_cache->ne[0], sess_->conf_cnn_cache->ne[1],
                                        sess_->conf_cnn_cache->ne[2] };
@@ -7859,10 +7865,10 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
                                        sess_->est_cnn_cache->ne[2], sess_->est_cnn_cache->ne[3] };
         cache_out.estimator_att_ne = { sess_->est_att_cache->ne[0], sess_->est_att_cache->ne[1],
                                        sess_->est_att_cache->ne[2], sess_->est_att_cache->ne[3] };
-        runner_read_tensor_bytes(loader_.backend(), sess_->conf_cnn_cache, cache_out.conformer_cnn_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->conf_att_cache, cache_out.conformer_att_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->est_cnn_cache, cache_out.estimator_cnn_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->est_att_cache, cache_out.estimator_att_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->conf_cnn_cache, cache_out.conformer_cnn_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->conf_att_cache, cache_out.conformer_att_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->est_cnn_cache, cache_out.estimator_cnn_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->est_att_cache, cache_out.estimator_att_cache);
     }
     return true;
 }
@@ -7886,7 +7892,7 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         LOG_ERROR( "flowGGUFModelRunner.inference_chunk: expected C_spk=192, got %lld\n", (long long) C_spk);
         return false;
     }
-    if (!loader_.backend() || !loader_.model()) {
+    if (!loader_->backend() || !loader_->model()) {
         return false;
     }
     (void) cache_in;
@@ -7916,10 +7922,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     runner_bc_to_cb(spk_bc, B, C_spk, spk_cb);
     {
         omni::flow::profile::ScopeTimer _t("t2m.upload");
-        backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
+        backend_tensor_set(loader_->backend(), sess_->chunk_token_ids_tb, token_tb.data(),
                                          token_tb.size() * sizeof(int32_t));
-        backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
-        runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+        backend_tensor_set(loader_->backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
+        runner_feed_enc_stream_pos(loader_->backend(), sess_->ctx, loader_->encoder());
     }
     const int     call_id      = last_chunk ? sess_->call_id_last : sess_->call_id_nonlast;
     const int64_t last_att_len = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
@@ -7928,7 +7934,7 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     const int64_t T            = feat->ne[1];
     {
         omni::flow::profile::ScopeTimer _t("t2m.feed_noise");
-        runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
+        runner_feed_cfm_noise_ts(loader_->backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
                                      B);
     }
     // 根据last_chunk选择图并执行推理
@@ -7967,17 +7973,17 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
             return !e || std::string(e) != "0"; // default on; "0" to opt out
         }();
         if (disable_last_graph) {
-            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/true);
+            omni_set_cuda_disable_graph(loader_->backend(), /*disable=*/true);
         }
-        const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
+        const ggml_status st = ggml_backend_graph_compute(loader_->backend(), gf);
         if (disable_last_graph) {
-            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/false);
+            omni_set_cuda_disable_graph(loader_->backend(), /*disable=*/false);
         }
         if (st != GGML_STATUS_SUCCESS) {
             return false;
         }
-        if (runner_backend_is_device(loader_.backend())) {
-            ggml_backend_synchronize(loader_.backend());
+        if (runner_backend_is_device(loader_->backend())) {
+            ggml_backend_synchronize(loader_->backend());
         }
     }
     {
@@ -7997,10 +8003,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                                        sess_->est_cnn_cache->ne[2], sess_->est_cnn_cache->ne[3] };
         cache_out.estimator_att_ne = { sess_->est_att_cache->ne[0], sess_->est_att_cache->ne[1],
                                        sess_->est_att_cache->ne[2], sess_->est_att_cache->ne[3] };
-        runner_read_tensor_bytes(loader_.backend(), sess_->conf_cnn_cache, cache_out.conformer_cnn_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->conf_att_cache, cache_out.conformer_att_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->est_cnn_cache, cache_out.estimator_cnn_cache);
-        runner_read_tensor_bytes(loader_.backend(), sess_->est_att_cache, cache_out.estimator_att_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->conf_cnn_cache, cache_out.conformer_cnn_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->conf_att_cache, cache_out.conformer_att_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->est_cnn_cache, cache_out.estimator_cnn_cache);
+        runner_read_tensor_bytes(loader_->backend(), sess_->est_att_cache, cache_out.estimator_att_cache);
     }
     return true;
 }
@@ -8038,7 +8044,7 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
         LOG_ERROR("inference_chunk_encoder_only: expected C_spk=192, got %lld\n", (long long) C_spk);
         return false;
     }
-    if (!loader_.backend() || !loader_.model()) {
+    if (!loader_->backend() || !loader_->model()) {
         return false;
     }
     if (cache_in_conformer.conformer_cnn_ne.size() != 3 || cache_in_conformer.conformer_att_ne.size() != 4) {
@@ -8086,7 +8092,7 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
         ggml_set_output(s.conf_cnn_cache);
         ggml_set_output(s.conf_att_cache);
         // build nonlast graph
-        auto out_n = loader_.model()->build_inference_chunk_encoder_only_graph(
+        auto out_n = loader_->model()->build_inference_chunk_encoder_only_graph(
             s.ctx, s.chunk_token_ids_tb, s.spk_cb, /*last_chunk=*/false,
             s.conf_cnn_cache, s.conf_att_cache);
         if (!out_n.mu_ctb || !out_n.spk_proj_cb) {
@@ -8096,7 +8102,7 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
         s.out_mu_ctb_nonlast = out_n.mu_ctb;
         s.out_spk_proj_cb    = out_n.spk_proj_cb;
         // build last graph
-        auto out_l = loader_.model()->build_inference_chunk_encoder_only_graph(
+        auto out_l = loader_->model()->build_inference_chunk_encoder_only_graph(
             s.ctx, s.chunk_token_ids_tb, s.spk_cb, /*last_chunk=*/true,
             s.conf_cnn_cache, s.conf_att_cache);
         if (!out_l.mu_ctb) {
@@ -8140,7 +8146,7 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
         ggml_build_forward_expand(gf_alloc, s.out_mu_ctb_last);
         ggml_build_forward_expand(gf_alloc, cpy_cnn_l);
         ggml_build_forward_expand(gf_alloc, cpy_att_l);
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_->backend());
         s.galloc                        = ggml_gallocr_new(buft);
         if (!s.galloc) {
             s.clear();
@@ -8151,10 +8157,10 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
             return false;
         }
         // 把 cache_in 的 conformer cache 字节写入持久 tensor
-        backend_tensor_set(loader_.backend(), s.conf_cnn_cache,
+        backend_tensor_set(loader_->backend(), s.conf_cnn_cache,
                            cache_in_conformer.conformer_cnn_cache.data(),
                            cache_in_conformer.conformer_cnn_cache.size());
-        backend_tensor_set(loader_.backend(), s.conf_att_cache,
+        backend_tensor_set(loader_->backend(), s.conf_att_cache,
                            cache_in_conformer.conformer_att_cache.data(),
                            cache_in_conformer.conformer_att_cache.size());
     }
@@ -8163,18 +8169,18 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
     runner_bt_to_tb(token_bt, B, T_token, token_tb);
     std::vector<float> spk_cb_v;
     runner_bc_to_cb(spk_bc, B, C_spk, spk_cb_v);
-    backend_tensor_set(loader_.backend(), s.chunk_token_ids_tb, token_tb.data(),
+    backend_tensor_set(loader_->backend(), s.chunk_token_ids_tb, token_tb.data(),
                        token_tb.size() * sizeof(int32_t));
-    backend_tensor_set(loader_.backend(), s.spk_cb, spk_cb_v.data(), spk_cb_v.size() * sizeof(float));
-    runner_feed_enc_stream_pos(loader_.backend(), s.ctx, loader_.encoder());
+    backend_tensor_set(loader_->backend(), s.spk_cb, spk_cb_v.data(), spk_cb_v.size() * sizeof(float));
+    runner_feed_enc_stream_pos(loader_->backend(), s.ctx, loader_->encoder());
     // 运行
     ggml_cgraph *        gf = last_chunk ? s.gf_last : s.gf_nonlast;
-    const ggml_status    st = ggml_backend_graph_compute(loader_.backend(), gf);
+    const ggml_status    st = ggml_backend_graph_compute(loader_->backend(), gf);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
     }
-    if (runner_backend_is_device(loader_.backend())) {
-        ggml_backend_synchronize(loader_.backend());
+    if (runner_backend_is_device(loader_->backend())) {
+        ggml_backend_synchronize(loader_->backend());
     }
     // 下载 mu (B, 80, T_mel)
     ggml_tensor * mu_t = last_chunk ? s.out_mu_ctb_last : s.out_mu_ctb_nonlast;
@@ -8200,8 +8206,8 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
                                                  s.conf_cnn_cache->ne[2] };
         cache_out_conformer.conformer_att_ne = { s.conf_att_cache->ne[0], s.conf_att_cache->ne[1],
                                                  s.conf_att_cache->ne[2], s.conf_att_cache->ne[3] };
-        runner_read_tensor_bytes(loader_.backend(), s.conf_cnn_cache, cache_out_conformer.conformer_cnn_cache);
-        runner_read_tensor_bytes(loader_.backend(), s.conf_att_cache, cache_out_conformer.conformer_att_cache);
+        runner_read_tensor_bytes(loader_->backend(), s.conf_cnn_cache, cache_out_conformer.conformer_cnn_cache);
+        runner_read_tensor_bytes(loader_->backend(), s.conf_att_cache, cache_out_conformer.conformer_att_cache);
     }
     return true;
 }
@@ -8295,7 +8301,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
                                                 int64_t                     B,
                                                 int                         n_timesteps,
                                                 float                       temperature) {
-    if (!loader_.backend() || !loader_.model()) {
+    if (!loader_->backend() || !loader_->model()) {
         return false;
     }
     if (!spk_bc || B <= 0) {
@@ -8337,7 +8343,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         sess_->T_chunk_token  = T_chunk_token;
         sess_->n_timesteps    = n_timesteps;
         sess_->temperature    = temperature;
-        if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_.decoder()) {
+        if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_->decoder()) {
             dec->reset_stream_state();
         }
         ggml_init_params p{};
@@ -8379,7 +8385,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         est_in.att_cache = sess_->est_att_cache;
         flow_matching::fmCFMCache est_out_nonlast;
         est_out_nonlast.clear();
-        auto out1 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
+        auto out1 = loader_->model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  false, sess_->conf_cnn_cache, sess_->conf_att_cache,
                                                                  &est_in, n_timesteps, temperature, &est_out_nonlast);
         if (!out1.feat_ctb || !out1.conformer_cnn_cache || !out1.conformer_att_cache || !est_out_nonlast.cnn_cache ||
@@ -8412,7 +8418,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
         flow_matching::fmCFMCache est_out_last;
         est_out_last.clear();
-        auto out2 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
+        auto out2 = loader_->model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  true, sess_->conf_cnn_cache, sess_->conf_att_cache,
                                                                  &est_in, n_timesteps, temperature, &est_out_last);
         if (!out2.feat_ctb || !out2.conformer_cnn_cache || !out2.conformer_att_cache || !est_out_last.cnn_cache ||
@@ -8454,7 +8460,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_2);
         ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
 
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_->backend());
         sess_->galloc = ggml_gallocr_new(buft);
         if (!sess_->galloc) {
             sess_->clear();
@@ -8467,44 +8473,44 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
     }
     std::vector<float> spk_cb;
     runner_bc_to_cb(spk_bc, B, 192, spk_cb);
-    backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
-    backend_tensor_set(loader_.backend(), sess_->conf_cnn_cache, cache_host.conformer_cnn_cache.data(),
+    backend_tensor_set(loader_->backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
+    backend_tensor_set(loader_->backend(), sess_->conf_cnn_cache, cache_host.conformer_cnn_cache.data(),
                                      cache_host.conformer_cnn_cache.size());
-    backend_tensor_set(loader_.backend(), sess_->conf_att_cache, cache_host.conformer_att_cache.data(),
+    backend_tensor_set(loader_->backend(), sess_->conf_att_cache, cache_host.conformer_att_cache.data(),
                                      cache_host.conformer_att_cache.size());
-    backend_tensor_set(loader_.backend(), sess_->est_cnn_cache, cache_host.estimator_cnn_cache.data(),
+    backend_tensor_set(loader_->backend(), sess_->est_cnn_cache, cache_host.estimator_cnn_cache.data(),
                                      cache_host.estimator_cnn_cache.size());
-    backend_tensor_set(loader_.backend(), sess_->est_att_cache, cache_host.estimator_att_cache.data(),
+    backend_tensor_set(loader_->backend(), sess_->est_att_cache, cache_host.estimator_att_cache.data(),
                                      cache_host.estimator_att_cache.size());
-    if (runner_backend_is_device(loader_.backend())) {
-        ggml_backend_synchronize(loader_.backend());
+    if (runner_backend_is_device(loader_->backend())) {
+        ggml_backend_synchronize(loader_->backend());
     }
-    if (runner_backend_is_device(loader_.backend())) {
+    if (runner_backend_is_device(loader_->backend())) {
         const int32_t        pad_token = 4218;
         std::vector<int32_t> token_tb((size_t) T_chunk_token * (size_t) B, pad_token);
-        backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
+        backend_tensor_set(loader_->backend(), sess_->chunk_token_ids_tb, token_tb.data(),
                                          token_tb.size() * sizeof(int32_t));
-        runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+        runner_feed_enc_stream_pos(loader_->backend(), sess_->ctx, loader_->encoder());
         {
             const int     call_id      = sess_->call_id_nonlast;
             const int64_t last_att_len = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
             ggml_tensor * feat         = sess_->out_feat_nonlast_ctb;
             const int64_t C            = feat ? feat->ne[0] : 80;
             const int64_t T            = feat ? feat->ne[1] : 1;
-            runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len,
+            runner_feed_cfm_noise_ts(loader_->backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len,
                                          C, T, B);
         }
-        (void) ggml_backend_graph_compute(loader_.backend(), sess_->gf_nonlast);
-        ggml_backend_synchronize(loader_.backend());
-        backend_tensor_set(loader_.backend(), sess_->conf_cnn_cache,
+        (void) ggml_backend_graph_compute(loader_->backend(), sess_->gf_nonlast);
+        ggml_backend_synchronize(loader_->backend());
+        backend_tensor_set(loader_->backend(), sess_->conf_cnn_cache,
                                          cache_host.conformer_cnn_cache.data(), cache_host.conformer_cnn_cache.size());
-        backend_tensor_set(loader_.backend(), sess_->conf_att_cache,
+        backend_tensor_set(loader_->backend(), sess_->conf_att_cache,
                                          cache_host.conformer_att_cache.data(), cache_host.conformer_att_cache.size());
-        backend_tensor_set(loader_.backend(), sess_->est_cnn_cache, cache_host.estimator_cnn_cache.data(),
+        backend_tensor_set(loader_->backend(), sess_->est_cnn_cache, cache_host.estimator_cnn_cache.data(),
                                          cache_host.estimator_cnn_cache.size());
-        backend_tensor_set(loader_.backend(), sess_->est_att_cache, cache_host.estimator_att_cache.data(),
+        backend_tensor_set(loader_->backend(), sess_->est_att_cache, cache_host.estimator_att_cache.data(),
                                          cache_host.estimator_att_cache.size());
-        ggml_backend_synchronize(loader_.backend());
+        ggml_backend_synchronize(loader_->backend());
     }
     return true;
 }
@@ -8699,6 +8705,22 @@ Token2Mel::~Token2Mel() {
 #endif
 }
 
+bool Token2Mel::attach_shared_model(std::shared_ptr<flowGGUFModelLoader> loader, int threads) {
+    reset_stream();
+    if (!loader || !loader->backend() || !loader->model()) {
+        LOG_ERROR("Token2Mel.attach_shared_model: loader not loaded\n");
+        model_loaded_ = false;
+        return false;
+    }
+    runner_.attach_loader(loader);
+    runner_.set_num_threads(threads);
+    runner_.set_export_caches_to_host(false);
+    backend_kind_ = Backend::GGUF;
+    ane_handle_   = nullptr;
+    coreml_model_path_.clear();
+    model_loaded_ = true;
+    return true;
+}
 bool Token2Mel::load_model(const std::string & encoder_gguf,
                            const std::string & flow_matching_gguf,
                            const std::string & flow_extra_gguf,
@@ -9662,13 +9684,29 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
         models_loaded_ = false;
         return false;
     }
-    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
+    if (!voc_model_->voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
         models_loaded_ = false;
         return false;
     }
-
-    voc_runner_.model = &voc_model_;
+    voc_runner_.model = voc_model_.get();
+    models_loaded_    = true;
+    return true;
+}
+bool Token2Wav::attach_shared_models(std::shared_ptr<flowGGUFModelLoader> t2m_loader,
+                                     std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model) {
+    reset_stream();
+    if (!t2m_.attach_shared_model(t2m_loader, 8)) {
+        models_loaded_ = false;
+        return false;
+    }
+    if (!voc_model || !voc_model->backend || !voc_model->hg2) {
+        LOG_ERROR("Token2Wav.attach_shared_models: vocoder model not loaded\n");
+        models_loaded_ = false;
+        return false;
+    }
+    voc_model_        = voc_model;
+    voc_runner_.model = voc_model_.get();
     models_loaded_    = true;
     return true;
 }
@@ -9676,6 +9714,7 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
 bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                                     int                 n_timesteps,
                                                     float               temperature) {
+    std::lock_guard<std::mutex> l1(omni_backend_mutex(t2m_.shared_model() ? t2m_.shared_model()->backend() : nullptr));
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
@@ -9721,6 +9760,13 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
                                    int64_t &            out_T_audio) {
     wave_bt_out.clear();
     out_T_audio = 0;
+    // weights (and their backend memory pools) may be shared by several sessions
+    ggml_backend_t b1 = t2m_.shared_model() ? t2m_.shared_model()->backend() : nullptr;
+    ggml_backend_t b2 = voc_model_ ? voc_model_->backend : nullptr;
+    if (b1 && b2 && (uintptr_t) b1 > (uintptr_t) b2) std::swap(b1, b2);
+    std::unique_lock<std::mutex> l1(omni_backend_mutex(b1));
+    std::unique_lock<std::mutex> l2(b2 != b1 ? omni_backend_mutex(b2) : omni_backend_mutex(nullptr), std::defer_lock);
+    if (b2 != b1) l2.lock();
 
     if (!models_loaded_) {
         LOG_ERROR( "Token2Wav.push_tokens_window: models not loaded\n");

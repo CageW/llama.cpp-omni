@@ -476,6 +476,23 @@ struct omni_context {
     int  tts_text_eos_token_id  = 151692;  // TTS text_eos id
     int  tts_num_audio_tokens   = 6562;    // audio codebook size (+eos)
     llama_token special_token_threshold = 150000; // tokens >= this are treated as special (not sent to TTS)
+
+    // ---- multi-session: weight ownership + per-context thread control (formerly process globals) ----
+    // false when this context was created by omni_session_clone(): weights (LLM model, TTS model +
+    // host weight tables + projector + condition graph, vision ctx, audition weights, Token2Wav models)
+    // belong to the parent and must not be freed here.
+    bool owns_tts_weights   = true;
+    bool owns_vision        = true;
+    struct omni_context * parent = nullptr;      // weight owner (nullptr for a root context)
+    std::atomic<bool> llm_thread_running{true};
+    std::atomic<bool> tts_thread_running{true};
+    std::atomic<bool> t2w_thread_running{true};
+    bool prefill_done = true;
+    std::condition_variable g_decode_cv;
+    std::mutex speek_mtx;
+    std::condition_variable speek_cv;
+    bool last_speek_done_flag = false;
+    std::mutex buffer_mutex;
 };
 
 //
@@ -500,6 +517,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+// Create an additional session context that shares every model weight with `parent` (same GPU)
+// and owns only per-session state: LLM/TTS llama_context + samplers, APM streaming KV cache,
+// Token2Wav stream state, queues and worker threads. `parent` must outlive the clone.
+struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
+                                         const std::string & base_output_dir);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);

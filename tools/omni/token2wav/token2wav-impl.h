@@ -1658,8 +1658,12 @@ class flowGGUFModelRunner {
                         const std::string & flow_matching_gguf_path,
                         const std::string & flow_extra_gguf_path,
                         const std::string & device);
+    // Share already-loaded weights/backend with another runner (multi-session): no GPU memory is duplicated.
+    // Concurrent compute on the shared backend must be serialized by the caller.
+    void attach_loader(std::shared_ptr<flowGGUFModelLoader> loader);
+    std::shared_ptr<flowGGUFModelLoader> shared_loader() const { return loader_; }
     void set_num_threads(int n_threads);
-    const std::string & backend_name() const { return loader_.backend_name(); }
+    const std::string & backend_name() const { return loader_->backend_name(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
     void reset_stream();
     bool setup_cache(const int32_t *       token_bt,
@@ -1728,7 +1732,7 @@ class flowGGUFModelRunner {
     struct streamSessionEncOnly;
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
-    flowGGUFModelLoader            loader_;
+    std::shared_ptr<flowGGUFModelLoader> loader_ = std::make_shared<flowGGUFModelLoader>();
     std::unique_ptr<streamSession>        sess_;
     std::unique_ptr<streamSessionEncOnly> sess_enc_only_;
 };
@@ -2057,6 +2061,9 @@ class Token2Mel {
                     const std::string & device              = "gpu",
                     int                 threads             = 8,
                     const std::string & coreml_model_path  = "");
+    // Multi-session: reuse weights already loaded by another Token2Mel (GGUF backend only).
+    bool attach_shared_model(std::shared_ptr<flowGGUFModelLoader> loader, int threads = 8);
+    std::shared_ptr<flowGGUFModelLoader> shared_model() const { return runner_.shared_loader(); }
 
     static bool load_prompt_bundle_dir(const std::string & dir, PromptBundle & out);
 
@@ -2208,6 +2215,11 @@ class Token2Wav {
                      const std::string & device_vocoder      = "gpu",
                      const std::string & coreml_model_path  = "");
 
+    // Multi-session: borrow weights from an already-loaded Token2Wav (no GPU memory duplicated).
+    bool attach_shared_models(std::shared_ptr<flowGGUFModelLoader> t2m_loader,
+                              std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model);
+    std::shared_ptr<flowGGUFModelLoader>          shared_t2m_loader() const { return t2m_.shared_model(); }
+    std::shared_ptr<omni::vocoder::voc_hg2_model> shared_voc_model()  const { return voc_model_; }
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
                                              float               temperature = -1.0f);
@@ -2236,7 +2248,7 @@ class Token2Wav {
   private:
     Token2Mel t2m_;
 
-    omni::vocoder::voc_hg2_model  voc_model_{};
+    std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model_ = std::make_shared<omni::vocoder::voc_hg2_model>();
     omni::vocoder::voc_hg2_runner voc_runner_{};
 
     static constexpr int32_t kMelCacheLen    = 8;
@@ -2265,6 +2277,12 @@ struct Token2WavSession {
                                      int                 n_timesteps         = 10,
                                      float               temperature         = 1.0f,
                                      const std::string & coreml_model_path  = "");
+
+    // Multi-session: new stream state on top of weights owned by `parent` (must stay alive).
+    bool init_from_shared(const Token2WavSession & parent,
+                          const std::string & prompt_cache_gguf_path,
+                          int                 n_timesteps = 10,
+                          float               temperature = 1.0f);
 
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
                                  const std::string & flow_matching_gguf,

@@ -182,6 +182,14 @@ set_target_properties  (${TARGET_DUPLEX_PERF} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_PERF} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_PERF} PRIVATE cxx_std_17)
 
+
+# 多 session 容量探针（共享权重，N 个 duplex session 并发）
+set(TARGET_MULTISESSION_PERF llama-omni-perf-multisession)
+add_executable         (${TARGET_MULTISESSION_PERF} perf/perf-multisession.cpp)
+set_target_properties  (${TARGET_MULTISESSION_PERF} PROPERTIES OUTPUT_NAME llama-omni-perf-multisession)
+target_link_libraries  (${TARGET_MULTISESSION_PERF} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_MULTISESSION_PERF} PRIVATE cxx_std_17)
+
 # Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
 add_executable(token2wav-example token2wav/token2wav-example.cpp)
 target_link_libraries(token2wav-example PRIVATE llama-common omni Threads::Threads)
