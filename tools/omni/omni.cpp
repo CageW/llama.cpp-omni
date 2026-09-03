@@ -3,6 +3,7 @@
 #include "audition.h"
 #include "omni.h"
 #include "backend-lock.h"
+#include "token2wav/token2wav.h"
 #include "token2wav/token2wav-impl.h"
 
 #include "llama.h"
@@ -4214,6 +4215,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 如果 TTS 模型需要更小的上下文窗口，可以在这里调整
         // 例如：tts_ctx_params.n_ctx = std::min(params->n_ctx, 2048); // 限制 TTS 上下文大小
         tts_ctx_params.n_ctx = params->n_ctx;  // 暂时使用相同的 n_ctx，后续可以根据需要调整
+        if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tts_ctx_params.n_ctx = v; }
         
         llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
         if (ctx_tts_llama == NULL) {
@@ -4948,8 +4950,19 @@ void omni_free(struct omni_context * ctx_omni) {
 // ==================== 语言设置函数 ====================
 // 设置语言并更新 system prompt（zh=中文，en=英文）
 // 基于 Python MiniCPM-o-4_5 modeling_minicpmo.py 中的 audio_assistant 模式 prompt
+std::unique_ptr<omni::flow::Token2WavSession> omni_load_token2wav_owner(const std::string & model_dir,
+                                                                       const std::string & device) {
+    auto s = std::make_unique<omni::flow::Token2WavSession>();
+    const bool ok = s->init_from_prompt_cache_gguf(model_dir + "/encoder.gguf", model_dir + "/flow_matching.gguf",
+                                                   model_dir + "/flow_extra.gguf", model_dir + "/prompt_cache.gguf",
+                                                   model_dir + "/hifigan2.gguf", device, device, 5, 1.0f, "");
+    if (!ok) { LOG_ERR("omni_load_token2wav_owner: init failed on %s\n", device.c_str()); return nullptr; }
+    return s;
+}
+
 struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
-                                         const std::string & base_output_dir) {
+                                         const std::string & base_output_dir,
+                                         omni::flow::Token2WavSession * t2w_weight_owner) {
     if (!parent || !parent->model || !parent->ctx_llama) {
         LOG_ERR("omni_session_clone: invalid parent\n");
         return nullptr;
@@ -5001,6 +5014,7 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
         c->model_tts = parent->model_tts;
         llama_context_params tp = common_context_params_to_llama(*params);
         tp.n_ctx = params->n_ctx;
+        if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tp.n_ctx = v; }
         c->ctx_tts_llama = llama_new_context_with_model(c->model_tts, tp);
         if (!c->ctx_tts_llama) { LOG_ERR("omni_session_clone: TTS llama_new_context failed\n"); omni_free(c); return nullptr; }
         common_params_sampling ts = params->sampling;
@@ -5016,10 +5030,11 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
         c->head_code_weight = parent->head_code_weight; c->head_code_hidden_size = parent->head_code_hidden_size; c->head_code_num_audio_tokens = parent->head_code_num_audio_tokens;
         c->projector = parent->projector;   // device weights shared; projector_forward allocates per-call compute buffers
         c->token2wav_model_dir = parent->token2wav_model_dir;
-        if (parent->token2wav_initialized && parent->token2wav_session) {
+        omni::flow::Token2WavSession * owner = t2w_weight_owner ? t2w_weight_owner : parent->token2wav_session.get();
+        if (owner && (t2w_weight_owner || parent->token2wav_initialized)) {
             c->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
             std::string prompt_cache_gguf = c->token2wav_model_dir + "/prompt_cache.gguf";
-            if (c->token2wav_session->init_from_shared(*parent->token2wav_session, prompt_cache_gguf, 5, 1.0f)) {
+            if (c->token2wav_session->init_from_shared(*owner, prompt_cache_gguf, 5, 1.0f)) {
                 c->token2wav_initialized = true;
             } else {
                 LOG_ERR("omni_session_clone: Token2Wav init_from_shared failed\n");
@@ -5034,8 +5049,9 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
 
     // ---- APM: shared weights, private streaming KV ----
     c->ctx_audio = parent->ctx_audio ? audition_clone_shared(parent->ctx_audio) : nullptr;
-    // ---- VPM: stateless, shared (encode serialized inside vision.cpp) ----
-    c->ctx_vision = parent->ctx_vision;
+    // ---- VPM: weights shared, own compute backend + scheduler per session ----
+    c->ctx_vision  = parent->ctx_vision ? vision_clone_compute(parent->ctx_vision) : nullptr;
+    c->owns_vision = (c->ctx_vision != nullptr);
 
     c->async = true;
     print_with_timestamp("=== omni_session_clone: session ctx %p created on parent %p\n", (void*) c, (void*) parent);

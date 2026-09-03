@@ -276,11 +276,10 @@ struct audition_ctx {
     ~audition_ctx() {
         audition_whisper_free_kv_cache(this);
         if (weights_owner) {
-            // borrowed weights: drop our references without freeing
+            // borrowed weights: drop our references without freeing (backends below are our own)
             buf.release();
             ctx_data.release();
             ctx_gguf.release();
-            return;   // backends belong to the owner
         }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
@@ -1345,10 +1344,20 @@ struct audition_ctx * audition_clone_shared(struct audition_ctx * owner) {
     c->sched.reset();
     if (c->backend_cpu) { ggml_backend_free(c->backend_cpu); }
     c->backend_ptrs.clear(); c->backend_buft.clear();
-    c->backend      = owner->backend;
-    c->backend_cpu  = owner->backend_cpu;
-    c->backend_ptrs = owner->backend_ptrs;
-    c->backend_buft = owner->backend_buft;
+    // own backend instance on the owner's device (own stream/pool) so sessions encode concurrently
+    c->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (owner->backend != owner->backend_cpu) {
+        ggml_backend_t nb = ggml_backend_dev_init(ggml_backend_get_device(owner->backend), nullptr);
+        c->backend = nb ? nb : c->backend_cpu;
+    } else {
+        c->backend = c->backend_cpu;
+    }
+    if (c->backend != c->backend_cpu) {
+        c->backend_ptrs.push_back(c->backend);
+        c->backend_buft.push_back(ggml_backend_get_default_buffer_type(c->backend));
+    }
+    c->backend_ptrs.push_back(c->backend_cpu);
+    c->backend_buft.push_back(ggml_backend_get_default_buffer_type(c->backend_cpu));
     c->sched.reset(ggml_backend_sched_new(c->backend_ptrs.data(), c->backend_buft.data(), c->backend_ptrs.size(), 8192, false, true));
     c->weights_owner = owner;
     c->model = owner->model;                // tensor pointers into owner's buffers (shallow copy)

@@ -85,6 +85,8 @@ struct vision_context_params {
 // vision layers
 struct vision_ctx * vision_init(const char * fname, struct vision_context_params ctx_params);
 void vision_free(struct vision_ctx * ctx);
+// multi-session: compute-only clone sharing weights with `owner` (own backend instance + scheduler)
+struct vision_ctx * vision_clone_compute(struct vision_ctx * owner);
 
 // vision processor
 void vision_image_u8_free(struct vision_image_u8  * img);

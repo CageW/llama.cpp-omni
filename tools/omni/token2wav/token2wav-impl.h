@@ -1660,7 +1660,8 @@ class flowGGUFModelRunner {
                         const std::string & device);
     // Share already-loaded weights/backend with another runner (multi-session): no GPU memory is duplicated.
     // Concurrent compute on the shared backend must be serialized by the caller.
-    void attach_loader(std::shared_ptr<flowGGUFModelLoader> loader);
+    void attach_loader(std::shared_ptr<flowGGUFModelLoader> loader);   // creates an own compute backend on the loader's device
+    ggml_backend_t compute_backend() const { return backend(); }
     std::shared_ptr<flowGGUFModelLoader> shared_loader() const { return loader_; }
     void set_num_threads(int n_threads);
     const std::string & backend_name() const { return loader_->backend_name(); }
@@ -1733,6 +1734,8 @@ class flowGGUFModelRunner {
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
     std::shared_ptr<flowGGUFModelLoader> loader_ = std::make_shared<flowGGUFModelLoader>();
+    ggml_backend_t compute_backend_ = nullptr;   // own backend instance when sharing a loader (multi-session)
+    ggml_backend_t backend() const { return compute_backend_ ? compute_backend_ : loader_->backend(); }
     std::unique_ptr<streamSession>        sess_;
     std::unique_ptr<streamSessionEncOnly> sess_enc_only_;
 };
@@ -2010,6 +2013,13 @@ struct voc_hg2_model {
 };
 struct voc_hg2_runner {
     voc_hg2_model * model = nullptr;
+    // multi-session: optional own backend instance + allocator (weights stay in `model`)
+    ggml_backend_t own_backend = nullptr;
+    ggml_gallocr_t own_galloc  = nullptr;
+    ggml_backend_t backend() const { return own_backend ? own_backend : (model ? model->backend : nullptr); }
+    ggml_gallocr_t galloc()  const { return own_galloc  ? own_galloc  : (model ? model->galloc  : nullptr); }
+    bool init_own_backend();      // create own stream/pool on model->backend's device
+    void free_own_backend();
     bool voc_hg2_runner_build_graph(ggml_context * ctx,
                                     ggml_cgraph *  gf,
                                     ggml_tensor *  speech_feat_c80_t_b,
@@ -2064,6 +2074,7 @@ class Token2Mel {
     // Multi-session: reuse weights already loaded by another Token2Mel (GGUF backend only).
     bool attach_shared_model(std::shared_ptr<flowGGUFModelLoader> loader, int threads = 8);
     std::shared_ptr<flowGGUFModelLoader> shared_model() const { return runner_.shared_loader(); }
+    ggml_backend_t compute_backend() const { return runner_.compute_backend(); }
 
     static bool load_prompt_bundle_dir(const std::string & dir, PromptBundle & out);
 
@@ -2202,7 +2213,9 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
 class Token2Wav {
   public:
     Token2Wav()  = default;
-    ~Token2Wav() = default;
+    ~Token2Wav() { voc_runner_.free_own_backend(); }
+    ggml_backend_t t2m_compute_backend() const;
+    ggml_backend_t voc_compute_backend() const { return voc_runner_.backend(); }
 
     Token2Wav(const Token2Wav &)             = delete;
     Token2Wav & operator=(const Token2Wav &) = delete;

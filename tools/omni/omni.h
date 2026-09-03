@@ -521,7 +521,11 @@ void omni_free(struct omni_context * ctx_omni);
 // and owns only per-session state: LLM/TTS llama_context + samplers, APM streaming KV cache,
 // Token2Wav stream state, queues and worker threads. `parent` must outlive the clone.
 struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
-                                         const std::string & base_output_dir);
+                                         const std::string & base_output_dir,
+                                         omni::flow::Token2WavSession * t2w_weight_owner = nullptr); // default: parent's
+// Load a stand-alone Token2Wav weight set (e.g. on another GPU) to be shared by sessions via omni_session_clone().
+std::unique_ptr<omni::flow::Token2WavSession> omni_load_token2wav_owner(const std::string & model_dir,
+                                                                       const std::string & device);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);

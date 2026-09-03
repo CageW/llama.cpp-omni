@@ -11,6 +11,7 @@
 #include "llama.h"
 #include "log.h"
 #include "ggml-backend.h"
+#include "token2wav/token2wav.h"
 
 #include <algorithm>
 #include <atomic>
@@ -54,7 +55,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv;
+    std::string out_csv; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; std::vector<std::string> t2w_devs{"gpu:0"};
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -64,14 +65,19 @@ int main(int argc, char ** argv) {
         else if (a == "-c" && i + 1 < argc) n_ctx = atoi(argv[++i]);
         else if (a == "--no-tts") use_tts = false;
         else if (a == "--csv" && i + 1 < argc) out_csv = argv[++i];
+        else if (a == "--ctk" && i + 1 < argc) { std::string t = argv[++i]; ctk = t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; }
+        else if (a == "--ub" && i + 1 < argc) n_ubatch = atoi(argv[++i]);
+        else if (a == "--t2w-devices" && i + 1 < argc) { t2w_devs.clear(); std::string l = argv[++i]; size_t p = 0; while (p <= l.size()) { size_t q = l.find(',', p); if (q == std::string::npos) q = l.size(); if (q > p) t2w_devs.push_back(l.substr(p, q - p)); p = q + 1; } }
         else { fprintf(stderr, "usage: %s -m llm.gguf --test <prefix> <n> [-n sessions] [--interval ms] [-c n_ctx] [--no-tts] [--csv out]\n", argv[0]); return 1; }
     }
     if (llm_path.empty() || prefix.empty()) { fprintf(stderr, "need -m and --test\n"); return 1; }
 
     common_params params;
     params.model.path = llm_path;
-    params.n_ctx = n_ctx; params.n_batch = 2048; params.n_ubatch = 512; params.n_gpu_layers = 99;
+    params.n_ctx = n_ctx; params.n_batch = 2048; params.n_ubatch = n_ubatch; params.n_gpu_layers = 99;
+    params.cache_type_k = ctk; params.cache_type_v = ctk; params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.n_parallel = 1;
+    params.split_mode = LLAMA_SPLIT_MODE_NONE; params.main_gpu = 0;   // LLM/APM/VPM stay on the first visible GPU
     params.sampling.temp = 0.7f; params.sampling.top_p = 0.8f; params.sampling.top_k = 20; params.sampling.penalty_repeat = 1.05f;
     const std::string base = parent_dir(llm_path);
     const bool o5 = llm_path.find("o5") != std::string::npos;
@@ -84,7 +90,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     ggml_backend_load_all();
     const size_t mem0 = gpu_used_mib();
-    omni_context * root = omni_init(&params, /*media_type*/2, use_tts, params.tts_bin_dir, 99, "gpu:0", /*duplex*/true,
+    omni_context * root = omni_init(&params, /*media_type*/2, use_tts, params.tts_bin_dir, 99, t2w_devs[0], /*duplex*/true,
                                     nullptr, nullptr, "./tools/omni/output/ms0");
     if (!root) { fprintf(stderr, "omni_init failed\n"); return 1; }
     root->clean_kvcache = true;
@@ -92,8 +98,18 @@ int main(int argc, char ** argv) {
 
     std::vector<omni_context *> sess{root};
     std::vector<size_t> mem_after_clone{mem_root};
+    // extra Token2Wav weight owners on additional GPUs (stage placement experiment)
+    std::vector<std::unique_ptr<omni::flow::Token2WavSession>> t2w_owners;
+    for (size_t d = 1; d < t2w_devs.size(); ++d) {
+        auto o = omni_load_token2wav_owner(root->token2wav_model_dir, t2w_devs[d]);
+        if (!o) { fprintf(stderr, "t2w owner on %s failed\n", t2w_devs[d].c_str()); return 1; }
+        t2w_owners.push_back(std::move(o));
+    }
+    printf("[t2w] devices: "); for (auto & d : t2w_devs) printf("%s ", d.c_str()); printf("\n");
     for (int i = 1; i < n_sessions; ++i) {
-        omni_context * c = omni_session_clone(root, &params, "./tools/omni/output/ms" + std::to_string(i));
+        omni::flow::Token2WavSession * owner = nullptr;
+        if (!t2w_owners.empty()) { size_t k = (size_t) i % t2w_devs.size(); owner = k == 0 ? nullptr : t2w_owners[k - 1].get(); }
+        omni_context * c = omni_session_clone(root, &params, "./tools/omni/output/ms" + std::to_string(i), owner);
         if (!c) { fprintf(stderr, "clone %d failed\n", i); return 1; }
         sess.push_back(c);
         mem_after_clone.push_back(gpu_used_mib());

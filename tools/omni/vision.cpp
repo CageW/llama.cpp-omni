@@ -205,7 +205,9 @@ struct vision_ctx {
     ggml_backend_buffer_ptr buf;
 
     int max_nodes = 8192;
-    std::mutex encode_mtx;   // multi-session: one vision_ctx is shared by all sessions on a GPU
+    // multi-session: this ctx borrows model weights from `weights_owner` (same device) and owns only
+    // its backend instances (own CUDA stream + pool) and scheduler
+    struct vision_ctx * weights_owner = nullptr;
     
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
@@ -262,6 +264,12 @@ struct vision_ctx {
     }
 
     ~vision_ctx() {
+        if (weights_owner) {
+            // borrowed weights: drop references without freeing the buffers
+            buf.release();
+            ctx_data.release();
+            ctx_gguf.release();
+        }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -1637,6 +1645,52 @@ void vision_free(vision_ctx * ctx) {
         return;
     }
     delete ctx;
+}
+
+// Multi-session: a compute-only clone. Shares the weight buffers of `owner` (device buffer type is
+// per device, so any backend instance on that device can read them) but has its own backend
+// instance (= own CUDA stream + memory pool) and scheduler, so sessions encode concurrently.
+struct vision_ctx * vision_clone_compute(struct vision_ctx * owner) {
+    if (!owner) return nullptr;
+    vision_context_params p{ /*use_gpu*/ false, GGML_LOG_LEVEL_INFO, nullptr };
+    vision_ctx * c = nullptr;
+    try { c = new vision_ctx(p); } catch (...) { return nullptr; }
+    c->sched.reset();
+    c->backend_ptrs.clear(); c->backend_buft.clear();
+    if (owner->backend != owner->backend_cpu) {
+        ggml_backend_t nb = ggml_backend_dev_init(ggml_backend_get_device(owner->backend), nullptr);
+        if (nb) {
+            c->backend = nb;
+            c->backend_ptrs.push_back(nb);
+            c->backend_buft.push_back(ggml_backend_get_default_buffer_type(nb));
+        } else {
+            c->backend = c->backend_cpu;
+        }
+    } else {
+        c->backend = c->backend_cpu;
+    }
+    c->backend_ptrs.push_back(c->backend_cpu);
+    c->backend_buft.push_back(ggml_backend_get_default_buffer_type(c->backend_cpu));
+    c->sched.reset(ggml_backend_sched_new(c->backend_ptrs.data(), c->backend_buft.data(), c->backend_ptrs.size(), 8192, false, true));
+    c->weights_owner = owner;
+    c->model = owner->model;
+    c->ctx_gguf.reset(owner->ctx_gguf.get());
+    c->ctx_data.reset(owner->ctx_data.get());
+    c->buf.reset(owner->buf.get());
+    c->buf_compute_meta = owner->buf_compute_meta;
+    c->max_nodes = owner->max_nodes;
+    c->max_slice_nums_override = owner->max_slice_nums_override;
+    c->batch_encode = owner->batch_encode;
+    c->coreml_model_path = owner->coreml_model_path;
+    {
+        vision_image_f32_batch batch;
+        vision_image_f32_ptr img(vision_image_f32_init());
+        img->nx = c->model.hparams.warmup_image_size; img->ny = c->model.hparams.warmup_image_size;
+        batch.entries.push_back(std::move(img));
+        ggml_cgraph * gf = vision_image_build_graph(c, batch);
+        ggml_backend_sched_reserve(c->sched.get(), gf);
+    }
+    return c;
 }
 
 
