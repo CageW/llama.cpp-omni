@@ -467,6 +467,15 @@ struct omni_context {
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
+
+    // ---- model-variant dependent constants (MiniCPM-o 4.5 defaults; overridden for o5 at init) ----
+    bool is_o5 = false;                 // LLM is the Qwen3.5-MoE hybrid backbone (MiniCPM-o5 / 4.6 family)
+    int  llm_n_embd = 4096;             // LLM hidden size (4096 for o4.5, 2048 for o5)
+    int  n_pos_per_embd = 1;            // 4 when the LLM uses M-RoPE (o5), else 1
+    int  tts_audio_bos_token_id = 151687;  // id of the first audio token in the TTS text-embedding space
+    int  tts_text_eos_token_id  = 151692;  // TTS text_eos id
+    int  tts_num_audio_tokens   = 6562;    // audio codebook size (+eos)
+    llama_token special_token_threshold = 150000; // tokens >= this are treated as special (not sent to TTS)
 };
 
 //

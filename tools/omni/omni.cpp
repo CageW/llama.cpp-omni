@@ -340,6 +340,21 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
 //
 // omni mtmd embed
 //
+// Build a position array for a batch of n tokens starting at pos0.
+// For M-RoPE models (MiniCPM-o5 / Qwen3.5) llama.cpp expects 4 sections per token
+// ([text, T, H, W]); we broadcast the 1-D position to all sections (text-style positions).
+static std::vector<llama_pos> omni_make_pos(const llama_model * model, int pos0, int n) {
+    const enum llama_rope_type rt = llama_model_rope_type(model);
+    const int n_sec = (rt == LLAMA_ROPE_TYPE_MROPE || rt == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+    std::vector<llama_pos> pos((size_t) n * n_sec);
+    for (int k = 0; k < n_sec; k++) {
+        for (int j = 0; j < n; j++) {
+            pos[(size_t) k * n + j] = pos0 + j;
+        }
+    }
+    return pos;
+}
+
 bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_embed, int n_batch, int * n_past) {
     int n_embd  = llama_n_embd(llama_get_model(ctx_llama));
 
@@ -351,10 +366,7 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (omni_embed->embed + i*n_embd);
-        std::vector<llama_pos> pos_vec(n_eval);
-        for (int j = 0; j < n_eval; j++) {
-            pos_vec[j] = *n_past + j;
-        }
+        std::vector<llama_pos> pos_vec = omni_make_pos(llama_get_model(ctx_llama), *n_past, n_eval);
         batch.pos = pos_vec.data();
         
         if (llama_decode(ctx_llama, batch)) {
@@ -378,10 +390,7 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (embed + i*n_embd);
-        std::vector<llama_pos> pos_vec(n_eval);
-        for (int j = 0; j < n_eval; j++) {
-            pos_vec[j] = *n_past + j;
-        }
+        std::vector<llama_pos> pos_vec = omni_make_pos(llama_get_model(ctx_omni->ctx_llama), *n_past, n_eval);
         batch.pos = pos_vec.data();
         
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
@@ -423,10 +432,7 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (embed + i * n_embd);
-        std::vector<llama_pos> pos_vec(n_eval);
-        for (int j = 0; j < n_eval; j++) {
-            pos_vec[j] = *n_past + j;
-        }
+        std::vector<llama_pos> pos_vec = omni_make_pos(llama_get_model(ctx_omni->ctx_llama), *n_past, n_eval);
         batch.pos = pos_vec.data();
 
         // 启用 embeddings 输出
@@ -968,6 +974,19 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
     const int n_ctx = params->n_ctx;
 
+    if (ctx_omni->is_o5) {
+        // Hybrid (gated-delta-net + attention) memory cannot remove a middle range of positions,
+        // so the o4.5 "drop oldest rounds and shift" window is not applicable. Stage-0 policy:
+        // no sliding; the caller must reset the session before n_ctx is exhausted.
+        static bool warned = false;
+        if (!warned && ctx_omni->n_past + chunk_size >= n_ctx - 2048) {
+            warned = true;
+            print_with_timestamp("⚠️ o5: n_past=%d approaching n_ctx=%d; sliding window disabled for hybrid memory\n",
+                                 ctx_omni->n_past, n_ctx);
+        }
+        return;
+    }
+
     // ==================== 双工模式：按轮次边界智能清理 ====================
     if (ctx_omni->duplex_mode) {
         const int duplex_trigger = std::max(ctx_omni->n_keep, n_ctx - 2048);
@@ -1420,9 +1439,10 @@ static std::mt19937* get_sampler_rng(struct common_sampler * smpl) {
 // ==============================================================================
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda) {
     
+    struct ggml_context * ctx_meta = nullptr;   // tensor metadata (shapes) without data
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
-        /*.ctx      = */ nullptr,
+        /*.ctx      = */ &ctx_meta,
     };
     
     struct gguf_context * ctx_gguf = gguf_init_from_file(fname.c_str(), params);
@@ -1468,19 +1488,24 @@ bool projector_init(projector_model & model, const std::string & fname, bool use
         enum ggml_type type = gguf_get_tensor_type(ctx_gguf, i);
         struct ggml_tensor * tensor = nullptr;
         
+        // shapes come from the GGUF tensor info (o4.5: 4096->768, o5: 2048->768)
+        const struct ggml_tensor * meta = ctx_meta ? ggml_get_tensor(ctx_meta, name) : nullptr;
+        if (!meta) { continue; }
+        const int64_t ne0 = meta->ne[0];
+        const int64_t ne1 = ggml_n_dims(meta) > 1 ? meta->ne[1] : 1;
         if (strcmp(name, "linear1.weight") == 0) {
-            tensor = ggml_new_tensor_2d(model.ctx_w, type, 4096, 768);
+            tensor = ggml_new_tensor_2d(model.ctx_w, type, ne0, ne1);
             model.layer.linear1_weight = tensor;
-            model.hparams.in_dim = 4096;
-            model.hparams.out_dim = 768;
+            model.hparams.in_dim = (int32_t) ne0;
+            model.hparams.out_dim = (int32_t) ne1;
         } else if (strcmp(name, "linear1.bias") == 0) {
-            tensor = ggml_new_tensor_1d(model.ctx_w, type, 768);
+            tensor = ggml_new_tensor_1d(model.ctx_w, type, ne0);
             model.layer.linear1_bias = tensor;
         } else if (strcmp(name, "linear2.weight") == 0) {
-            tensor = ggml_new_tensor_2d(model.ctx_w, type, 768, 768);
+            tensor = ggml_new_tensor_2d(model.ctx_w, type, ne0, ne1);
             model.layer.linear2_weight = tensor;
         } else if (strcmp(name, "linear2.bias") == 0) {
-            tensor = ggml_new_tensor_1d(model.ctx_w, type, 768);
+            tensor = ggml_new_tensor_1d(model.ctx_w, type, ne0);
             model.layer.linear2_bias = tensor;
         } else {
             continue;
@@ -1521,6 +1546,7 @@ bool projector_init(projector_model & model, const std::string & fname, bool use
     }
     
     fclose(f);
+    if (ctx_meta) ggml_free(ctx_meta);
     gguf_free(ctx_gguf);
     
     model.initialized = true;
@@ -1656,9 +1682,10 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             int64_t hidden_size = 768;
             
             // GGUF stores as (hidden_size, num_audio_tokens) = [768, 6562]
-            if (dim0 == hidden_size && dim1 == num_audio_tokens) {
-                // Correct: stored as (hidden_size, num_audio_tokens)
-            } else if (dim0 == num_audio_tokens && dim1 == hidden_size) {
+            if (dim0 == hidden_size) {
+                // Correct: stored as (hidden_size, num_audio_tokens); vocab may differ from 6562
+                num_audio_tokens = dim1;
+            } else if (dim1 == hidden_size) {
                 // Stored as (num_audio_tokens, hidden_size) - need to transpose
                 num_audio_tokens = dim0;
                 hidden_size = dim1;
@@ -1715,7 +1742,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             int64_t dim1 = emb_text_tensor->ne[1];
             
             // Expected values
-            int64_t expected_vocab_size = 152064;
+            int64_t expected_vocab_size = (dim0 == 768) ? dim1 : dim0;  // 152064 (o4.5) / 248144 (o5)
             int64_t expected_hidden_size = 768;
             
             // GGML tensor 维度理解：
@@ -1800,15 +1827,16 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
     // PyTorch nn.Linear(in_features, out_features) weight shape is (out_features, in_features)
     // GGUF may store as (out_features, in_features) or (in_features, out_features)
     // We need to detect and handle both cases
+    const int64_t llm_dim = ctx_omni->llm_n_embd;
     int64_t expected_shapes_pytorch[][2] = {
-        {768, 4096},  // linear1.weight: PyTorch shape (out_features, in_features)
+        {768, llm_dim},  // linear1.weight: PyTorch shape (out_features, in_features)
         {768, 0},     // linear1.bias (1D)
         {768, 768},   // linear2.weight: PyTorch shape (out_features, in_features)
         {768, 0}      // linear2.bias (1D)
     };
     
     int64_t expected_shapes_transposed[][2] = {
-        {4096, 768},  // linear1.weight: transposed shape (in_features, out_features)
+        {llm_dim, 768},  // linear1.weight: transposed shape (in_features, out_features)
         {768, 0},     // linear1.bias (1D)
         {768, 768},   // linear2.weight: same for square matrix
         {768, 0}      // linear2.bias (1D)
@@ -1934,11 +1962,26 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
     }
     
     // Set projector dimensions
-    ctx_omni->projector_semantic_input_dim = 4096;
+    ctx_omni->projector_semantic_input_dim = ctx_omni->llm_n_embd;
     ctx_omni->projector_semantic_output_dim = 768;
     
     // Load head_code.weight: (hidden_size=768, num_audio_tokens=6562)
     // Note: num_vq=1, so we only load head_code.0.weight
+    {
+        auto get_u32 = [&](const char * key, int & out) {
+            int64_t k = gguf_find_key(ctx_gguf, key);
+            if (k >= 0) { out = (int) gguf_get_val_u32(ctx_gguf, k); return true; }
+            return false;
+        };
+        int v = 0;
+        if (get_u32("minicpmtts.audio_bos_token_id", v) && v > 0) ctx_omni->tts_audio_bos_token_id = v;
+        if (get_u32("minicpmtts.text_eos_token_id", v) && v > 0)  ctx_omni->tts_text_eos_token_id  = v;
+        if (get_u32("minicpmtts.num_audio_tokens", v) && v > 0)   ctx_omni->tts_num_audio_tokens   = v;
+        else if (ctx_omni->emb_code_vocab_size > 0)               ctx_omni->tts_num_audio_tokens   = ctx_omni->emb_code_vocab_size;
+        print_with_timestamp("TTS: audio_bos=%d text_eos=%d num_audio_tokens=%d (from GGUF meta or defaults)\n",
+                             ctx_omni->tts_audio_bos_token_id, ctx_omni->tts_text_eos_token_id, ctx_omni->tts_num_audio_tokens);
+    }
+
     const char * head_code_name = "head_code.0.weight";
     int64_t head_code_idx = gguf_find_tensor(ctx_gguf, head_code_name);
     if (head_code_idx >= 0) {
@@ -1952,7 +1995,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             
             // Expected shape in GGUF: (hidden_size=768, num_audio_tokens=6562)
             int64_t expected_hidden_size = 768;
-            int64_t expected_num_audio_tokens = 6562;
+            int64_t expected_num_audio_tokens = (dim0 == 768) ? dim1 : dim0;
             
             // Allocate memory for weight: (hidden_size, num_audio_tokens) = [768, 6562]
             size_t head_code_size = expected_hidden_size * expected_num_audio_tokens * sizeof(float);
@@ -2783,8 +2826,8 @@ static int nucleus_sampling_with_min_keep_tts(
 static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, int token_index_in_chunk, bool force_no_eos = false, bool is_final_text_chunk = false) {
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
-    const int audio_bos_token_id = 151687;
-    const int num_audio_tokens = 6562;
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;
     const int eos_relative_idx = num_audio_tokens - 1;  // EOS token relative index: 6561
     
     // 单工版本：is_audio_bos 只有在整个生成过程的第一个 token 时才为 true
@@ -2987,8 +3030,8 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
     // TTS model constants
-    const int audio_bos_token_id = 151687;
-    const int num_audio_tokens = 6562;  // head_code output size
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;  // head_code output size
     
     // 🔧 [差异2修复] 分离两个概念，与 Python generate_chunk 对齐：
     // 1. is_first_token_overall: 整个生成过程的第一个 token（用于 re-forward condition）
@@ -4129,6 +4172,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
 
+    // model-variant detection (must precede TTS weight loading, which sizes projector by llm_n_embd)
+    ctx_omni->llm_n_embd = llama_n_embd(model);
+    {
+        const enum llama_rope_type rt = llama_model_rope_type(model);
+        ctx_omni->n_pos_per_embd = (rt == LLAMA_ROPE_TYPE_MROPE || rt == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+        ctx_omni->is_o5 = llama_model_is_hybrid(model);
+        print_with_timestamp("=== omni_init: llm_n_embd=%d n_pos_per_embd=%d hybrid(o5)=%d\n",
+                             ctx_omni->llm_n_embd, ctx_omni->n_pos_per_embd, (int) ctx_omni->is_o5);
+    }
+
     if (use_tts && !params->tts_model.empty()) {
         print_with_timestamp("=== omni_init: loading TTS model\n");
         // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
@@ -4200,6 +4253,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Load Projector Semantic from GGUF file
         // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
         std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
+        {
+            std::ifstream pf(projector_path);
+            if (!pf.good()) {
+                std::string alt = tts_bin_dir + "/MiniCPM-o5-projector-F16.gguf";
+                std::ifstream af(alt);
+                if (af.good()) projector_path = alt;
+            }
+        }
         print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
         if (projector_init(ctx_omni->projector, projector_path, true)) {
             print_with_timestamp("Projector: loaded successfully\n");
@@ -4208,8 +4269,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         }
     }
 
-    ctx_omni->omni_emb.resize((64 + 10 + 1) * 4096); // temp fix for omni embed
-    ctx_omni->audio_emb.resize((10 + 1) * 4096); // temp fix for audio embed
+    ctx_omni->omni_emb.resize((64 + 10 + 1) * ctx_omni->llm_n_embd); // temp fix for omni embed
+    ctx_omni->audio_emb.resize((10 + 1) * ctx_omni->llm_n_embd); // temp fix for audio embed
     print_with_timestamp("=== omni_init: loading APM model\n");
     if (params->apm_model.empty()) {
         LOG_ERR("%s: error: apm_model path is empty\n", __func__);
@@ -5145,7 +5206,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
 //   1. chunk_speak_token_ids = [speak_token_id] 中的 token 不会被添加到 TTS 条件
 //   2. j != 0 条件跳过循环中的第一个 token
 // 注意：这些 token 大部分也会被 tid >= 150000 规则过滤，但显式列出便于理解和调试
-static const std::vector<llama_token> g_special_token_ids = {
+static std::vector<llama_token> g_special_token_ids = {
     151667,  // <think>
     151668,  // </think>
     151704,  // <|tts_eos|> - TTS 结束标记
@@ -5167,6 +5228,7 @@ static const std::set<llama_token> g_known_empty_token_ids = {
 
 // Helper function to check if a token should be filtered out
 // Returns true if the token is valid for TTS, false if it should be skipped
+static llama_token g_special_token_threshold = 150000;
 static bool is_valid_tts_token(llama_token tid) {
     // Skip special tokens
     for (llama_token sid : g_special_token_ids) {
@@ -5175,8 +5237,8 @@ static bool is_valid_tts_token(llama_token tid) {
         }
     }
     
-    // Skip tokens >= 150000 (usually special tokens like <|im_end|>, <|tts_bos|>, etc.)
-    if (tid >= 150000) {
+    // Skip tokens >= first special token id (<|im_end|>, <|tts_bos|>, ...); set from vocab at omni_init
+    if (tid >= g_special_token_threshold) {
         return false;
     }
     
@@ -5271,8 +5333,8 @@ static bool generate_audio_tokens_local_simplex(
     print_with_timestamp("TTS Simplex: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d)\n",
                         chunk_idx, n_tokens, tts_n_embd);
     
-    const int audio_bos_token_id = 151687;
-    const int num_audio_tokens = 6562;
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;
     // 🔧 [与 Python 对齐] Python: max_new_token=500，每个 LLM condition 生成直到 EOS
     // 然后每 25 个 tokens yield 一次
     const int max_audio_tokens = 500;
@@ -5303,7 +5365,7 @@ static bool generate_audio_tokens_local_simplex(
     // 原因：一个 text chunk 会生成多个 audio chunk，text_eos_embed 放在 condition 中
     // 会导致所有 audio chunk 都受到影响。正确做法是在第一轮 audio 生成结束（EOS）后，
     // 再注入 text_eos_embed + audio_bos 做第二轮生成，这样只影响最后一批 audio tokens。
-    const int text_eos_token_id = 151692;  // TTS 的 text_eos_token_id
+    const int text_eos_token_id = ctx_omni->tts_text_eos_token_id;  // TTS 的 text_eos_token_id
     
     // 🔧 [与 Python 对齐] 只添加 audio_bos（总是添加）
     // Python: condition = torch.cat([condition, self.audio_bos_embeds], dim=1)
@@ -5682,8 +5744,8 @@ static bool generate_audio_tokens_local(
     }
     
     // TTS model constants
-    const int audio_bos_token_id = 151687;
-    const int num_audio_tokens = 6562;
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;
     // 🔧 [单双工适配] max_audio_tokens:
     // - 双工模式: 26 (与 Python 对齐，max_token_per_chunk = 25 + 1)
     // - 单工模式: 500 (允许更长的生成，靠 EOS 结束)
@@ -5719,7 +5781,7 @@ static bool generate_audio_tokens_local(
     
     // 🔧 [与 Python 对齐] 如果是轮次结束，先添加 text_eos_embed
     // Python: if text_finished: condition = torch.cat([condition, self.text_eos_embed], dim=1)
-    const int text_eos_token_id = 151692;  // TTS 的 text_eos_token_id
+    const int text_eos_token_id = ctx_omni->tts_text_eos_token_id;  // TTS 的 text_eos_token_id
     if (is_end_of_turn) {
         std::vector<float> text_eos_embed(tts_n_embd, 0.0f);
         if (tts_emb_text(ctx_omni, text_eos_token_id, text_eos_embed.data(), tts_n_embd)) {
@@ -6239,10 +6301,10 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     create_dir(tts_wav_output_dir);
     
     // TTS model constants
-    const int audio_bos_token_id = 151687;
-    const int audio_eos_token_id = audio_bos_token_id + 6561;
-    const int text_eos_token_id = 151692;
-    const int num_audio_tokens = 6562;
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
+    const int audio_eos_token_id = audio_bos_token_id + ctx_omni->tts_num_audio_tokens - 1;
+    const int text_eos_token_id = ctx_omni->tts_text_eos_token_id;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;
     
     // 🔧 [诊断] 用于追踪所有 decode 调用
     int decode_call_idx = 0;
@@ -6903,12 +6965,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     update_output_dirs();
     
     // TTS model constants from config.json
-    const int audio_bos_token_id = 151687;
+    const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
     // Audio EOS token: relative index 6561, absolute ID = 151687 + 6561 = 158248
-    const int audio_eos_token_id = audio_bos_token_id + 6561;  // 158248
-    const int text_eos_token_id = 151692;  // 用于文本结束检测
+    const int audio_eos_token_id = audio_bos_token_id + ctx_omni->tts_num_audio_tokens - 1;  // 158248
+    const int text_eos_token_id = ctx_omni->tts_text_eos_token_id;  // 用于文本结束检测
     const int spk_emb_token_id = 21143;
-    const int num_audio_tokens = 6562;
+    const int num_audio_tokens = ctx_omni->tts_num_audio_tokens;
     const int max_audio_tokens = 1000;  // Maximum audio tokens to generate per text chunk
     
     // WAV timing log file (will be created in current round directory)
@@ -7989,7 +8051,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         // Note: Save relative indices (0-6561) for token2wav compatibility
         if (!audio_tokens.empty()) {
             // Always save to fixed output directory
-            const int audio_bos_token_id = 151687;
+            const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
             std::string token_file = tts_output_dir + "/tts_audio_tokens_chunk_" + std::to_string(chunk_idx) + ".txt";
             FILE *f = fopen(token_file.c_str(), "w");
             if (f) {
@@ -7999,9 +8061,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     int absolute_id = audio_tokens[i];
                     int relative_idx = absolute_id - audio_bos_token_id;
                     // Verify token is in valid range
-                    if (absolute_id < audio_bos_token_id || relative_idx >= 6562) {
+                    if (absolute_id < audio_bos_token_id || relative_idx >= ctx_omni->tts_num_audio_tokens) {
                         LOG_ERR("TTS: WARNING - token %d (relative_idx=%d) is outside valid range [%d, %d)\n", 
-                                absolute_id, relative_idx, audio_bos_token_id, audio_bos_token_id + 6562);
+                                absolute_id, relative_idx, audio_bos_token_id, audio_bos_token_id + ctx_omni->tts_num_audio_tokens);
                         // Still save relative index, but mark as invalid
                         relative_idx = -1;  // Mark as invalid
                     }
@@ -8085,22 +8147,22 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             if (!all_audio_tokens.empty()) {
                 // Always save to fixed output directory
                 // Note: Save relative indices (0-6561) for token2wav compatibility
-                const int audio_bos_token_id = 151687;
+                const int audio_bos_token_id = ctx_omni->tts_audio_bos_token_id;
                 std::string summary_file = tts_output_dir + "/tts_all_audio_tokens_summary.txt";
                 FILE *f = fopen(summary_file.c_str(), "w");
                 if (f) {
                     fprintf(f, "Total audio tokens: %zu\n", all_audio_tokens.size());
                     fprintf(f, "Audio token range: relative [0, %d) (absolute [%d, %d))\n", 
-                            6562, audio_bos_token_id, audio_bos_token_id + 6562);
+                            6562, audio_bos_token_id, audio_bos_token_id + ctx_omni->tts_num_audio_tokens);
                     fprintf(f, "Audio tokens [relative_index]:\n");
                     int invalid_count = 0;
                     for (size_t i = 0; i < all_audio_tokens.size(); ++i) {
                         int absolute_id = all_audio_tokens[i];
                         int relative_idx = absolute_id - audio_bos_token_id;
                         // Verify token is in valid range
-                        if (absolute_id < audio_bos_token_id || relative_idx >= 6562 || relative_idx < 0) {
+                        if (absolute_id < audio_bos_token_id || relative_idx >= ctx_omni->tts_num_audio_tokens || relative_idx < 0) {
                             LOG_ERR("TTS: WARNING - token %d (relative_idx=%d) is outside valid range [%d, %d)\n", 
-                                    absolute_id, relative_idx, audio_bos_token_id, audio_bos_token_id + 6562);
+                                    absolute_id, relative_idx, audio_bos_token_id, audio_bos_token_id + ctx_omni->tts_num_audio_tokens);
                             relative_idx = -1;  // Mark as invalid
                             invalid_count++;
                         }
@@ -8114,7 +8176,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     fprintf(f, "\n");
                     if (invalid_count > 0) {
                         fprintf(f, "WARNING: Found %d tokens outside valid range [%d, %d)\n", 
-                                invalid_count, audio_bos_token_id, audio_bos_token_id + 6562);
+                                invalid_count, audio_bos_token_id, audio_bos_token_id + ctx_omni->tts_num_audio_tokens);
                     }
                     fclose(f);
                     fflush(stdout);

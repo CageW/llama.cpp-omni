@@ -142,10 +142,12 @@ static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
     paths.base_dir = get_parent_dir(llm_path);
     
     // 自动推断其他模型路径
-    paths.vision = paths.base_dir + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
-    paths.audio = paths.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
-    paths.tts = paths.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
-    paths.projector = paths.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
+    const bool o5 = llm_path.find("o5") != std::string::npos;
+    const std::string tag = o5 ? "MiniCPM-o5" : "MiniCPM-o-4_5";
+    paths.vision = paths.base_dir + "/vision/" + tag + "-vision-F16.gguf";
+    paths.audio = paths.base_dir + "/audio/" + tag + "-audio-F16.gguf";
+    paths.tts = paths.base_dir + "/tts/" + tag + "-tts-F16.gguf";
+    paths.projector = paths.base_dir + "/tts/" + tag + "-projector-F16.gguf";
     paths.vision_coreml = paths.base_dir + "/vision/coreml_minicpmo45_vit_all_f16.mlmodelc";
     
     return paths;

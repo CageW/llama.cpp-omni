@@ -65,14 +65,16 @@ static bool ensure_omni_model_paths_from_llm(common_params & params) {
     if (root.empty()) {
         return false;
     }
+    const bool o5 = params.model.path.find("o5") != std::string::npos;
+    const std::string tag = o5 ? "MiniCPM-o5" : "MiniCPM-o-4_5";
     if (params.vpm_model.empty()) {
-        params.vpm_model = root + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
+        params.vpm_model = root + "/vision/" + tag + "-vision-F16.gguf";
     }
     if (params.apm_model.empty()) {
-        params.apm_model = root + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
+        params.apm_model = root + "/audio/" + tag + "-audio-F16.gguf";
     }
     if (params.tts_model.empty()) {
-        params.tts_model = root + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
+        params.tts_model = root + "/tts/" + tag + "-tts-F16.gguf";
     }
     if (params.tts_bin_dir.empty()) {
         params.tts_bin_dir = root + "/tts";
