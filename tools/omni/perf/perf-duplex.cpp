@@ -131,10 +131,11 @@ static TestModelPaths resolve_model_paths(const std::string & llm_path) {
     TestModelPaths p;
     p.llm = llm_path;
     p.base_dir = get_parent_dir(llm_path);
-    p.vision        = p.base_dir + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
-    p.audio         = p.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
-    p.tts           = p.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
-    p.projector     = p.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
+    const std::string tag = (llm_path.find("o5") != std::string::npos) ? "MiniCPM-o5" : "MiniCPM-o-4_5";
+    p.vision        = p.base_dir + "/vision/" + tag + "-vision-F16.gguf";
+    p.audio         = p.base_dir + "/audio/" + tag + "-audio-F16.gguf";
+    p.tts           = p.base_dir + "/tts/" + tag + "-tts-F16.gguf";
+    p.projector     = p.base_dir + "/tts/" + tag + "-projector-F16.gguf";
     p.vision_coreml = p.base_dir + "/vision/coreml_minicpmo45_vit_all_f16.mlmodelc";
     return p;
 }
