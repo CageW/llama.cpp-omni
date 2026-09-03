@@ -514,8 +514,12 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     }
     
     int n_embd = vision_n_mmproj_embd(ctx_vision);
-    int n_tokens = vision_n_output_tokens(ctx_vision);
     const int n_total = (int)img_res_v.entries.size();
+    // MiniCPM-o 4.6/o5: tokens per chunk depend on the preprocessed size (16x downsample);
+    // overview may be non-square, slices share one size
+    int n_tokens = (n_total > 1) ? vision_n_output_tokens_for_image(ctx_vision, img_res_v.entries[1].get())
+                                 : vision_n_output_tokens_for_image(ctx_vision, img_res_v.entries[0].get());
+    const int n_tokens_overview = vision_n_output_tokens_for_image(ctx_vision, img_res_v.entries[0].get());
     
     vision_chunks.clear();
     vision_chunks.resize(n_total);
@@ -530,7 +534,7 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     // 1) encode the overview image (entry 0)
     {
         const int64_t t_step_us = ggml_time_us();
-        vision_chunks[0].resize(n_embd * n_tokens);
+        vision_chunks[0].resize(n_embd * n_tokens_overview);
         bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[0].get(), vision_chunks[0].data());
         if (!encoded) {
             LOG_ERR("Unable to encode overview image\n");
@@ -585,7 +589,20 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
 
     const int64_t t_img_enc_end_us = ggml_time_us();
     float t_img_enc_ms = (t_img_enc_end_us - t_img_enc_start_us) / 1000.0;
-    int total_tokens = n_total * n_tokens;
+    int total_tokens = n_tokens_overview + n_slices * n_tokens;
+    if (getenv("OMNI_VISION_DEBUG")) {
+        for (size_t c = 0; c < vision_chunks.size(); c++) {
+            double sum = 0, sq = 0; int nan = 0; const auto & v = vision_chunks[c];
+            for (float x : v) { if (std::isnan(x) || std::isinf(x)) nan++; else { sum += x; sq += (double) x * x; } }
+            LOG_INF("vision-debug chunk %zu: n=%zu mean=%.5f rms=%.5f nan/inf=%d first=[%.4f %.4f %.4f %.4f]\n",
+                    c, v.size(), sum / v.size(), sqrt(sq / v.size()), nan, v[0], v[1], v[2], v[3]);
+        }
+        const char * dump = getenv("OMNI_VISION_DEBUG");
+        if (dump[0] == '/') {
+            FILE * f = fopen(dump, "wb");
+            if (f) { for (auto & v : vision_chunks) fwrite(v.data(), sizeof(float), v.size(), f); fclose(f); }
+        }
+    }
     LOG_INF("\n%s: image encoded in %8.2f ms by vision (%d chunks, %d total tokens, grid: %dx%d)\n", 
             __func__, t_img_enc_ms, n_total, total_tokens,
             img_res_v.grid_x, img_res_v.grid_y);
@@ -776,19 +793,23 @@ void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char
 }
 
 // 保留原有函数用于兼容（将所有 chunk 拼成一个 flat buffer）
-static bool encode_image_with_vision(vision_ctx * ctx_vision, int n_threads, const vision_image_u8 * img, float * image_embd, int * n_img_pos) {
+static bool encode_image_with_vision(vision_ctx * ctx_vision, int n_threads, const vision_image_u8 * img, float ** image_embd, int * n_img_pos) {
     std::vector<std::vector<float>> vision_chunks;
     if (!encode_image_with_vision_chunks(ctx_vision, n_threads, img, vision_chunks)) {
         return false;
     }
-    
     int n_embd = vision_n_mmproj_embd(ctx_vision);
-    int n_tokens = vision_n_output_tokens(ctx_vision);
+    size_t total_floats = 0;
+    for (auto & c : vision_chunks) total_floats += c.size();
+    *image_embd = (float *) malloc(total_floats * sizeof(float));   // exact size; caller frees
+    if (!*image_embd) {
+        LOG_ERR("%s: unable to allocate %zu floats for image embeddings\n", __func__, total_floats);
+        return false;
+    }
     int n_img_pos_out = 0;
-    
     for (size_t i = 0; i < vision_chunks.size(); i++) {
-        std::memcpy(image_embd + n_img_pos_out * n_embd, vision_chunks[i].data(), n_embd * n_tokens * sizeof(float));
-        n_img_pos_out += n_tokens;
+        std::memcpy(*image_embd + (size_t) n_img_pos_out * n_embd, vision_chunks[i].data(), vision_chunks[i].size() * sizeof(float));
+        n_img_pos_out += (int) (vision_chunks[i].size() / n_embd);
     }
     *n_img_pos = n_img_pos_out;
     LOG_INF("%s: image embedding created: %d tokens from %d chunks\n", __func__, *n_img_pos, (int)vision_chunks.size());
@@ -822,19 +843,13 @@ struct omni_embed * omni_image_embed_make_with_bytes(struct vision_ctx * ctx_vis
         LOG_ERR("%s: can't load image from bytes, is it a valid image?", __func__);
         return NULL;
     }
-    int num_max_patches = 10;
-    float * image_embed = (float *)malloc(vision_n_mmproj_embd(ctx_vision) * vision_n_output_tokens(ctx_vision) * num_max_patches * sizeof(float));
-    if (!image_embed) {
-        vision_image_u8_free(img);
-        LOG_ERR("Unable to allocate memory for image embeddings\n");
-        return NULL;
-    }
+    float * image_embed = nullptr;   // allocated by encode_image_with_vision
 
     LOG_INF("%s: omni_image_embed_make_with_filename s1\n", __func__);
     int n_img_pos = 0;
-    if (!encode_image_with_vision(ctx_vision, n_threads, img, image_embed, &n_img_pos)) {
+    if (!encode_image_with_vision(ctx_vision, n_threads, img, &image_embed, &n_img_pos)) {
         vision_image_u8_free(img);
-        free(image_embed);
+        if (image_embed) free(image_embed);
         LOG_ERR("%s: cannot encode image, aborting\n", __func__);
         return NULL;
     }
@@ -4313,6 +4328,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
         if (ctx_vision) {
             vision_set_batch_encode(ctx_vision, ctx_omni->params->vpm_batch_encode);
+            if (ctx_omni->is_o5) {
+                // MiniCPM-o5 streaming/duplex reference (streaming_prefill max_slice_nums=1): one 448-grid
+                // overview per frame, no HD slices. The 3-D canvas M-RoPE for sliced images is not wired
+                // in the C++ prefill yet, so keep a single chunk per frame unless the caller overrides.
+                vision_set_max_slice_nums(ctx_vision, 1);
+                print_with_timestamp("=== omni_init: o5 -> max_slice_nums=1 (single overview chunk per frame)\n");
+            }
         }
 
         // Set CoreML model path if available (for vision ANE acceleration)
@@ -5096,7 +5118,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     if (has_slices) {
                         for (int i = 1; i < n_chunks; i++) {
                             eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false);
-                            prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), tokens_per_chunk,
+                            prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), (int)(embeds->vision_embed[i].size() / hidden_size),
                                             params->n_batch, &ctx_omni->n_past);
                             eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false);
                         }
@@ -9727,7 +9749,7 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
                 build_ok &= append_text_emb(dup, "<slice>", fused, fused_ntok);
                 if (build_ok) {
                     append_raw_emb(fused, fused_ntok,
-                                   packet->vision_embed[i].data(), tokens_per_chunk, hidden_size);
+                                   packet->vision_embed[i].data(), (int)(packet->vision_embed[i].size() / hidden_size), hidden_size);
                 }
                 build_ok &= append_text_emb(dup, "</slice>", fused, fused_ntok);
             }
@@ -9810,7 +9832,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
                     eval_string(ctx_omni, params, "<slice>",
                                 params->n_batch, &ctx_omni->n_past, false);
                     prefill_with_emb(ctx_omni, params, packet->vision_embed[i].data(),
-                                     tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
+                                     (int)(packet->vision_embed[i].size() / hidden_size), params->n_batch, &ctx_omni->n_past);
                     eval_string(ctx_omni, params, "</slice>",
                                 params->n_batch, &ctx_omni->n_past, false);
                 }

@@ -1914,7 +1914,9 @@ struct llava_uhd {
                     res.refined_size.width, res.refined_size.height,
                     res.grid_size.width, res.grid_size.height);
 
-            if (!has_slices || max_slice_nums == 0) {
+            if (!has_slices || max_slice_nums <= 1 || (best_grid.width * best_grid.height) <= 1) {
+                // max_slice_nums=1 (o5 streaming default) or a 1x1 grid: overview only, no slices
+                res.grid_size = {0, 0};
                 return res;
             }
 
@@ -2222,7 +2224,7 @@ static std::vector<std::vector<float>> get_2d_sincos_pos_embed(int embed_dim, co
 //
 // vision query
 //
-static int vision_n_output_tokens_for_image(const struct vision_ctx * ctx, const vision_image_f32 * img) {
+int vision_n_output_tokens_for_image(const struct vision_ctx * ctx, const vision_image_f32 * img) {
     const auto & params = ctx->model.hparams;
     int n_patches = 64;
     omni_model_type proj = ctx->model.model_type;
@@ -2512,12 +2514,19 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
 
     // print debug nodes
     if (ctx->debug_graph) {
-        LOG_INF("\n\n---\n\n");
-        LOG_INF("\n\nDebug graph:\n\n");
+        // dump every cb() tensor as raw f32 to $Omni_DEBUG_GRAPH_DIR/<name>.bin (if the env var names a directory)
+        const char * dir = getenv("Omni_DEBUG_GRAPH_DIR");
+        static int call_idx = 0;
         for (ggml_tensor * t : ctx->debug_print_tensors) {
             std::vector<uint8_t> data(ggml_nbytes(t));
             ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+            if (dir && t->type == GGML_TYPE_F32) {
+                char path[1024]; snprintf(path, sizeof(path), "%s/call%d_%s.bin", dir, call_idx, ggml_get_name(t));
+                FILE * f = fopen(path, "wb");
+                if (f) { int32_t hdr[4] = {(int32_t)t->ne[0],(int32_t)t->ne[1],(int32_t)t->ne[2],(int32_t)t->ne[3]}; fwrite(hdr,4,4,f); fwrite(data.data(),1,data.size(),f); fclose(f); }
+            }
         }
+        call_idx++;
     }
 
     // the last node is the embedding tensor
@@ -2539,6 +2548,13 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
 }
 
 bool vision_image_encode(struct vision_ctx * ctx, const int n_threads, vision_image_f32 * img, float * vec) {
+    if (const char * dbg = getenv("OMNI_VISION_DEBUG")) {
+        static int dump_idx = 0;
+        char path[512]; snprintf(path, sizeof(path), "%s.pix%d.bin", dbg, dump_idx++);
+        FILE * f = fopen(path, "wb");
+        if (f) { int32_t hdr[2] = { img->nx, img->ny }; fwrite(hdr, 4, 2, f); fwrite(img->buf.data(), 4, img->buf.size(), f); fclose(f); }
+        LOG_INF("vision-debug: dumped preprocessed image %dx%d (%zu floats) to %s\n", img->nx, img->ny, img->buf.size(), path);
+    }
     vision_image_f32_batch imgs;
     vision_image_f32_ptr img_copy(vision_image_f32_init());
     *img_copy = *img;

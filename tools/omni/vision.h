@@ -98,6 +98,8 @@ bool vision_image_load_from_bytes(const unsigned char * bytes, size_t bytes_leng
 
 // vision query
 int vision_n_output_tokens(const struct vision_ctx * ctx);
+// number of LLM tokens produced for a specific preprocessed image (MiniCPM-o 4.6/o5: depends on image size)
+int vision_n_output_tokens_for_image(const struct vision_ctx * ctx, const struct vision_image_f32 * img);
 int vision_n_mmproj_embd(const struct vision_ctx * ctx);
 
 // vision preprocess
