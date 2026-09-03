@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "tts-condition-graph.h"
+#include "llm-exec.h"
 
 #include <thread>
 #include <memory>
@@ -493,7 +494,20 @@ struct omni_context {
     std::condition_variable speek_cv;
     bool last_speek_done_flag = false;
     std::mutex buffer_mutex;
+
+    // ---- shared batched LLM executor (stage 2). When set, ctx_llama points at the executor's
+    // shared context (used only for vocab/tokenize) and every LLM forward goes through llm_exec
+    // on sequence llm_seq; last_logits holds the logits of the most recent forward for sampling.
+    omni_llm_exec * llm_exec = nullptr;
+    bool owns_llm_exec = false;
+    int  llm_seq = 0;
+    std::vector<float> last_logits;
 };
+
+// Switch a root context (and all sessions cloned from it afterwards) to the shared batched
+// LLM executor: one llama_context with n_seq sequences, one worker thread that merges the
+// forwards of concurrent sessions into a single llama_decode.
+bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq);
 
 //
 // omni embed

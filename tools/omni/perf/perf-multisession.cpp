@@ -55,7 +55,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; std::vector<std::string> t2w_devs{"gpu:0"};
+    std::string out_csv; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -67,6 +67,7 @@ int main(int argc, char ** argv) {
         else if (a == "--csv" && i + 1 < argc) out_csv = argv[++i];
         else if (a == "--ctk" && i + 1 < argc) { std::string t = argv[++i]; ctk = t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; }
         else if (a == "--ub" && i + 1 < argc) n_ubatch = atoi(argv[++i]);
+        else if (a == "--exec") use_exec = true;
         else if (a == "--t2w-devices" && i + 1 < argc) { t2w_devs.clear(); std::string l = argv[++i]; size_t p = 0; while (p <= l.size()) { size_t q = l.find(',', p); if (q == std::string::npos) q = l.size(); if (q > p) t2w_devs.push_back(l.substr(p, q - p)); p = q + 1; } }
         else { fprintf(stderr, "usage: %s -m llm.gguf --test <prefix> <n> [-n sessions] [--interval ms] [-c n_ctx] [--no-tts] [--csv out]\n", argv[0]); return 1; }
     }
@@ -94,6 +95,7 @@ int main(int argc, char ** argv) {
                                     nullptr, nullptr, "./tools/omni/output/ms0");
     if (!root) { fprintf(stderr, "omni_init failed\n"); return 1; }
     root->clean_kvcache = true;
+    if (use_exec && !omni_enable_llm_exec(root, n_sessions, n_ctx)) { fprintf(stderr, "omni_enable_llm_exec failed\n"); return 1; }
     const size_t mem_root = gpu_used_mib();
 
     std::vector<omni_context *> sess{root};
@@ -193,6 +195,10 @@ int main(int argc, char ** argv) {
             fclose(f);
         }
     }
+    if (root->llm_exec) printf("[exec] batches %llu steps %llu tokens %llu | avg steps/batch %.2f max %llu | decode wall %.1f s (avg %.1f ms/batch)\n",
+        (unsigned long long) root->llm_exec->n_batches, (unsigned long long) root->llm_exec->n_steps, (unsigned long long) root->llm_exec->n_tokens_total,
+        root->llm_exec->n_batches ? (double) root->llm_exec->n_steps / root->llm_exec->n_batches : 0.0, (unsigned long long) root->llm_exec->max_steps_in_batch,
+        root->llm_exec->decode_ms_total / 1000.0, root->llm_exec->n_batches ? root->llm_exec->decode_ms_total / root->llm_exec->n_batches : 0.0);
     for (int i = n_sessions - 1; i >= 1; --i) omni_free(sess[i]);
     omni_free(root);
     return 0;

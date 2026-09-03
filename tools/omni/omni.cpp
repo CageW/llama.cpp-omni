@@ -342,6 +342,42 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
 //
 // omni mtmd embed
 //
+// ---- shared batched executor plumbing ----
+static inline bool omni_use_exec(const omni_context * c) { return c && c->llm_exec != nullptr; }
+static inline llama_memory_t omni_llm_mem(omni_context * c) { return llama_get_memory(c->llm_exec ? c->llm_exec->ctx : c->ctx_llama); }
+static bool omni_exec_embd(omni_context * c, const float * embd, int n, int * n_past, float * hidden_out) {
+    omni_llm_step_result r = c->llm_exec->run(c->llm_seq, *n_past, embd, n, hidden_out != nullptr);
+    if (!r.ok) return false;
+    const int n_embd = c->llm_exec->n_embd, n_vocab = c->llm_exec->n_vocab;
+    const int n_out = hidden_out ? n : 1;
+    c->last_logits.assign(r.logits.begin() + (size_t)(n_out - 1) * n_vocab, r.logits.begin() + (size_t) n_out * n_vocab);
+    if (hidden_out) memcpy(hidden_out, r.hidden.data(), (size_t) n * n_embd * sizeof(float));
+    *n_past += n;
+    return true;
+}
+static bool omni_exec_tokens(omni_context * c, const llama_token * toks, int n, int * n_past, float * hidden_out) {
+    const int n_embd = c->llm_exec->n_embd;
+    std::vector<float> embd((size_t) n * n_embd);
+    for (int i = 0; i < n; i++) {
+        const float * row = c->llm_exec->tok_emb_row(toks[i]);
+        if (!row) { LOG_ERR("omni_exec_tokens: token embedding table not loaded\n"); return false; }
+        memcpy(embd.data() + (size_t) i * n_embd, row, n_embd * sizeof(float));
+    }
+    return omni_exec_embd(c, embd.data(), n, n_past, hidden_out);
+}
+static float * omni_last_logits(omni_context * c) {
+    return omni_use_exec(c) ? c->last_logits.data() : llama_get_logits_ith(c->ctx_llama, -1);
+}
+static llama_token omni_sample(common_sampler * smpl, omni_context * c) {
+    if (!omni_use_exec(c)) return common_sampler_sample(smpl, c->ctx_llama, -1);
+    const int n_vocab = c->llm_exec->n_vocab;
+    std::vector<llama_token_data> cur((size_t) n_vocab);
+    for (int i = 0; i < n_vocab; i++) cur[i] = llama_token_data{ i, c->last_logits[i], 0.0f };
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(common_sampler_get(smpl), &cur_p);
+    return cur_p.data[cur_p.selected].id;
+}
+
 // Build a position array for a batch of n tokens starting at pos0.
 // For M-RoPE models (MiniCPM-o5 / Qwen3.5) llama.cpp expects 4 sections per token
 // ([text, T, H, W]); we broadcast the 1-D position to all sections (text-style positions).
@@ -382,6 +418,7 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
 
 bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, float* embed, int n_pos, int n_batch, int*n_past) {
     kv_cache_slide_window(ctx_omni, params, n_pos);
+    if (omni_use_exec(ctx_omni)) return omni_exec_embd(ctx_omni, embed, n_pos, n_past, nullptr);
     
     int n_embd  = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
     for (int i = 0; i < n_pos; i += n_batch) {
@@ -418,6 +455,10 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
 
     // 在函数内部分配空间
     hidden_states = (float *)malloc(n_pos * n_embd * sizeof(float));
+    if (omni_use_exec(ctx_omni) && hidden_states) {
+        if (!omni_exec_embd(ctx_omni, embed, n_pos, n_past, hidden_states)) { free(hidden_states); hidden_states = nullptr; return false; }
+        return true;
+    }
     if (hidden_states == nullptr) {
         LOG_ERR("%s : failed to allocate memory for hidden_states\n", __func__);
         return false;
@@ -1048,10 +1089,10 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 print_with_timestamp("⚠️ slide skipped (rounds<2): nothing to discard (n_past=%d, target_keep=%d)\n",
                                      ctx_omni->n_past, target_keep_tokens);
             } else {
-                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                llama_memory_t mem = omni_llm_mem(ctx_omni);
                 if (mem) {
-                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
-                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
+                    llama_memory_seq_rm(mem, ctx_omni->llm_seq, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, ctx_omni->llm_seq, keep_from, ctx_omni->n_past, -n_discard);
                 }
                 ctx_omni->n_past -= n_discard;
                 // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
@@ -1086,10 +1127,10 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 print_with_timestamp("⚠️ slide: nothing to discard (keep_from=%d <= n_keep=%d)\n",
                                      keep_from, ctx_omni->n_keep);
             } else {
-                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                llama_memory_t mem = omni_llm_mem(ctx_omni);
                 if (mem) {
-                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
-                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
+                    llama_memory_seq_rm(mem, ctx_omni->llm_seq, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, ctx_omni->llm_seq, keep_from, ctx_omni->n_past, -n_discard);
                 }
                 ctx_omni->n_past -= n_discard;
 
@@ -1185,11 +1226,11 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
         ctx_omni->round_start_positions = new_rounds;
     }
     
-    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    llama_memory_t mem = omni_llm_mem(ctx_omni);
     if (mem) {
-        bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, delete_end_pos);
+        bool rm_ok = llama_memory_seq_rm(mem, ctx_omni->llm_seq, ctx_omni->n_keep, delete_end_pos);
         (void)rm_ok;
-        llama_memory_seq_add(mem, 0, delete_end_pos, ctx_omni->n_past, -n_discard);
+        llama_memory_seq_add(mem, ctx_omni->llm_seq, delete_end_pos, ctx_omni->n_past, -n_discard);
     }
     
     int old_n_past = ctx_omni->n_past;
@@ -1200,6 +1241,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
 static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
     int N = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, N);
+    if (omni_use_exec(ctx_omni)) return N == 0 ? true : omni_exec_tokens(ctx_omni, tokens.data(), N, n_past, nullptr);
 
     for (int i = 0; i < N; i += n_batch) {
         int n_eval = (int) tokens.size() - i;
@@ -1249,6 +1291,10 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
 
     // 在函数内部分配空间
     hidden_states = (float *)malloc(N * n_embd * sizeof(float));
+    if (omni_use_exec(ctx_omni) && hidden_states) {
+        if (!omni_exec_tokens(ctx_omni, tokens.data(), N, n_past, hidden_states)) { free(hidden_states); hidden_states = nullptr; return false; }
+        return true;
+    }
     if (hidden_states == nullptr) {
         LOG_ERR("%s : failed to allocate memory for hidden_states\n", __func__);
         return false;
@@ -1325,7 +1371,7 @@ static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_param
 }
 
 static const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = omni_sample(smpl, ctx_omni);
     common_sampler_accept(smpl, id, true);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
@@ -1338,7 +1384,7 @@ static const char * sample(struct common_sampler * smpl, struct omni_context * c
 }
 
 static const char * sample_with_hidden(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = omni_sample(smpl, ctx_omni);
     common_sampler_accept(smpl, id, true);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
@@ -1359,7 +1405,7 @@ static const char * llama_loop(struct omni_context * ctx_omni, common_params *pa
 // 🔧 [双工模式] 支持 listen_prob_scale 参数，增加 <|listen|> 的采样概率
 // 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
 static const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states, llama_token & token_id) {
-    float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    float * logits = omni_last_logits(ctx_omni);
     
     // 🔧 [双工模式] 在采样前调整 logits
     if (ctx_omni->duplex_mode) {
@@ -1412,7 +1458,7 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
         }
     }
     
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = omni_sample(smpl, ctx_omni);
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
     static std::string ret;
@@ -3605,14 +3651,14 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
         return false;
     }
     
-    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    llama_memory_t mem = omni_llm_mem(ctx_omni);
     if (!mem) {
         print_with_timestamp("[SW] drop_tokens: failed to get llama memory\n");
         return false;
     }
     
     // 1) 删除 [preserve, preserve + length) 区间的 KV
-    bool success = llama_memory_seq_rm(mem, 0, preserve, preserve + length);
+    bool success = llama_memory_seq_rm(mem, ctx_omni->llm_seq, preserve, preserve + length);
     
     if (success) {
         // 2) 把后段 [preserve + length, cache_len_before) 的 position
@@ -3620,7 +3666,7 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
         //    "inconsistent sequence positions" 错误。
         //    与 kv_cache_slide_window 的处理方式一致。
         if (cache_len_before > preserve + length) {
-            llama_memory_seq_add(mem, 0, preserve + length, cache_len_before, -length);
+            llama_memory_seq_add(mem, ctx_omni->llm_seq, preserve + length, cache_len_before, -length);
         }
 
         ctx_omni->n_past = cache_len_before - length;
@@ -4216,6 +4262,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 例如：tts_ctx_params.n_ctx = std::min(params->n_ctx, 2048); // 限制 TTS 上下文大小
         tts_ctx_params.n_ctx = params->n_ctx;  // 暂时使用相同的 n_ctx，后续可以根据需要调整
         if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tts_ctx_params.n_ctx = v; }
+        if (const char * e = getenv("OMNI_TTS_UBATCH")) { int v = atoi(e); if (v > 0) { tts_ctx_params.n_ubatch = v; tts_ctx_params.n_batch = std::max<uint32_t>(v, tts_ctx_params.n_batch > 512 ? 512 : tts_ctx_params.n_batch); } }
         
         llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
         if (ctx_tts_llama == NULL) {
@@ -4918,7 +4965,12 @@ void omni_free(struct omni_context * ctx_omni) {
     
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
     // 如果是外部传入的模型（模型复用），则不释放
-    if (ctx_omni->owns_model) {
+    if (ctx_omni->llm_exec) {
+        ctx_omni->llm_exec->free_seq(ctx_omni->llm_seq);
+        if (ctx_omni->owns_llm_exec) { delete ctx_omni->llm_exec; }   // frees the shared context
+        ctx_omni->llm_exec = nullptr;
+        if (ctx_omni->owns_model) { llama_free_model(ctx_omni->model); }
+    } else if (ctx_omni->owns_model) {
         llama_free(ctx_omni->ctx_llama);
         llama_free_model(ctx_omni->model);
     }
@@ -4960,6 +5012,22 @@ std::unique_ptr<omni::flow::Token2WavSession> omni_load_token2wav_owner(const st
     return s;
 }
 
+bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq) {
+    if (!root || !root->model || root->llm_exec) return false;
+    llama_context_params cp = common_context_params_to_llama(*root->params);
+    auto ex = omni_llm_exec_create(root->model, cp, n_seq, n_ctx_per_seq);
+    if (!ex) { LOG_ERR("omni_enable_llm_exec: failed to create shared context\n"); return false; }
+    if (!ex->load_tok_emb(root->params->model.path)) { LOG_ERR("omni_enable_llm_exec: failed to load token_embd\n"); return false; }
+    if (root->owns_model && root->ctx_llama) llama_free(root->ctx_llama);
+    root->llm_exec = ex.release();
+    root->owns_llm_exec = true;
+    root->llm_seq = root->llm_exec->alloc_seq();
+    root->ctx_llama = root->llm_exec->ctx;
+    print_with_timestamp("=== omni_enable_llm_exec: shared LLM context n_seq=%d n_ctx/seq=%d (tok_emb %.1f MB)\n",
+                         n_seq, n_ctx_per_seq, root->llm_exec->tok_emb.size() * 4.0 / 1e6);
+    return true;
+}
+
 struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
                                          const std::string & base_output_dir,
                                          omni::flow::Token2WavSession * t2w_weight_owner) {
@@ -4997,11 +5065,18 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
     c->listen_prob_scale = parent->listen_prob_scale; c->force_listen_count = parent->force_listen_count;
     c->length_penalty = parent->length_penalty;
 
-    // ---- LLM: shared model, private context ----
+    // ---- LLM: shared model; private context, or a sequence in the shared batched executor ----
     c->model = parent->model;
-    {
+    if (parent->llm_exec) {
+        c->llm_exec = parent->llm_exec;
+        c->llm_seq  = parent->llm_exec->alloc_seq();
+        if (c->llm_seq < 0) { LOG_ERR("omni_session_clone: no free sequence in LLM executor\n"); delete c; return nullptr; }
+        c->ctx_llama = parent->llm_exec->ctx;   // vocab/tokenize only
+        c->ctx_sampler = common_sampler_init(c->model, params->sampling);
+    } else {
         llama_context_params cp = common_context_params_to_llama(*params);
         cp.n_ctx = params->n_ctx;
+        if (const char * e = getenv("OMNI_LLM_UBATCH")) { int v = atoi(e); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(v, 512); } }
         c->ctx_llama = llama_new_context_with_model(c->model, cp);
         if (!c->ctx_llama) { LOG_ERR("omni_session_clone: llama_new_context failed\n"); delete c; return nullptr; }
         c->ctx_sampler = common_sampler_init(c->model, params->sampling);
@@ -5015,6 +5090,7 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
         llama_context_params tp = common_context_params_to_llama(*params);
         tp.n_ctx = params->n_ctx;
         if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tp.n_ctx = v; }
+        if (const char * e = getenv("OMNI_TTS_UBATCH")) { int v = atoi(e); if (v > 0) { tp.n_ubatch = v; tp.n_batch = std::max<uint32_t>(v, tp.n_batch > 512 ? 512 : tp.n_batch); } }
         c->ctx_tts_llama = llama_new_context_with_model(c->model_tts, tp);
         if (!c->ctx_tts_llama) { LOG_ERR("omni_session_clone: TTS llama_new_context failed\n"); omni_free(c); return nullptr; }
         common_params_sampling ts = params->sampling;
@@ -5100,7 +5176,8 @@ void omni_set_language(struct omni_context * ctx_omni, const std::string & lang)
 
 static void process_audio(struct omni_context * ctx_omni, struct omni_embed * embeds, common_params * params, bool save_spk_emb=false) {
     LOG_INF("%s: audio token past: %d\n", __func__, ctx_omni->n_past);
-    omni_eval_embed(ctx_omni->ctx_llama, embeds, params->n_batch, &ctx_omni->n_past);
+    if (omni_use_exec(ctx_omni)) omni_exec_embd(ctx_omni, embeds->embed, embeds->n_pos, &ctx_omni->n_past, nullptr);
+    else omni_eval_embed(ctx_omni->ctx_llama, embeds, params->n_batch, &ctx_omni->n_past);
     LOG_INF("%s: audio token past after eval: %d\n", __func__, ctx_omni->n_past);
 }
 
@@ -11878,10 +11955,10 @@ bool clean_kvcache(struct omni_context * ctx_omni) {
                              ctx_omni->n_keep, ctx_omni->n_past, ctx_omni->n_keep);
         
         // 获取 memory 对象并清理 KV cache
-        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+        llama_memory_t mem = omni_llm_mem(ctx_omni);
         if (mem) {
             // 删除 [n_keep, n_past) 范围的所有 token，保留 system prompt 等
-            bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, ctx_omni->n_past);
+            bool rm_ok = llama_memory_seq_rm(mem, ctx_omni->llm_seq, ctx_omni->n_keep, ctx_omni->n_past);
             if (!rm_ok) {
                 print_with_timestamp("🧹 clean_kvcache: llama_memory_seq_rm 失败\n");
             } else {

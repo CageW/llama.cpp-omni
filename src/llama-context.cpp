@@ -1643,7 +1643,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_embd  = hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // omni: with explicit per-token output flags (batch.logits) and no pooling, embeddings are extracted
+    // only for the flagged tokens (like logits) instead of forcing every token to be an output. This keeps
+    // lm_head + host copies proportional to the requested outputs when several sessions are batched.
+    const bool output_all   = cparams.embeddings && (batch_inp.logits == nullptr || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE);
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -1712,6 +1715,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
+        // omni: when the caller marks outputs explicitly (batch.logits != NULL) with pooling NONE,
+        // the per-sequence split that `embd_all` forces is not needed; keep cross-sequence ubatches
+        // so concurrent sessions are actually batched (hybrid/recurrent memory otherwise splits by seq).
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;

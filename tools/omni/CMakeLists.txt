@@ -11,6 +11,8 @@ endif()
 
 add_library(omni
             omni.cpp
+            llm-exec.cpp
+            llm-exec.h
             omni.h
             tts-condition-graph.cpp
             tts-condition-graph.h
