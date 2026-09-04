@@ -56,7 +56,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv, start_file; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false; std::vector<std::string> enc_devs;
+    std::string out_csv, start_file; int start_delay_ms = 0; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false; std::vector<std::string> enc_devs;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -71,6 +71,7 @@ int main(int argc, char ** argv) {
         else if (a == "--exec") use_exec = true;
         else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (a == "--start-file" && i + 1 < argc) start_file = argv[++i];
+        else if (a == "--start-delay-ms" && i + 1 < argc) start_delay_ms = atoi(argv[++i]);
         else if (a == "--enc-devices" && i + 1 < argc) { std::string l = argv[++i]; size_t q0 = 0; while (q0 <= l.size()) { size_t q = l.find(',', q0); if (q == std::string::npos) q = l.size(); if (q > q0) enc_devs.push_back(l.substr(q0, q - q0)); q0 = q + 1; } }
         else if (a == "--t2w-devices" && i + 1 < argc) { t2w_devs.clear(); std::string l = argv[++i]; size_t p = 0; while (p <= l.size()) { size_t q = l.find(',', p); if (q == std::string::npos) q = l.size(); if (q > p) t2w_devs.push_back(l.substr(p, q - p)); p = q + 1; } }
         else { fprintf(stderr, "usage: %s -m llm.gguf --test <prefix> <n> [-n sessions] [--interval ms] [-c n_ctx] [--no-tts] [--csv out]\n", argv[0]); return 1; }
@@ -160,6 +161,8 @@ int main(int argc, char ** argv) {
         while (!file_exists(start_file)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         printf("[go]\n"); fflush(stdout);
     }
+    // --start-delay-ms: phase-offset this process's frame ticks relative to the others (shared-GPU burst experiments)
+    if (start_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(start_delay_ms));
 
     auto t_start = std::chrono::high_resolution_clock::now();
     std::vector<std::thread> producers, consumers;
