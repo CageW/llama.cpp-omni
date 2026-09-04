@@ -5097,11 +5097,12 @@ bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_s
             root->llm_execs.push_back(ex.release());
         }
         root->llm_exec_count = root->llm_execs.size();
+        if (root->owns_model && root->ctx_llama) llama_free(root->ctx_llama);   // drop the private per-session context
         root->llm_exec = root->llm_execs[0];
         root->owns_llm_exec = true;
         root->llm_seq = root->llm_execs[0]->alloc_seq();
+        root->llm_exec_rr = 1;   // root already occupies a seq on worker 0: first clone goes to worker 1 so n_seq/N each fits exactly
         root->ctx_llama = root->llm_execs[0]->ctx;
-        if (root->owns_model && root->ctx_llama) {/* ctx_llama now points at executor context; don't free model here */}
         print_with_timestamp("=== omni_enable_llm_exec: %d workers, %d seq each on %d GPUs (total %d seq)\n",
                              workers, per, workers, per * workers);
         return true;
@@ -5161,13 +5162,20 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
     if (parent->llm_exec) {
         // multi-worker: round-robin sessions over the per-GPU executors; single-worker falls back to [0]
         omni_llm_exec * ex = parent->llm_exec;
+        int seq = -1;
         if (parent->llm_exec_count > 1) {
-            int k = parent->llm_exec_rr++ % parent->llm_exec_count;
-            ex = parent->llm_execs[k];
+            // round-robin over workers; if the chosen one is full, take the first worker with a free sequence
+            const int k0 = parent->llm_exec_rr++ % parent->llm_exec_count;
+            for (int t = 0; t < parent->llm_exec_count && seq < 0; ++t) {
+                ex = parent->llm_execs[(k0 + t) % parent->llm_exec_count];
+                seq = ex->alloc_seq();
+            }
+        } else {
+            seq = ex->alloc_seq();
         }
         c->llm_exec = ex;
-        c->llm_seq  = ex->alloc_seq();
-        if (c->llm_seq < 0) { LOG_ERR("omni_session_clone: no free sequence in LLM executor\n"); delete c; return nullptr; }
+        c->llm_seq  = seq;
+        if (c->llm_seq < 0) { LOG_ERR("omni_session_clone: no free sequence in any LLM executor\n"); delete c; return nullptr; }
         c->ctx_llama = ex->ctx;   // vocab/tokenize only
         c->ctx_sampler = common_sampler_init(c->model, params->sampling);
     } else {
