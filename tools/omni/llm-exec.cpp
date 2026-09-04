@@ -295,11 +295,10 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     cp.n_batch    = std::max<uint32_t>(cp.n_batch, 4096);
     if (const char * u = getenv("OMNI_EXEC_UBATCH")) { int v = atoi(u); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(cp.n_batch, v); } }
     if (device && device[0]) {
-        // pin this executor to a single GPU (multi-worker layout)
-        ggml_backend_dev_t dev = ggml_backend_dev_by_name(device);
-        if (!dev) { LOG_ERR("omni_llm_exec_create: device %s not found\n", device); return nullptr; }
-        e->devices.push_back(dev);
-        cp.devices = e->devices.data();
+        // NOTE: a llama_context cannot be pinned to a GPU independently of its model: device placement is fixed
+        // at llama_model load (llama_model_params.devices), and every context shares the model's device set.
+        // A per-GPU executor therefore needs its own model copy (= the multi-process layout). Kept as a no-op.
+        LOG_WRN("omni_llm_exec_create: per-executor device '%s' ignored (context inherits the model's devices)\n", device);
     }
     e->ctx = llama_new_context_with_model(model, cp);
     if (!e->ctx) return nullptr;
