@@ -211,6 +211,7 @@ int main(int argc, char ** argv) {
         (unsigned long long) root->llm_exec->n_batches, (unsigned long long) root->llm_exec->n_steps, (unsigned long long) root->llm_exec->n_tokens_total,
         root->llm_exec->n_batches ? (double) root->llm_exec->n_steps / root->llm_exec->n_batches : 0.0, (unsigned long long) root->llm_exec->max_steps_in_batch,
         root->llm_exec->decode_ms_total / 1000.0, root->llm_exec->n_batches ? root->llm_exec->decode_ms_total / root->llm_exec->n_batches : 0.0);
+    if (root->llm_exec) printf("[exec] padding tokens %llu (%.1f%% of real)\n", (unsigned long long) root->llm_exec->n_pad_tokens, root->llm_exec->n_tokens_total ? 100.0 * root->llm_exec->n_pad_tokens / root->llm_exec->n_tokens_total : 0.0);
     if (root->llm_exec) printf("[exec] queue wait per step: avg %.1f ms, max %.1f ms\n", root->llm_exec->n_steps ? root->llm_exec->qwait_ms_total / root->llm_exec->n_steps : 0.0, root->llm_exec->qwait_ms_max);
     if (root->ctx_vision) { uint64_t c = 0, im = 0; vision_batcher_stats(root->ctx_vision, &c, &im); if (c) printf("[vision] batched calls %llu images %llu (avg %.2f/call)\n", (unsigned long long) c, (unsigned long long) im, (double) im / c); }
     if (root->llm_exec) { printf("[exec] step length histogram:"); for (auto & kv : root->llm_exec->step_len_hist) printf(" %d:%llu", kv.first, (unsigned long long) kv.second); printf("\n"); }

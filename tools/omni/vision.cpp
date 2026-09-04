@@ -16,6 +16,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -446,15 +447,20 @@ struct vision_graph {
         const int qw         = half_w / 2;
         const int n_ds2      = qh * qw;
 
+        // gather indices: 1-D for a single image, [n, batch] for a batched graph so that
+        // ggml_get_rows on the [n_embd, n_pos, batch] activations gathers per image
         auto add_i32_input = [&](const char * name, int n) {
-            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
+            ggml_tensor * t = batch_size > 1 ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n, batch_size)
+                                             : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
             ggml_set_name(t, name);
             ggml_set_input(t);
             return t;
         };
 
         // position indices for ViT learned positional embeddings
-        ggml_tensor * positions = add_i32_input("positions", n_pos);
+        ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pos);   // shared by all batch entries (broadcast add)
+        ggml_set_name(positions, "positions");
+        ggml_set_input(positions);
         ggml_tensor * learned_pos_embd = ggml_get_rows(ctx0, model.position_embeddings, positions);
 
         // ViT merger window reorder indices + block-diagonal mask
@@ -515,9 +521,9 @@ struct vision_graph {
                     Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                 }
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
-                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+                Qcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Qcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+                Kcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Kcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+                Vcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Vcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
@@ -579,9 +585,9 @@ struct vision_graph {
                 Vcur = ggml_add(ctx0, Vcur, model.vit_merger_attn_v_b);
             }
 
-            Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
-            Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+            Qcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Qcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+            Kcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Kcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+            Vcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Vcur, d_head, n_head, n_pos, batch_size) : ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
             cb(Qcur, "vit_merger_Qcur", -1);
             cb(Kcur, "vit_merger_Kcur", -1);
             cb(Vcur, "vit_merger_Vcur", -1);
@@ -653,9 +659,9 @@ struct vision_graph {
                         Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                     }
 
-                    Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos_ds);
-                    Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos_ds);
-                    Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos_ds);
+                    Qcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Qcur, d_head, n_head, n_pos_ds, batch_size) : ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos_ds);
+                    Kcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Kcur, d_head, n_head, n_pos_ds, batch_size) : ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos_ds);
+                    Vcur = batch_size > 1 ? ggml_reshape_4d(ctx0, Vcur, d_head, n_head, n_pos_ds, batch_size) : ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos_ds);
                     cb(Qcur, "Qcur", il);
                     cb(Kcur, "Kcur", il);
                     cb(Vcur, "Vcur", il);
@@ -2510,8 +2516,14 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
                         inv_window_idx[window_idx[i]] = i;
                     }
                 }
-                set_input_i32("vit_merger_window_idx",     window_idx);
-                set_input_i32("vit_merger_inv_window_idx", inv_window_idx);
+                // gather indices are [n, batch]: the per-image pattern repeated for every batch entry
+                auto set_idx_batched = [&](const char * name, const std::vector<int32_t> & v) {
+                    std::vector<int32_t> rep; rep.reserve(v.size() * batch_size);
+                    for (int bi = 0; bi < batch_size; bi++) rep.insert(rep.end(), v.begin(), v.end());
+                    set_input_i32(name, rep);
+                };
+                set_idx_batched("vit_merger_window_idx",     window_idx);
+                set_idx_batched("vit_merger_inv_window_idx", inv_window_idx);
 
                 std::vector<float> window_mask_data(n_pos * n_pos, std::numeric_limits<float>::lowest());
                 for (int wi = 0; wi < n_pos / 4; wi++) {
@@ -2537,10 +2549,10 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
                 auto vit_merger_ds_1 = make_ds_idx(0, 1, half_h, half_w, pos_w);
                 auto vit_merger_ds_2 = make_ds_idx(1, 0, half_h, half_w, pos_w);
                 auto vit_merger_ds_3 = make_ds_idx(1, 1, half_h, half_w, pos_w);
-                set_input_i32("vit_merger_ds_idx_0", vit_merger_ds_0);
-                set_input_i32("vit_merger_ds_idx_1", vit_merger_ds_1);
-                set_input_i32("vit_merger_ds_idx_2", vit_merger_ds_2);
-                set_input_i32("vit_merger_ds_idx_3", vit_merger_ds_3);
+                set_idx_batched("vit_merger_ds_idx_0", vit_merger_ds_0);
+                set_idx_batched("vit_merger_ds_idx_1", vit_merger_ds_1);
+                set_idx_batched("vit_merger_ds_idx_2", vit_merger_ds_2);
+                set_idx_batched("vit_merger_ds_idx_3", vit_merger_ds_3);
 
                 const int qh = half_h / 2;
                 const int qw = half_w / 2;
@@ -2548,10 +2560,10 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
                 auto merger_ds_1 = make_ds_idx(0, 1, qh, qw, half_w);
                 auto merger_ds_2 = make_ds_idx(1, 0, qh, qw, half_w);
                 auto merger_ds_3 = make_ds_idx(1, 1, qh, qw, half_w);
-                set_input_i32("merger_ds_idx_0", merger_ds_0);
-                set_input_i32("merger_ds_idx_1", merger_ds_1);
-                set_input_i32("merger_ds_idx_2", merger_ds_2);
-                set_input_i32("merger_ds_idx_3", merger_ds_3);
+                set_idx_batched("merger_ds_idx_0", merger_ds_0);
+                set_idx_batched("merger_ds_idx_1", merger_ds_1);
+                set_idx_batched("merger_ds_idx_2", merger_ds_2);
+                set_idx_batched("merger_ds_idx_3", merger_ds_3);
             } break;
         default:
             GGML_ABORT("Unknown projector type");
@@ -2642,8 +2654,24 @@ struct vision_batcher {
             const int n_tok = vision_n_output_tokens_for_image(ctx, imgs.entries[0].get());
             const int n_embd = vision_n_mmproj_embd(ctx);
             std::vector<float> out((size_t) n_tok * n_embd * b.size());
+            const auto t_b0 = std::chrono::steady_clock::now();
             const bool ok = vision_image_batch_encode(ctx, b[0]->n_threads, &imgs, out.data());
+            const double ms_b = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_b0).count();
+            LOG_INF("[vision-batch] n=%zu wall=%.1f ms (%.1f ms/img)\n", b.size(), ms_b, ms_b / b.size());
             n_calls++; n_imgs += b.size();
+            // OMNI_VISION_BATCH_VERIFY=1: re-encode the last image of the batch alone and report the cosine
+            // similarity against its batched result (checks the batched o5 graph against the single-image path)
+            static const bool verify = getenv("OMNI_VISION_BATCH_VERIFY") != nullptr;
+            if (ok && verify && b.size() > 1) {
+                vision_image_f32_batch one; vision_image_f32_ptr c(vision_image_f32_init()); *c = *b.back()->img; one.entries.push_back(std::move(c));
+                std::vector<float> ref((size_t) n_tok * n_embd);
+                if (vision_image_batch_encode(ctx, b[0]->n_threads, &one, ref.data())) {
+                    const float * bb = out.data() + (b.size() - 1) * (size_t) n_tok * n_embd;
+                    double dot = 0, na = 0, nb = 0, maxd = 0;
+                    for (size_t i = 0; i < ref.size(); i++) { dot += (double) bb[i] * ref[i]; na += (double) bb[i] * bb[i]; nb += (double) ref[i] * ref[i]; maxd = std::max(maxd, (double) fabs(bb[i] - ref[i])); }
+                    LOG_INF("[vision-verify] batch=%zu cos=%.6f max_abs_diff=%.4g\n", b.size(), dot / (sqrt(na) * sqrt(nb) + 1e-12), maxd);
+                }
+            }
             for (size_t i = 0; i < b.size(); i++) {
                 if (ok) memcpy(b[i]->vec, out.data() + i * (size_t) n_tok * n_embd, (size_t) n_tok * n_embd * sizeof(float));
                 b[i]->done.set_value(ok);
@@ -2658,8 +2686,6 @@ static vision_batcher * vision_get_batcher(vision_ctx * ctx) {
     auto it = all.find(owner);
     if (it == all.end()) {
         auto vb = std::make_unique<vision_batcher>(); vb->ctx = owner;
-        // MiniCPM-o 4.6/o5 ViT graph (build_minicpm_o_4_6) has no batch dimension yet: encode one image per call
-        if (owner->model.model_type == MiniCPM_o_4_6) vb->max_batch = 1;
         if (const char * e = getenv("OMNI_VISION_BATCH_WINDOW_US")) vb->window_us = atoi(e);
         if (const char * e = getenv("OMNI_VISION_BATCH_MAX")) vb->max_batch = atoi(e);
         vb->th = std::thread([p = vb.get()]{ p->loop(); });

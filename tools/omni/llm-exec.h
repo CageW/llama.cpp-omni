@@ -51,7 +51,7 @@ struct omni_llm_exec {
     void free_seq(int seq);
 
     // stats
-    uint64_t n_batches = 0, n_steps = 0, n_tokens_total = 0;
+    uint64_t n_batches = 0, n_steps = 0, n_tokens_total = 0, n_pad_tokens = 0;
     uint64_t max_steps_in_batch = 0;
     double   decode_ms_total = 0;
     double   qwait_ms_total = 0, qwait_ms_max = 0;   // time steps spent waiting in the executor queue
