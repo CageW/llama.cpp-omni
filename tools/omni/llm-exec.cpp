@@ -37,14 +37,31 @@ struct omni_llm_exec::impl {
                     bool any_long = false, any_short = false;
                     for (auto * s : queue) { (s->n > 8 ? any_long : any_short) = true; }
                     static const int prefill_window_us = getenv("OMNI_EXEC_PREFILL_WINDOW_US") ? atoi(getenv("OMNI_EXEC_PREFILL_WINDOW_US")) : 0;
-                    const int w = (any_long && !any_short && prefill_window_us > window_us_) ? prefill_window_us : window_us_;
-                    if (w > 0) {
-                        // wait until a short step arrives or the window elapses
-                        cv.wait_for(lk, std::chrono::microseconds(w), [&]{
+                    // OMNI_EXEC_PREFILL_GATHER_US: when any prefill (long step) is pending, keep gathering for up to this
+                    // long and stop early only once OMNI_EXEC_PREFILL_TARGET (default n_seq) prefills are queued. Unlike
+                    // PREFILL_WINDOW_US, a pending decode step does NOT cut the wait short. Rationale: a 79-token prefill
+                    // costs ~77 ms alone but ~14 ms each when 24-32 are batched; under load there is always some decode
+                    // pending, so the window variant collapses to 3 ms and prefills go out 3-4 wide.
+                    static const int gather_us = getenv("OMNI_EXEC_PREFILL_GATHER_US") ? atoi(getenv("OMNI_EXEC_PREFILL_GATHER_US")) : 0;
+                    static const int gather_target = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
+                    if (gather_us > 0 && any_long) {
+                        const int target = gather_target > 0 ? gather_target : self->n_seq;
+                        cv.wait_for(lk, std::chrono::microseconds(gather_us), [&]{
                             if (!running) return true;
-                            for (auto * s : queue) if (s->n <= 8) return true;
-                            return false;
+                            int n_long = 0;
+                            for (auto * s : queue) n_long += (s->n > 8);
+                            return n_long >= target;
                         });
+                    } else {
+                        const int w = (any_long && !any_short && prefill_window_us > window_us_) ? prefill_window_us : window_us_;
+                        if (w > 0) {
+                            // wait until a short step arrives or the window elapses
+                            cv.wait_for(lk, std::chrono::microseconds(w), [&]{
+                                if (!running) return true;
+                                for (auto * s : queue) if (s->n <= 8) return true;
+                                return false;
+                            });
+                        }
                     }
                 }
                 // Scheduling policy (OMNI_EXEC_POLICY):
