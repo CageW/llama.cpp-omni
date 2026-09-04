@@ -21,6 +21,7 @@ struct omni_llm_exec::impl {
     omni_llm_exec * self = nullptr;
     std::mutex run_mtx;              // serializes llama_decode with memory ops on the shared ctx
     std::vector<bool> seq_used;
+    uint64_t forward_last = 0;       // last-read graph compute count of this executor's context (per executor)
 
     void loop() {
         std::vector<step *> batch;
@@ -176,7 +177,6 @@ struct omni_llm_exec::impl {
     int window_us_ = 3000;
 
     void run_batch(std::vector<step *> & batch) {
-        static uint64_t forward_last = 0;   // omni: last-read graph compute count (single-executor experiment)
         llama_context * ctx = self->ctx;
         const int n_embd = self->n_embd, n_vocab = self->n_vocab, npos = self->n_pos_per_embd;
         int n_real = 0; for (auto * s : batch) n_real += s->n;

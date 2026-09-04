@@ -4996,6 +4996,7 @@ void omni_free(struct omni_context * ctx_omni) {
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
     // 如果是外部传入的模型（模型复用），则不释放
     if (ctx_omni->llm_exec) {
+        ctx_omni->llm_exec->free_seq(ctx_omni->llm_seq);
         if (ctx_omni->owns_llm_exec) {
             if (ctx_omni->llm_exec_count > 1) {
                 for (auto * ex : ctx_omni->llm_execs) { if (ex) delete ex; }   // frees all worker contexts
