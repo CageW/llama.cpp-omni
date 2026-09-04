@@ -136,3 +136,33 @@ GGUF 在南京节点 `/data/wangkaiqi/o5gguf/`，原始日志 `/data/wangkaiqi/l
 按此外推 8 卡 H20：6 张 LLM 卡（每卡一个副本、16 session）+ 1 张编码器卡 + 1 张 TTS/Token2Wav 卡，约 96 个 omni session；若把每副本的 CPU 侧开销压下去让单副本到 24，则约 144。
 
 已验证无效的方向：executor 固定形状 padding + MoE decode 走 CUDA graph（MoE decode 耗时随 batch 内 token 数增长，1 token 4.7 ms、16 token 16.5 ms，padding 反而变慢）；decode 优先调度（prefill 排队 1 s 以上）。
+
+## 2026-09-04 晚：单进程 24 session 达标与 8 卡布局实测（新节点 10.20.20.10 / .6，8×H20，无其他租户）
+
+上一节「单进程上限 16 到 20、瓶颈是主机侧开销」的结论已被推翻。用 nsys 按第一个 decode kernel 切分加载期与稳态后，稳态 1 秒窗口里 GPU kernel 忙 71%，一次 forward 内部几乎全是 kernel 执行；之前 nvidia-smi 上的 20% 是占空比（每个 session 每秒只推一帧），不是 kernel 效率。CUDA graph、减少 memcpy、采样优化三条路都没有收益，已关闭。
+
+真正的浪费在合批宽度。24 个 session 每帧各一次 79 token 的 prefill，合成一批只要 8 ms 一个，单独跑要 77 ms 一个；此前平均每批只合到 3.1 个，prefill 占了运行时间的 31/36 秒。两个原因叠加：一是 executor 的合批窗口只等 3 ms；二是编码器与 LLM 同卡时抢算力，各 session 的编码完成时刻在一个 tick 内散开 275 到 483 ms，prefill 天然到不齐。「多等一会儿凑批」的所有参数都更差，因为 session 要等本帧 decode 完成才提交下一帧 prefill，而 decode 排在同一队列里被凑批等待挡住。
+
+修法两条，缺一不可：`OMNI_EXEC_POLICY=ripe`（decode 永不扣住；prefill 扣到凑齐 `OMNI_EXEC_PREFILL_TARGET` 个或最早的等了 `OMNI_EXEC_PREFILL_DEADLINE_US`=200 ms 才整批放行）；编码器搬离 LLM 卡（`Omni_BACKEND_DEVICE=CUDA1` 加 `--enc-devices` 副本，`OMNI_VISION_BATCH=1 OMNI_VISION_BATCH_MAX=4`）。搬离后编码完成散开只剩 88 ms，prefill 宽度到 24.0。
+
+单进程（1 张 LLM 卡）的 session 上限，均含 Q8_0 权重、F16 KV：
+
+| session | TTS | 编码器卡 | P50 / P95 (ms) | 超时帧 | 结论 |
+|---|---|---|---|---|---|
+| 20 | 有 | 3 | 732 / 898 | 2/720 | 达标，余量大 |
+| 24 | 有 | 3 | 856 / 1119 | 98/864 | 达标 |
+| 24 | 无 | 1 | 1048 / 1312 | 498/864 | 不达标：1 张编码器卡撑不住 24 |
+| 26 | 无 | 3 | 953 / 1349 | 299/936 | 边缘 |
+| 28 | 无 | 3 | 1104 / 2358 | 672/1008 | 不达标 |
+| 32 | 无 | 3 | 1879 / 5655 | 905/1152 | 不达标 |
+
+单进程上限是 24。再往上不是吞吐不够（executor 只忙 44%），是延迟链：24 宽的 prefill 批本身 230 ms，加 200 ms 凑批 deadline，加 4 次 decode 往返，单 session 的串行链已顶到 1 秒。同一张卡开 2 个 executor 更差（prefill 被拆进两个队列，宽度只有 8，P95 6.3 s）。
+
+多进程布局（每个 LLM 进程一张卡，共用编码器卡和 TTS/Token2Wav 卡，全部含 TTS）：
+
+| 布局 | 卡数 | session | 各进程 P95 (ms) | 超时帧 | 结论 |
+|---|---|---|---|---|---|
+| 2 LLM + 2 编码器 + 1 TTS | 5 | 2×24 = 48 | 1115 / 1500 | 203/1728 | 一个达标一个边缘：2 张编码器卡撑 48 偏紧 |
+| 3 LLM + 4 编码器 + 1 TTS | 8 | 3×24 = 72 | 1173 / 1106 / 1145 | 445/2592 | 边缘偏达标（P95 超 1 s 约 10%） |
+
+8 卡上 3×24 = 72 个 omni session 是目前实测到的最高点，比上一节按 16/进程外推的 96 低，因为每进程从 16 提到 24 后，共用的编码器卡成了新约束：经验值一张编码器卡稳撑 16 到 20 个 session。要再往上，下一个杠杆是编码器卡的效率（vision 合批目前只合到 3 到 4 张），而不是 LLM。
