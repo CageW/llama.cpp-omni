@@ -97,22 +97,21 @@ struct omni_llm_exec::impl {
     void run_batch(std::vector<step *> & batch) {
         llama_context * ctx = self->ctx;
         const int n_embd = self->n_embd, n_vocab = self->n_vocab, npos = self->n_pos_per_embd;
-        int n_real = 0, n_out_real = 0; for (auto * s : batch) { n_real += s->n; n_out_real += s->all_outputs ? s->n : 1; }
-        // Fixed-shape padding (OMNI_EXEC_PAD=<tok granularity>[,<out granularity>]): the ggml graph shape depends on
-        // the ubatch token count and on the number of output rows; every distinct shape forces a CUDA graph
-        // re-capture. Pad both up to a bucket with dummy tokens on a reserved sequence (id n_seq) that is
-        // cleared right after the forward, so consecutive batches of similar size hit the same captured graph.
-        static const int pad_tok = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
-        static const int pad_out = getenv("OMNI_EXEC_PAD") && strchr(getenv("OMNI_EXEC_PAD"), ',') ? atoi(strchr(getenv("OMNI_EXEC_PAD"), ',') + 1) : pad_tok;
-        int n_tok = n_real, n_out_pad_rows = 0;
-        if (pad_tok > 0) {
-            const int n_out_tgt = ((n_out_real + pad_out - 1) / pad_out) * pad_out;
-            n_out_pad_rows = n_out_tgt - n_out_real;
-            n_tok = ((n_real + pad_tok - 1) / pad_tok) * pad_tok;
-            while (n_tok - n_real < n_out_pad_rows) n_tok += pad_tok;   // need at least one dummy token per padded output row
-            if (n_tok > self->max_tokens) { n_tok = n_real; n_out_pad_rows = 0; }
+        int n_real = 0; for (auto * s : batch) n_real += s->n;
+        // Fixed-shape padding (OMNI_EXEC_PAD=<step granularity>): the hybrid memory splits a batch into ubatches with
+        // split_equal, which takes one token from every participating sequence per ubatch. So (a) the graph shape of a
+        // decode ubatch is set by the NUMBER OF SEQUENCES in it, and (b) dummy tokens stacked on ONE reserved sequence
+        // become their own extra ubatch (a second forward). Pad therefore with 1-token steps on distinct reserved
+        // sequences (ids n_seq .. n_seq+pad-1), bringing the step count up to a multiple of the granularity: the
+        // decode ubatch then always has the same n_seqs / n_outputs and the captured CUDA graph is reused.
+        static const int pad_steps = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
+        int n_dummy = 0;
+        if (pad_steps > 0) {
+            const int n_steps_tgt = ((int) batch.size() + pad_steps - 1) / pad_steps * pad_steps;
+            n_dummy = std::min(n_steps_tgt - (int) batch.size(), pad_steps);
+            if (n_real + n_dummy > self->max_tokens) n_dummy = 0;
         }
-        const int n_dummy = n_tok - n_real;
+        const int n_tok = n_real + n_dummy;
         // one contiguous embd buffer + pos (mrope: 4 sections, broadcast) + seq ids + output flags
         std::vector<float>        embd((size_t) n_tok * n_embd, 0.0f);
         std::vector<llama_pos>    pos((size_t) n_tok * npos);
@@ -130,10 +129,10 @@ struct omni_llm_exec::impl {
             }
             off += s->n;
         }
-        for (int j = 0; j < n_dummy; j++) {   // dummy tokens: reserved seq, positions 0.., first n_out_pad_rows produce (ignored) outputs
-            for (int k = 0; k < npos; k++) pos[(size_t) k * n_tok + off + j] = j;
-            seq_ids[off + j] = self->n_seq; seq_ptr[off + j] = &seq_ids[off + j];
-            out[off + j] = j < n_out_pad_rows ? 1 : 0;
+        for (int j = 0; j < n_dummy; j++) {   // dummy steps: one token each on reserved seqs n_seq+j at pos 0, output on (ignored)
+            for (int k = 0; k < npos; k++) pos[(size_t) k * n_tok + off + j] = 0;
+            seq_ids[off + j] = self->n_seq + j; seq_ptr[off + j] = &seq_ids[off + j];
+            out[off + j] = 1;
         }
         llama_batch b = {};
         b.n_tokens = n_tok; b.embd = embd.data(); b.pos = pos.data();
@@ -143,7 +142,7 @@ struct omni_llm_exec::impl {
         for (auto * s : batch) { double w = std::chrono::duration<double, std::milli>(t0 - s->t_enq).count(); qwait_sum += w; qwait_max = std::max(qwait_max, w); }
         self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
         const int rc = llama_decode(ctx, b);
-        if (n_dummy > 0) llama_memory_seq_rm(llama_get_memory(ctx), self->n_seq, -1, -1);
+        for (int j = 0; j < n_dummy; j++) llama_memory_seq_rm(llama_get_memory(ctx), self->n_seq + j, -1, -1);
         self->n_pad_tokens += n_dummy;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         self->decode_ms_total += ms;
@@ -241,8 +240,8 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
                                                     int n_seq, int n_ctx_per_seq) {
     auto e = std::make_unique<omni_llm_exec>();
     llama_context_params cp = base;
-    const bool pad = getenv("OMNI_EXEC_PAD") != nullptr;
-    cp.n_seq_max  = n_seq + (pad ? 1 : 0);          // +1: reserved sequence for fixed-shape padding tokens
+    const int pad = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
+    cp.n_seq_max  = n_seq + std::max(pad, 0);       // reserved sequences for fixed-shape padding steps
     cp.n_ctx      = (uint32_t) n_ctx_per_seq * cp.n_seq_max;   // n_ctx must be a multiple of n_seq_max
     cp.kv_unified = getenv("OMNI_EXEC_KV_UNIFIED") != nullptr;
     cp.embeddings = true;              // hidden states for TTS
