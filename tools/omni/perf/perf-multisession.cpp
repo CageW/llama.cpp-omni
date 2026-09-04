@@ -220,6 +220,21 @@ int main(int argc, char ** argv) {
     if (root->llm_exec) printf("[exec] queue wait per step: avg %.1f ms, max %.1f ms\n", root->llm_exec->n_steps ? root->llm_exec->qwait_ms_total / root->llm_exec->n_steps : 0.0, root->llm_exec->qwait_ms_max);
     if (root->ctx_vision) { uint64_t c = 0, im = 0; vision_batcher_stats(root->ctx_vision, &c, &im); if (c) printf("[vision] batched calls %llu images %llu (avg %.2f/call)\n", (unsigned long long) c, (unsigned long long) im, (double) im / c); }
     if (root->llm_exec) { printf("[exec] step length histogram:"); for (auto & kv : root->llm_exec->step_len_hist) printf(" %d:%llu", kv.first, (unsigned long long) kv.second); printf("\n"); }
+    if (root->llm_exec_count > 1) {
+        // multi-worker: per-worker batched-stats summary
+        for (int w = 0; w < root->llm_exec_count; ++w) {
+            omni_llm_exec * ex = root->llm_execs[w];
+            if (!ex) continue;
+            printf("[worker %d] batches %llu steps %llu tokens %llu forwards %llu | avg steps/batch %.2f | decode wall %.1f s (avg %.1f ms/batch %.1f ms/forward)\n",
+                w, (unsigned long long) ex->n_batches, (unsigned long long) ex->n_steps, (unsigned long long) ex->n_tokens_total,
+                (unsigned long long) ex->n_forward,
+                ex->n_batches ? (double) ex->n_steps / ex->n_batches : 0.0,
+                ex->decode_ms_total / 1000.0, ex->n_batches ? ex->decode_ms_total / ex->n_batches : 0.0,
+                ex->n_forward ? ex->decode_ms_total / ex->n_forward : 0.0);
+            printf("[worker %d] queue wait per step: avg %.1f ms, max %.1f ms\n", w,
+                ex->n_steps ? ex->qwait_ms_total / ex->n_steps : 0.0, ex->qwait_ms_max);
+        }
+    }
     for (int i = n_sessions - 1; i >= 1; --i) omni_free(sess[i]);
     omni_free(root);
     return 0;

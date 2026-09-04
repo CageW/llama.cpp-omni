@@ -267,7 +267,7 @@ omni_llm_exec::~omni_llm_exec() {
 }
 
 std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, const struct llama_context_params & base,
-                                                    int n_seq, int n_ctx_per_seq) {
+                                                    int n_seq, int n_ctx_per_seq, const char * device) {
     auto e = std::make_unique<omni_llm_exec>();
     llama_context_params cp = base;
     const int pad = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
@@ -277,6 +277,13 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     cp.embeddings = true;              // hidden states for TTS
     cp.n_batch    = std::max<uint32_t>(cp.n_batch, 4096);
     if (const char * u = getenv("OMNI_EXEC_UBATCH")) { int v = atoi(u); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(cp.n_batch, v); } }
+    if (device && device[0]) {
+        // pin this executor to a single GPU (multi-worker layout)
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(device);
+        if (!dev) { LOG_ERR("omni_llm_exec_create: device %s not found\n", device); return nullptr; }
+        e->devices.push_back(dev);
+        cp.devices = e->devices.data();
+    }
     e->ctx = llama_new_context_with_model(model, cp);
     if (!e->ctx) return nullptr;
     e->model = model; e->n_seq = n_seq;

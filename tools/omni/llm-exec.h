@@ -44,6 +44,7 @@ struct omni_llm_exec {
 
     // token -> input embedding (dequantized token_embd, host, shared by all sessions)
     std::vector<float> tok_emb;   // n_vocab * n_embd
+    std::vector<ggml_backend_dev_t> devices;   // GPU(s) pinned for this executor (kept alive; CP.devices points here)
     bool load_tok_emb(const std::string & llm_gguf_path);
     const float * tok_emb_row(int32_t tok) const { return tok_emb.empty() ? nullptr : tok_emb.data() + (size_t) tok * n_embd; }
 
@@ -65,5 +66,7 @@ struct omni_llm_exec {
 
 // Create the shared context on the model. n_ctx_per_seq * n_seq context, unified KV off,
 // embeddings on (hidden states are needed for TTS).
+// `device` (optional): name of a single GPU (e.g. "CUDA1") to pin this executor to; nullptr/empty uses the
+// default device list from `base`. Used for the multi-worker layout (one executor per GPU).
 std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, const struct llama_context_params & base,
-                                                    int n_seq, int n_ctx_per_seq);
+                                                    int n_seq, int n_ctx_per_seq, const char * device = nullptr);

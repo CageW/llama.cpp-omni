@@ -346,7 +346,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
 // steady host-side cost measurement (OMNI_PROF_STEADY=1): accumulate ms spent in sampling and in logits
 // copy-back per frame, printed at destruction. Cheap (two clock reads per call) and on by default OFF.
 static bool g_prof_steady = getenv("OMNI_PROF_STEADY") != nullptr;
-static std::atomic<double> g_prof_sample_ms{0}, g_prof_logits_ms{0};
+static std::atomic<long long> g_prof_sample_ms{0}, g_prof_logits_ms{0};   // 0.01 ms units
 static std::atomic<long long> g_prof_sample_n{0}, g_prof_logits_n{0};
 inline double omni_pw() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -360,7 +360,7 @@ static bool omni_exec_embd(omni_context * c, const float * embd, int n, int * n_
     double t0 = g_prof_steady ? omni_pw() : 0;
     c->last_logits.assign(r.logits.begin() + (size_t)(n_out - 1) * n_vocab, r.logits.begin() + (size_t) n_out * n_vocab);
     if (hidden_out) memcpy(hidden_out, r.hidden.data(), (size_t) n * n_embd * sizeof(float));
-    if (g_prof_steady) { g_prof_logits_ms += omni_pw() - t0; ++g_prof_logits_n; }
+    if (g_prof_steady) { g_prof_logits_ms += (long long)((omni_pw() - t0) * 100.0); ++g_prof_logits_n; }
     *n_past += n;
     return true;
 }
@@ -385,7 +385,7 @@ static llama_token omni_sample(common_sampler * smpl, omni_context * c) {
     for (int i = 0; i < n_vocab; i++) cur[i] = llama_token_data{ i, c->last_logits[i], 0.0f };
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
     llama_sampler_apply(common_sampler_get(smpl), &cur_p);
-    if (g_prof_steady) { g_prof_sample_ms += omni_pw() - t0; ++g_prof_sample_n; }
+    if (g_prof_steady) { g_prof_sample_ms += (long long)((omni_pw() - t0) * 100.0); ++g_prof_sample_n; }
     return cur_p.data[cur_p.selected].id;
 }
 
@@ -4881,10 +4881,10 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
 void omni_free(struct omni_context * ctx_omni) {
     if (g_prof_steady && ctx_omni->llm_exec) {
         fprintf(stderr, "[steady] sample: %llu calls %.1f ms total (%.2f ms/call) | logits-copy: %llu calls %.1f ms total (%.2f ms/call)\n",
-                (unsigned long long) g_prof_sample_n.load(), g_prof_sample_ms.load(),
-                g_prof_sample_n ? g_prof_sample_ms.load() / g_prof_sample_n.load() : 0.0,
-                (unsigned long long) g_prof_logits_n.load(), g_prof_logits_ms.load(),
-                g_prof_logits_n ? g_prof_logits_ms.load() / g_prof_logits_n.load() : 0.0);
+                (unsigned long long) g_prof_sample_n.load(), g_prof_sample_ms.load() / 100.0,
+                g_prof_sample_n ? g_prof_sample_ms.load() / 100.0 / g_prof_sample_n.load() : 0.0,
+                (unsigned long long) g_prof_logits_n.load(), g_prof_logits_ms.load() / 100.0,
+                g_prof_logits_n ? g_prof_logits_ms.load() / 100.0 / g_prof_logits_n.load() : 0.0);
     }
     // 高层 duplex session 必须在底层 duplex pipeline 之前结束：
     //   session_end 会尝试 drain 已 push 但未完成的 frame，
@@ -4996,8 +4996,14 @@ void omni_free(struct omni_context * ctx_omni) {
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
     // 如果是外部传入的模型（模型复用），则不释放
     if (ctx_omni->llm_exec) {
-        ctx_omni->llm_exec->free_seq(ctx_omni->llm_seq);
-        if (ctx_omni->owns_llm_exec) { delete ctx_omni->llm_exec; }   // frees the shared context
+        if (ctx_omni->owns_llm_exec) {
+            if (ctx_omni->llm_exec_count > 1) {
+                for (auto * ex : ctx_omni->llm_execs) { if (ex) delete ex; }   // frees all worker contexts
+                ctx_omni->llm_execs.clear();
+            } else {
+                delete ctx_omni->llm_exec;   // frees the shared context
+            }
+        }
         ctx_omni->llm_exec = nullptr;
         if (ctx_omni->owns_model) { llama_free_model(ctx_omni->model); }
     } else if (ctx_omni->owns_model) {
@@ -5065,6 +5071,40 @@ bool omni_add_encoder_devices(struct omni_context * root, const std::vector<std:
 bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq) {
     if (!root || !root->model || root->llm_exec) return false;
     llama_context_params cp = common_context_params_to_llama(*root->params);
+    // multi-worker: OMNI_EXEC_WORKERS=N creates N executors (one per GPU); each gets n_seq/N sequences.
+    // OMNI_EXEC_WORKER_DEVICES="CUDA0,CUDA1,..." pins each worker to a GPU (default CUDA0..CUDA{N-1}).
+    const int workers = getenv("OMNI_EXEC_WORKERS") ? std::max(1, atoi(getenv("OMNI_EXEC_WORKERS"))) : 1;
+    if (workers > 1) {
+        const char * devs = getenv("OMNI_EXEC_WORKER_DEVICES");
+        int per = std::max(1, n_seq / workers);
+        for (int w = 0; w < workers; ++w) {
+            char dname[32];
+            if (devs) {
+                // split the comma list; index w
+                const char * p = devs; int idx = 0;
+                while (p && idx < w) { p = strchr(p, ','); if (p) { ++p; } ++idx; }
+                const char * end = p ? strchr(p, ',') : nullptr;
+                size_t len = end ? (size_t)(end - p) : strlen(p ? p : "");
+                len = std::min(len, sizeof(dname) - 1);
+                memcpy(dname, p ? p : "", len); dname[len] = 0;
+            } else {
+                snprintf(dname, sizeof(dname), "CUDA%d", w);
+            }
+            auto ex = omni_llm_exec_create(root->model, cp, per, n_ctx_per_seq, dname);
+            if (!ex) { LOG_ERR("omni_enable_llm_exec: worker %d (%s) create failed\n", w, dname); return false; }
+            if (!ex->load_tok_emb(root->params->model.path)) { LOG_ERR("omni_enable_llm_exec: worker %d load_tok_emb failed\n", w); return false; }
+            root->llm_execs.push_back(ex.release());
+        }
+        root->llm_exec_count = root->llm_execs.size();
+        root->llm_exec = root->llm_execs[0];
+        root->owns_llm_exec = true;
+        root->llm_seq = root->llm_execs[0]->alloc_seq();
+        root->ctx_llama = root->llm_execs[0]->ctx;
+        if (root->owns_model && root->ctx_llama) {/* ctx_llama now points at executor context; don't free model here */}
+        print_with_timestamp("=== omni_enable_llm_exec: %d workers, %d seq each on %d GPUs (total %d seq)\n",
+                             workers, per, workers, per * workers);
+        return true;
+    }
     auto ex = omni_llm_exec_create(root->model, cp, n_seq, n_ctx_per_seq);
     if (!ex) { LOG_ERR("omni_enable_llm_exec: failed to create shared context\n"); return false; }
     if (!ex->load_tok_emb(root->params->model.path)) { LOG_ERR("omni_enable_llm_exec: failed to load token_embd\n"); return false; }
@@ -5118,10 +5158,16 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
     // ---- LLM: shared model; private context, or a sequence in the shared batched executor ----
     c->model = parent->model;
     if (parent->llm_exec) {
-        c->llm_exec = parent->llm_exec;
-        c->llm_seq  = parent->llm_exec->alloc_seq();
+        // multi-worker: round-robin sessions over the per-GPU executors; single-worker falls back to [0]
+        omni_llm_exec * ex = parent->llm_exec;
+        if (parent->llm_exec_count > 1) {
+            int k = parent->llm_exec_rr++ % parent->llm_exec_count;
+            ex = parent->llm_execs[k];
+        }
+        c->llm_exec = ex;
+        c->llm_seq  = ex->alloc_seq();
         if (c->llm_seq < 0) { LOG_ERR("omni_session_clone: no free sequence in LLM executor\n"); delete c; return nullptr; }
-        c->ctx_llama = parent->llm_exec->ctx;   // vocab/tokenize only
+        c->ctx_llama = ex->ctx;   // vocab/tokenize only
         c->ctx_sampler = common_sampler_init(c->model, params->sampling);
     } else {
         llama_context_params cp = common_context_params_to_llama(*params);

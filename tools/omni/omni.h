@@ -502,9 +502,13 @@ struct omni_context {
     std::vector<struct vision_ctx *>   vision_owners;    // [0] == ctx_vision
     std::vector<struct audition_ctx *> audition_owners;  // [0] == ctx_audio
     int encoder_rr = 0;
-    omni_llm_exec * llm_exec = nullptr;
+    omni_llm_exec * llm_exec = nullptr;         // single-worker execution: the one executor (root only)
     bool owns_llm_exec = false;
-    int  llm_seq = 0;
+    int  llm_seq = 0;                            // this session's sequence id in its executor
+    // ---- multi-worker (single process, one executor per GPU; OMNI_EXEC_WORKERS=N) ----
+    std::vector<omni_llm_exec *> llm_execs;      // root only; one per worker
+    int llm_exec_count = 0;
+    int llm_exec_rr = 0;                          // round-robin index for session -> worker assignment
     std::vector<float> last_logits;
 };
 
