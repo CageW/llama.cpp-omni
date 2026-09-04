@@ -343,6 +343,13 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
 // omni mtmd embed
 //
 // ---- shared batched executor plumbing ----
+// steady host-side cost measurement (OMNI_PROF_STEADY=1): accumulate ms spent in sampling and in logits
+// copy-back per frame, printed at destruction. Cheap (two clock reads per call) and on by default OFF.
+static bool g_prof_steady = getenv("OMNI_PROF_STEADY") != nullptr;
+static std::atomic<double> g_prof_sample_ms{0}, g_prof_logits_ms{0};
+static std::atomic<long long> g_prof_sample_n{0}, g_prof_logits_n{0};
+inline double omni_pw() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
 static inline bool omni_use_exec(const omni_context * c) { return c && c->llm_exec != nullptr; }
 static inline llama_memory_t omni_llm_mem(omni_context * c) { return llama_get_memory(c->llm_exec ? c->llm_exec->ctx : c->ctx_llama); }
 static bool omni_exec_embd(omni_context * c, const float * embd, int n, int * n_past, float * hidden_out) {
@@ -350,8 +357,10 @@ static bool omni_exec_embd(omni_context * c, const float * embd, int n, int * n_
     if (!r.ok) return false;
     const int n_embd = c->llm_exec->n_embd, n_vocab = c->llm_exec->n_vocab;
     const int n_out = hidden_out ? n : 1;
+    double t0 = g_prof_steady ? omni_pw() : 0;
     c->last_logits.assign(r.logits.begin() + (size_t)(n_out - 1) * n_vocab, r.logits.begin() + (size_t) n_out * n_vocab);
     if (hidden_out) memcpy(hidden_out, r.hidden.data(), (size_t) n * n_embd * sizeof(float));
+    if (g_prof_steady) { g_prof_logits_ms += omni_pw() - t0; ++g_prof_logits_n; }
     *n_past += n;
     return true;
 }
@@ -371,10 +380,12 @@ static float * omni_last_logits(omni_context * c) {
 static llama_token omni_sample(common_sampler * smpl, omni_context * c) {
     if (!omni_use_exec(c)) return common_sampler_sample(smpl, c->ctx_llama, -1);
     const int n_vocab = c->llm_exec->n_vocab;
+    double t0 = g_prof_steady ? omni_pw() : 0;
     std::vector<llama_token_data> cur((size_t) n_vocab);
     for (int i = 0; i < n_vocab; i++) cur[i] = llama_token_data{ i, c->last_logits[i], 0.0f };
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
     llama_sampler_apply(common_sampler_get(smpl), &cur_p);
+    if (g_prof_steady) { g_prof_sample_ms += omni_pw() - t0; ++g_prof_sample_n; }
     return cur_p.data[cur_p.selected].id;
 }
 
