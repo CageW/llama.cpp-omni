@@ -4879,7 +4879,13 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
 }
 
 void omni_free(struct omni_context * ctx_omni) {
-
+    if (g_prof_steady && ctx_omni->llm_exec) {
+        fprintf(stderr, "[steady] sample: %llu calls %.1f ms total (%.2f ms/call) | logits-copy: %llu calls %.1f ms total (%.2f ms/call)\n",
+                (unsigned long long) g_prof_sample_n.load(), g_prof_sample_ms.load(),
+                g_prof_sample_n ? g_prof_sample_ms.load() / g_prof_sample_n.load() : 0.0,
+                (unsigned long long) g_prof_logits_n.load(), g_prof_logits_ms.load(),
+                g_prof_logits_n ? g_prof_logits_ms.load() / g_prof_logits_n.load() : 0.0);
+    }
     // 高层 duplex session 必须在底层 duplex pipeline 之前结束：
     //   session_end 会尝试 drain 已 push 但未完成的 frame，
     //   这要求 duplex 内部线程依然运行。
