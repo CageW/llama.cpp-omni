@@ -154,6 +154,7 @@ struct audition_context_params {
 };
 
 struct audition_ctx * audition_init(const char * fname, struct audition_context_params ctx_params);
+void audition_set_init_device(const char * dev);
 
 void audition_free(struct audition_ctx * ctx);
 // multi-session: new ctx sharing weights with `owner` (own KV cache + compute buffers)

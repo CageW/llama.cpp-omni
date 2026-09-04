@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 #include <string>
+#include <map>
 
 struct omni_llm_step_result {
     bool ok = false;
@@ -53,6 +54,8 @@ struct omni_llm_exec {
     uint64_t n_batches = 0, n_steps = 0, n_tokens_total = 0;
     uint64_t max_steps_in_batch = 0;
     double   decode_ms_total = 0;
+    double   qwait_ms_total = 0, qwait_ms_max = 0;   // time steps spent waiting in the executor queue
+    std::map<int, uint64_t> step_len_hist;   // token count of submitted steps -> count
 
     ~omni_llm_exec();
     struct impl;

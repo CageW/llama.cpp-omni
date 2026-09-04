@@ -550,11 +550,13 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     vision_image_f32_batch img_res_v;
     img_res_v.entries.resize(0);
     img_res_v.entries.clear();
+    const int64_t t_pre0 = ggml_time_us();
     if (!vision_image_preprocess(ctx_vision, img, &img_res_v)) {
         LOG_ERR("%s: unable to preprocess image\n", __func__);
         img_res_v.entries.clear();
         return false;
     }
+    LOG_INF("%s: preprocess took %8.2f ms\n", __func__, (ggml_time_us() - t_pre0) / 1000.0);
     
     int n_embd = vision_n_mmproj_embd(ctx_vision);
     const int n_total = (int)img_res_v.entries.size();
@@ -4099,6 +4101,15 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     
     llama_model_params model_params = common_model_params_to_llama(*params);
     model_params.partial_load = true;  // TTS GGUF contains extra tensors (emb_code, head_code, projector_*) beyond standard llama
+    // OMNI_TTS_DEVICE=<cuda index>: place the TTS model (and thus every session's TTS context) on another GPU
+    static ggml_backend_dev_t tts_devs[2] = { nullptr, nullptr };
+    if (const char * e = getenv("OMNI_TTS_DEVICE")) {
+        char name[32]; snprintf(name, sizeof(name), "CUDA%d", atoi(e));
+        ggml_backend_dev_t d = ggml_backend_dev_by_name(name);
+        if (d) { tts_devs[0] = d; model_params.devices = tts_devs; model_params.split_mode = LLAMA_SPLIT_MODE_NONE; model_params.main_gpu = 0;
+                 print_with_timestamp("TTS model: placed on %s\n", name); }
+        else   { LOG_WRN("OMNI_TTS_DEVICE=%s: device %s not found, using default\n", e, name); }
+    }
 
     // 如果指定了override值(>=0)，使用它；否则保持与LLM相同的设置
     if (n_gpu_layers_override >= 0) {
@@ -4893,6 +4904,8 @@ void omni_free(struct omni_context * ctx_omni) {
     if (ctx_omni->owns_vision) {
         vision_free(ctx_omni->ctx_vision);
     }
+    for (size_t i = 1; i < ctx_omni->vision_owners.size(); i++)   { vision_free(ctx_omni->vision_owners[i]); }
+    for (size_t i = 1; i < ctx_omni->audition_owners.size(); i++) { audition_free(ctx_omni->audition_owners[i]); }
     audition_free(ctx_omni->ctx_audio);   // a clone's audition ctx only frees its own KV cache
 
     if (ctx_omni->use_tts && !ctx_omni->owns_tts_weights) {
@@ -5012,6 +5025,26 @@ std::unique_ptr<omni::flow::Token2WavSession> omni_load_token2wav_owner(const st
     return s;
 }
 
+bool omni_add_encoder_devices(struct omni_context * root, const std::vector<std::string> & devices) {
+    if (!root || !root->ctx_vision) return false;
+    if (root->vision_owners.empty()) { root->vision_owners.push_back(root->ctx_vision); root->audition_owners.push_back(root->ctx_audio); }
+    for (const auto & d : devices) {
+        vision_set_init_device(d.c_str());
+        vision_ctx * v = vision_init(root->params->vpm_model.c_str(), vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
+        vision_set_init_device(nullptr);
+        if (!v) { LOG_ERR("omni_add_encoder_devices: vision_init on %s failed\n", d.c_str()); return false; }
+        vision_set_batch_encode(v, root->params->vpm_batch_encode);
+        if (root->is_o5) vision_set_max_slice_nums(v, 1);
+        audition_set_init_device(d.c_str());
+        audition_ctx * a = audition_init(root->params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+        audition_set_init_device(nullptr);
+        if (!a) { LOG_ERR("omni_add_encoder_devices: audition_init on %s failed\n", d.c_str()); vision_free(v); return false; }
+        root->vision_owners.push_back(v); root->audition_owners.push_back(a);
+        print_with_timestamp("=== omni_add_encoder_devices: vision+audition weights loaded on %s\n", d.c_str());
+    }
+    return true;
+}
+
 bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq) {
     if (!root || !root->model || root->llm_exec) return false;
     llama_context_params cp = common_context_params_to_llama(*root->params);
@@ -5123,10 +5156,17 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
     }
     c->llm_thread_info = new LLMThreadInfo(1000);
 
-    // ---- APM: shared weights, private streaming KV ----
-    c->ctx_audio = parent->ctx_audio ? audition_clone_shared(parent->ctx_audio) : nullptr;
-    // ---- VPM: weights shared, own compute backend + scheduler per session ----
-    c->ctx_vision  = parent->ctx_vision ? vision_clone_compute(parent->ctx_vision) : nullptr;
+    // ---- encoders: pick a weight owner (round-robin over devices), then per-session compute state ----
+    vision_ctx *   vown = parent->ctx_vision;
+    audition_ctx * aown = parent->ctx_audio;
+    if (!parent->vision_owners.empty()) {
+        const int k = parent->encoder_rr++ % (int) parent->vision_owners.size();
+        vown = parent->vision_owners[k];
+        if (k < (int) parent->audition_owners.size()) aown = parent->audition_owners[k];
+        print_with_timestamp("omni_session_clone: encoders on owner %d\n", k);
+    }
+    c->ctx_audio = aown ? audition_clone_shared(aown) : nullptr;
+    c->ctx_vision  = vown ? vision_clone_compute(vown) : nullptr;
     c->owns_vision = (c->ctx_vision != nullptr);
 
     c->async = true;
@@ -6692,7 +6732,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             response = incomplete_bytes + response;
             incomplete_bytes.clear();
         }
-        size_t incomplete_len = findIncompleteUtf8(response);
+        size_t incomplete_len = std::min(findIncompleteUtf8(response), response.size());  // guard: a lone continuation-byte tail can report > size
         if (incomplete_len > 0) {
             incomplete_bytes = response.substr(response.size() - incomplete_len, incomplete_len);
             response = response.substr(0, response.size() - incomplete_len);
@@ -7366,7 +7406,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             incomplete_bytes.clear();
         }
         // 检查当前响应是否有不完整的 UTF-8 序列
-        size_t incomplete_len = findIncompleteUtf8(response);
+        size_t incomplete_len = std::min(findIncompleteUtf8(response), response.size());  // guard: a lone continuation-byte tail can report > size
         if (incomplete_len > 0) {
             print_with_timestamp("TTS: detected incomplete UTF-8 sequence at end: incomplete_len=%zu, response_len=%zu\n", 
                                 incomplete_len, response.length());

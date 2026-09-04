@@ -498,6 +498,10 @@ struct omni_context {
     // ---- shared batched LLM executor (stage 2). When set, ctx_llama points at the executor's
     // shared context (used only for vocab/tokenize) and every LLM forward goes through llm_exec
     // on sequence llm_seq; last_logits holds the logits of the most recent forward for sampling.
+    // ---- encoder stage placement: extra weight owners on other GPUs (root only); clones round-robin over them
+    std::vector<struct vision_ctx *>   vision_owners;    // [0] == ctx_vision
+    std::vector<struct audition_ctx *> audition_owners;  // [0] == ctx_audio
+    int encoder_rr = 0;
     omni_llm_exec * llm_exec = nullptr;
     bool owns_llm_exec = false;
     int  llm_seq = 0;
@@ -508,6 +512,9 @@ struct omni_context {
 // LLM executor: one llama_context with n_seq sequences, one worker thread that merges the
 // forwards of concurrent sessions into a single llama_decode.
 bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq);
+// Load additional vision+audition weight copies on the given devices (e.g. {"CUDA1","CUDA3"}); sessions
+// cloned afterwards are spread round-robin over all encoder owners (including the root's).
+bool omni_add_encoder_devices(struct omni_context * root, const std::vector<std::string> & devices);
 
 //
 // omni embed

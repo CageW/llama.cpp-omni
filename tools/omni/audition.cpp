@@ -207,6 +207,9 @@ struct whisper_kv_cache {
     int iter = 0;      // current iteration count for streaming
 };
 
+static const char * g_audition_device_override = nullptr;
+void audition_set_init_device(const char * dev) { g_audition_device_override = dev; }
+
 struct audition_ctx {
     audition_model model;
 
@@ -244,7 +247,7 @@ struct audition_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (audition_params.use_gpu) {
-            auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+            auto backend_name = g_audition_device_override ? g_audition_device_override : std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {

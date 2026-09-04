@@ -12,6 +12,7 @@
 #include "log.h"
 #include "ggml-backend.h"
 #include "token2wav/token2wav.h"
+#include "vision.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,7 +41,7 @@ static size_t gpu_used_mib() {
 }
 
 struct SessStats {
-    std::vector<double> ms_total;
+    std::vector<double> ms_total, ms_submit, ms_decode;
     int speak = 0, listen = 0, fail = 0;
     double first_audio_ms = -1;
     int wav_chunks = 0;
@@ -55,7 +56,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false;
+    std::string out_csv; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false; std::vector<std::string> enc_devs;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -68,6 +69,8 @@ int main(int argc, char ** argv) {
         else if (a == "--ctk" && i + 1 < argc) { std::string t = argv[++i]; ctk = t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; }
         else if (a == "--ub" && i + 1 < argc) n_ubatch = atoi(argv[++i]);
         else if (a == "--exec") use_exec = true;
+        else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
+        else if (a == "--enc-devices" && i + 1 < argc) { std::string l = argv[++i]; size_t q0 = 0; while (q0 <= l.size()) { size_t q = l.find(',', q0); if (q == std::string::npos) q = l.size(); if (q > q0) enc_devs.push_back(l.substr(q0, q - q0)); q0 = q + 1; } }
         else if (a == "--t2w-devices" && i + 1 < argc) { t2w_devs.clear(); std::string l = argv[++i]; size_t p = 0; while (p <= l.size()) { size_t q = l.find(',', p); if (q == std::string::npos) q = l.size(); if (q > p) t2w_devs.push_back(l.substr(p, q - p)); p = q + 1; } }
         else { fprintf(stderr, "usage: %s -m llm.gguf --test <prefix> <n> [-n sessions] [--interval ms] [-c n_ctx] [--no-tts] [--csv out]\n", argv[0]); return 1; }
     }
@@ -78,6 +81,7 @@ int main(int argc, char ** argv) {
     params.n_ctx = n_ctx; params.n_batch = 2048; params.n_ubatch = n_ubatch; params.n_gpu_layers = 99;
     params.cache_type_k = ctk; params.cache_type_v = ctk; params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.n_parallel = 1;
+    params.cpuparams.n_threads = n_threads; params.cpuparams_batch.n_threads = n_threads;   // per-session CPU threads: default -1 = all cores -> N sessions oversubscribe the host
     params.split_mode = LLAMA_SPLIT_MODE_NONE; params.main_gpu = 0;   // LLM/APM/VPM stay on the first visible GPU
     params.sampling.temp = 0.7f; params.sampling.top_p = 0.8f; params.sampling.top_k = 20; params.sampling.penalty_repeat = 1.05f;
     const std::string base = parent_dir(llm_path);
@@ -96,6 +100,7 @@ int main(int argc, char ** argv) {
     if (!root) { fprintf(stderr, "omni_init failed\n"); return 1; }
     root->clean_kvcache = true;
     if (use_exec && !omni_enable_llm_exec(root, n_sessions, n_ctx)) { fprintf(stderr, "omni_enable_llm_exec failed\n"); return 1; }
+    if (!enc_devs.empty() && !omni_add_encoder_devices(root, enc_devs)) { fprintf(stderr, "omni_add_encoder_devices failed\n"); return 1; }
     const size_t mem_root = gpu_used_mib();
 
     std::vector<omni_context *> sess{root};
@@ -162,6 +167,8 @@ int main(int argc, char ** argv) {
                 OmniDuplexFrameResult r;
                 if (!omni_duplex_wait_next_frame(sess[i], &r, 60000) || !r.ok) { stats[i].fail++; continue; }
                 stats[i].ms_total.push_back(r.ms_total);
+                stats[i].ms_submit.push_back(r.ms_prefill_submit);
+                stats[i].ms_decode.push_back(r.ms_decode);
                 (r.is_speak ? stats[i].speak : stats[i].listen)++;
             }
         });
@@ -171,13 +178,15 @@ int main(int argc, char ** argv) {
     const size_t mem_peak = gpu_used_mib();
     for (int i = 0; i < n_sessions; ++i) omni_duplex_session_end(sess[i]);
 
-    std::vector<double> pooled;
+    std::vector<double> pooled, pooled_submit, pooled_decode;
     printf("\n=== %d sessions | interval %d ms | %d frames each | tts=%d ===\n", n_sessions, interval_ms, cnt, (int) use_tts);
     printf("%-4s %8s %8s %8s %6s %6s %5s %10s %5s\n", "sess", "p50", "p95", "max", "speak", "listen", "fail", "1st_audio", "wavs");
     int over = 0;
     for (int i = 0; i < n_sessions; ++i) {
         auto & st = stats[i];
         pooled.insert(pooled.end(), st.ms_total.begin(), st.ms_total.end());
+        pooled_submit.insert(pooled_submit.end(), st.ms_submit.begin(), st.ms_submit.end());
+        pooled_decode.insert(pooled_decode.end(), st.ms_decode.begin(), st.ms_decode.end());
         for (double v : st.ms_total) if (v > interval_ms) over++;
         printf("s%-3d %8.1f %8.1f %8.1f %6d %6d %5d %10.0f %5d\n", i, pct(st.ms_total, 50), pct(st.ms_total, 95),
                st.ms_total.empty() ? 0 : *std::max_element(st.ms_total.begin(), st.ms_total.end()),
@@ -186,6 +195,9 @@ int main(int argc, char ** argv) {
     printf("pooled: p50 %.1f p95 %.1f max %.1f | frames over interval: %d / %zu | gpu peak %zu MiB (per-session %.1f MiB incl. compute)\n",
            pct(pooled, 50), pct(pooled, 95), pooled.empty() ? 0 : *std::max_element(pooled.begin(), pooled.end()),
            over, pooled.size(), mem_peak, n_sessions > 1 ? (double)(mem_peak - mem_root) / (n_sessions - 1) : 0.0);
+    printf("components: push->prefill_done p50 %.0f p95 %.0f | decode(stream_decode) p50 %.0f p95 %.0f | rest(queueing) p50 %.0f\n",
+           pct(pooled_submit, 50), pct(pooled_submit, 95), pct(pooled_decode, 50), pct(pooled_decode, 95),
+           pct(pooled, 50) - pct(pooled_submit, 50) - pct(pooled_decode, 50));
     if (!out_csv.empty()) {
         FILE * f = fopen(out_csv.c_str(), "a");
         if (f) {
@@ -199,6 +211,9 @@ int main(int argc, char ** argv) {
         (unsigned long long) root->llm_exec->n_batches, (unsigned long long) root->llm_exec->n_steps, (unsigned long long) root->llm_exec->n_tokens_total,
         root->llm_exec->n_batches ? (double) root->llm_exec->n_steps / root->llm_exec->n_batches : 0.0, (unsigned long long) root->llm_exec->max_steps_in_batch,
         root->llm_exec->decode_ms_total / 1000.0, root->llm_exec->n_batches ? root->llm_exec->decode_ms_total / root->llm_exec->n_batches : 0.0);
+    if (root->llm_exec) printf("[exec] queue wait per step: avg %.1f ms, max %.1f ms\n", root->llm_exec->n_steps ? root->llm_exec->qwait_ms_total / root->llm_exec->n_steps : 0.0, root->llm_exec->qwait_ms_max);
+    if (root->ctx_vision) { uint64_t c = 0, im = 0; vision_batcher_stats(root->ctx_vision, &c, &im); if (c) printf("[vision] batched calls %llu images %llu (avg %.2f/call)\n", (unsigned long long) c, (unsigned long long) im, (double) im / c); }
+    if (root->llm_exec) { printf("[exec] step length histogram:"); for (auto & kv : root->llm_exec->step_len_hist) printf(" %d:%llu", kv.first, (unsigned long long) kv.second); printf("\n"); }
     for (int i = n_sessions - 1; i >= 1; --i) omni_free(sess[i]);
     omni_free(root);
     return 0;

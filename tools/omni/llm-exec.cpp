@@ -11,6 +11,7 @@ struct omni_llm_exec::impl {
     struct step {
         int seq = 0; int pos0 = 0; const float * embd = nullptr; int n = 0; bool all_outputs = false;
         std::promise<omni_llm_step_result> done;
+        std::chrono::steady_clock::time_point t_enq;
     };
     std::mutex mtx;
     std::condition_variable cv;
@@ -29,34 +30,64 @@ struct omni_llm_exec::impl {
                 std::unique_lock<std::mutex> lk(mtx);
                 cv.wait(lk, [&]{ return !queue.empty() || !running; });
                 if (!running && queue.empty()) return;
-                // short window so concurrent sessions land in one forward
-                if (window_us_ > 0) {
-                    cv.wait_for(lk, std::chrono::microseconds(window_us_), [&]{ return !running; });
+                // short window so concurrent sessions land in one forward; long steps (prefill) may wait
+                // longer (OMNI_EXEC_PREFILL_WINDOW_US) so that a whole 1 s tick of sessions is merged,
+                // but never while a decode step is pending
+                {
+                    bool any_long = false, any_short = false;
+                    for (auto * s : queue) { (s->n > 8 ? any_long : any_short) = true; }
+                    static const int prefill_window_us = getenv("OMNI_EXEC_PREFILL_WINDOW_US") ? atoi(getenv("OMNI_EXEC_PREFILL_WINDOW_US")) : 0;
+                    const int w = (any_long && !any_short && prefill_window_us > window_us_) ? prefill_window_us : window_us_;
+                    if (w > 0) {
+                        // wait until a short step arrives or the window elapses
+                        cv.wait_for(lk, std::chrono::microseconds(w), [&]{
+                            if (!running) return true;
+                            for (auto * s : queue) if (s->n <= 8) return true;
+                            return false;
+                        });
+                    }
                 }
                 // Scheduling policy (OMNI_EXEC_POLICY):
-                //   mixed   : take everything pending (one step per sequence)                      [default]
-                //   decode  : decode steps (n<=8) first and alone; prefill steps (n>8) only when no decode
-                //             is pending, and at most OMNI_EXEC_MAX_PREFILL (default 2) prefill steps per
-                //             forward -> bounds the head-of-line delay a speaking session sees.
+                //   equal   : one forward = steps of EXACTLY the same token count (one per sequence). [default]
+                //             The hybrid (gated-delta-net + attention) memory splits a ubatch by sequence unless
+                //             every sequence contributes the same number of tokens; mixed lengths therefore turn
+                //             one batch into several full forwards. Equal-length grouping keeps it to one.
+                //             Longest pending length first (prefill before decode); the rest wait a round.
+                //   mixed   : take everything pending (one step per sequence)           [old behaviour]
+                //   decode  : decode steps (n<=8) first, then <= OMNI_EXEC_MAX_PREFILL prefills
                 static const char * pol = getenv("OMNI_EXEC_POLICY");
+                static const std::string policy = pol ? pol : "mixed";
                 static const int max_prefill = getenv("OMNI_EXEC_MAX_PREFILL") ? atoi(getenv("OMNI_EXEC_MAX_PREFILL")) : 2;
-                const bool decode_first = pol && std::string(pol) == "decode";
                 int tok = 0, n_long = 0;
                 std::vector<bool> seq_taken(self->n_seq, false);
-                bool have_short = false;
-                if (decode_first) for (auto * s : queue) if (s->n <= 8) { have_short = true; break; }
-                for (auto it = queue.begin(); it != queue.end();) {
-                    step * s = *it;
-                    const bool is_long = s->n > 8;
-                    if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
-                    if (decode_first) {
-                        if (have_short && is_long) { ++it; continue; }
-                        if (!have_short && is_long && n_long >= max_prefill) { ++it; continue; }
+                if (policy == "equal") {
+                    int pick_n = 0;
+                    for (auto * s : queue) pick_n = std::max(pick_n, s->n);
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        step * s = *it;
+                        if (s->n != pick_n || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                     }
-                    seq_taken[s->seq] = true; tok += s->n; n_long += is_long; batch.push_back(s); it = queue.erase(it);
+                } else {
+                    const bool decode_first = policy == "decode";
+                    bool have_short = false;
+                    if (decode_first) for (auto * s : queue) if (s->n <= 8) { have_short = true; break; }
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        step * s = *it;
+                        const bool is_long = s->n > 8;
+                        if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        if (decode_first) {
+                            if (have_short && is_long) { ++it; continue; }
+                            if (!have_short && is_long && n_long >= max_prefill) { ++it; continue; }
+                        }
+                        seq_taken[s->seq] = true; tok += s->n; n_long += is_long; batch.push_back(s); it = queue.erase(it);
+                    }
                 }
             }
             if (batch.empty()) continue;
+            // llama.cpp's equal-split for non-unified KV only merges sequences whose ids are increasing
+            // in batch order; keep the batch sorted by sequence id so one forward stays one ubatch.
+            std::sort(batch.begin(), batch.end(), [](const step * a, const step * b){ return a->seq < b->seq; });
             std::lock_guard<std::mutex> rl(run_mtx);
             run_batch(batch);
         }
@@ -88,12 +119,16 @@ struct omni_llm_exec::impl {
         b.n_tokens = n_tok; b.embd = embd.data(); b.pos = pos.data();
         b.n_seq_id = n_seq_id.data(); b.seq_id = seq_ptr.data(); b.logits = out.data();
         const auto t0 = std::chrono::steady_clock::now();
+        double qwait_max = 0, qwait_sum = 0;
+        for (auto * s : batch) { double w = std::chrono::duration<double, std::milli>(t0 - s->t_enq).count(); qwait_sum += w; qwait_max = std::max(qwait_max, w); }
+        self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
         const int rc = llama_decode(ctx, b);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         self->decode_ms_total += ms;
         static const bool trace = getenv("OMNI_EXEC_TRACE") != nullptr;
-        if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f\n", batch.size(), n_tok, mx, ms); }
+        if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f qwait_avg=%.1f qwait_max=%.1f\n", batch.size(), n_tok, mx, ms, qwait_sum / batch.size(), qwait_max); }
         self->n_batches++; self->n_steps += batch.size(); self->n_tokens_total += n_tok;
+        for (auto * s : batch) self->step_len_hist[s->n]++;
         self->max_steps_in_batch = std::max<uint64_t>(self->max_steps_in_batch, batch.size());
         // scatter outputs: output rows are in batch order over tokens with out[i]!=0
         int row = 0;
@@ -117,7 +152,7 @@ struct omni_llm_exec::impl {
 };
 
 omni_llm_step_result omni_llm_exec::run(int seq, int pos0, const float * embd, int n_tokens, bool all_outputs) {
-    auto * s = new impl::step(); s->seq = seq; s->pos0 = pos0; s->embd = embd; s->n = n_tokens; s->all_outputs = all_outputs;
+    auto * s = new impl::step(); s->seq = seq; s->pos0 = pos0; s->embd = embd; s->n = n_tokens; s->all_outputs = all_outputs; s->t_enq = std::chrono::steady_clock::now();
     auto fut = s->done.get_future();
     { std::lock_guard<std::mutex> lk(p->mtx); p->queue.push_back(s); }
     p->cv.notify_all();
@@ -189,6 +224,7 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     cp.kv_unified = getenv("OMNI_EXEC_KV_UNIFIED") != nullptr;
     cp.embeddings = true;              // hidden states for TTS
     cp.n_batch    = std::max<uint32_t>(cp.n_batch, 4096);
+    if (const char * u = getenv("OMNI_EXEC_UBATCH")) { int v = atoi(u); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(cp.n_batch, v); } }
     e->ctx = llama_new_context_with_model(model, cp);
     if (!e->ctx) return nullptr;
     e->model = model; e->n_seq = n_seq;

@@ -84,9 +84,12 @@ struct vision_context_params {
 
 // vision layers
 struct vision_ctx * vision_init(const char * fname, struct vision_context_params ctx_params);
+// multi-GPU: backend device name (e.g. "CUDA1") used by the next vision_init calls; nullptr = env/default
+void vision_set_init_device(const char * dev);
 void vision_free(struct vision_ctx * ctx);
 // multi-session: compute-only clone sharing weights with `owner` (own backend instance + scheduler)
 struct vision_ctx * vision_clone_compute(struct vision_ctx * owner);
+void vision_batcher_stats(struct vision_ctx * ctx, uint64_t * calls, uint64_t * imgs);
 
 // vision processor
 void vision_image_u8_free(struct vision_image_u8  * img);

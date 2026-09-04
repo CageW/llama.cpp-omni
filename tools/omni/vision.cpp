@@ -189,6 +189,9 @@ struct vision_model {
 
 };
 
+static const char * g_vision_device_override = nullptr;
+void vision_set_init_device(const char * dev) { g_vision_device_override = dev; }
+
 struct vision_ctx {
     vision_model model;
 
@@ -233,7 +236,7 @@ struct vision_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            auto backend_name = std::getenv("Omni_BACKEND_DEVICE");
+            auto backend_name = g_vision_device_override ? g_vision_device_override : std::getenv("Omni_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {
@@ -2605,7 +2608,80 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     return true;
 }
 
+// ---- cross-session vision batching service ----
+// Sessions encode one overview image per frame; frames of concurrent sessions arrive within the same
+// tick. When OMNI_VISION_BATCH=1, single-image encodes are queued on the weights-owner ctx and a worker
+// merges same-size images (up to OMNI_VISION_BATCH_MAX, default 16) arriving within OMNI_VISION_BATCH_WINDOW_US
+// (default 4000) into one vision_image_batch_encode call.
+#include <condition_variable>
+#include <future>
+#include <deque>
+#include <thread>
+struct vision_batch_req { vision_image_f32 * img; float * vec; int n_threads; std::promise<bool> done; };
+struct vision_batcher {
+    vision_ctx * ctx = nullptr;
+    std::mutex mtx; std::condition_variable cv; std::deque<vision_batch_req *> q; bool running = true; std::thread th;
+    int window_us = 4000, max_batch = 16;
+    uint64_t n_calls = 0, n_imgs = 0;
+    ~vision_batcher() { { std::lock_guard<std::mutex> lk(mtx); running = false; } cv.notify_all(); if (th.joinable()) th.join(); }
+    void loop() {
+        while (true) {
+            std::vector<vision_batch_req *> b;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&]{ return !q.empty() || !running; });
+                if (!running && q.empty()) return;
+                cv.wait_for(lk, std::chrono::microseconds(window_us), [&]{ return !running || (int) q.size() >= max_batch; });
+                vision_batch_req * f = q.front();
+                for (auto it = q.begin(); it != q.end() && (int) b.size() < max_batch;) {
+                    if ((*it)->img->nx == f->img->nx && (*it)->img->ny == f->img->ny) { b.push_back(*it); it = q.erase(it); } else ++it;
+                }
+            }
+            vision_image_f32_batch imgs;
+            for (auto * r : b) { vision_image_f32_ptr c(vision_image_f32_init()); *c = *r->img; imgs.entries.push_back(std::move(c)); }
+            const int n_tok = vision_n_output_tokens_for_image(ctx, imgs.entries[0].get());
+            const int n_embd = vision_n_mmproj_embd(ctx);
+            std::vector<float> out((size_t) n_tok * n_embd * b.size());
+            const bool ok = vision_image_batch_encode(ctx, b[0]->n_threads, &imgs, out.data());
+            n_calls++; n_imgs += b.size();
+            for (size_t i = 0; i < b.size(); i++) {
+                if (ok) memcpy(b[i]->vec, out.data() + i * (size_t) n_tok * n_embd, (size_t) n_tok * n_embd * sizeof(float));
+                b[i]->done.set_value(ok);
+            }
+        }
+    }
+};
+static vision_batcher * vision_get_batcher(vision_ctx * ctx) {
+    static std::mutex m; static std::map<vision_ctx *, std::unique_ptr<vision_batcher>> all;
+    vision_ctx * owner = ctx->weights_owner ? ctx->weights_owner : ctx;
+    std::lock_guard<std::mutex> g(m);
+    auto it = all.find(owner);
+    if (it == all.end()) {
+        auto vb = std::make_unique<vision_batcher>(); vb->ctx = owner;
+        // MiniCPM-o 4.6/o5 ViT graph (build_minicpm_o_4_6) has no batch dimension yet: encode one image per call
+        if (owner->model.model_type == MiniCPM_o_4_6) vb->max_batch = 1;
+        if (const char * e = getenv("OMNI_VISION_BATCH_WINDOW_US")) vb->window_us = atoi(e);
+        if (const char * e = getenv("OMNI_VISION_BATCH_MAX")) vb->max_batch = atoi(e);
+        vb->th = std::thread([p = vb.get()]{ p->loop(); });
+        it = all.emplace(owner, std::move(vb)).first;
+    }
+    return it->second.get();
+}
+void vision_batcher_stats(struct vision_ctx * ctx, uint64_t * calls, uint64_t * imgs) {
+    *calls = 0; *imgs = 0;
+    if (!getenv("OMNI_VISION_BATCH")) return;   // do not spawn a batcher just to read stats
+    vision_batcher * vb = vision_get_batcher(ctx); *calls = vb->n_calls; *imgs = vb->n_imgs;
+}
 bool vision_image_encode(struct vision_ctx * ctx, const int n_threads, vision_image_f32 * img, float * vec) {
+    static const bool use_batcher = getenv("OMNI_VISION_BATCH") != nullptr;
+    if (use_batcher && ctx->coreml_model_path.empty()) {
+        vision_batcher * vb = vision_get_batcher(ctx);
+        vision_batch_req r; r.img = img; r.vec = vec; r.n_threads = n_threads;
+        auto fut = r.done.get_future();
+        { std::lock_guard<std::mutex> lk(vb->mtx); vb->q.push_back(&r); }
+        vb->cv.notify_all();
+        return fut.get();
+    }
     if (const char * dbg = getenv("OMNI_VISION_DEBUG")) {
         static int dump_idx = 0;
         char path[512]; snprintf(path, sizeof(path), "%s.pix%d.bin", dbg, dump_idx++);
