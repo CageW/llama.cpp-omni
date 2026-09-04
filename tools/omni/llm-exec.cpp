@@ -55,6 +55,11 @@ struct omni_llm_exec::impl {
                 //             Longest pending length first (prefill before decode); the rest wait a round.
                 //   mixed   : take everything pending (one step per sequence)           [old behaviour]
                 //   decode  : decode steps (n<=8) first, then <= OMNI_EXEC_MAX_PREFILL prefills
+                //   pd      : prefill and decode never mix in one forward. Each loop picks ONE homogeneous
+                //             batch (all long, or all short); the two alternate via a toggle so neither
+                //             starves. Because a batch now has a single step length, the hybrid memory's
+                //             split_equal stays a single ubatch instead of exploding one mixed batch into
+                //             many forwards (which is what blows up the per-batch time at high concurrency).
                 static const char * pol = getenv("OMNI_EXEC_POLICY");
                 static const std::string policy = pol ? pol : "mixed";
                 static const int max_prefill = getenv("OMNI_EXEC_MAX_PREFILL") ? atoi(getenv("OMNI_EXEC_MAX_PREFILL")) : 2;
@@ -67,6 +72,29 @@ struct omni_llm_exec::impl {
                         step * s = *it;
                         if (s->n != pick_n || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                         seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
+                    }
+                } else if (policy == "pd") {
+                    // toggle: on odd iterations serve long (prefill) steps first, on even ones short (decode).
+                    static bool pd_prefill_turn = true;
+                    const bool want_long = pd_prefill_turn;
+                    pd_prefill_turn = !pd_prefill_turn;
+                    bool have_wanted = false;
+                    for (auto * s : queue) if ((s->n > 8) == want_long) { have_wanted = true; break; }
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        step * s = *it;
+                        const bool is_long = s->n > 8;
+                        if (is_long != want_long) { ++it; continue; }   // only take the wanted class this round
+                        if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
+                    }
+                    if (batch.empty() && have_wanted) {
+                        // wanted class present but too large to fit; fall back to the other class this round
+                        const bool other = !want_long;
+                        for (auto it = queue.begin(); it != queue.end();) {
+                            step * s = *it;
+                            if ((s->n > 8) != other || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                            seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
+                        }
                     }
                 } else {
                     const bool decode_first = policy == "decode";
@@ -95,6 +123,7 @@ struct omni_llm_exec::impl {
     int window_us_ = 3000;
 
     void run_batch(std::vector<step *> & batch) {
+        static uint64_t forward_last = 0;   // omni: last-read graph compute count (single-executor experiment)
         llama_context * ctx = self->ctx;
         const int n_embd = self->n_embd, n_vocab = self->n_vocab, npos = self->n_pos_per_embd;
         int n_real = 0; for (auto * s : batch) n_real += s->n;
@@ -142,6 +171,7 @@ struct omni_llm_exec::impl {
         for (auto * s : batch) { double w = std::chrono::duration<double, std::milli>(t0 - s->t_enq).count(); qwait_sum += w; qwait_max = std::max(qwait_max, w); }
         self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
         const int rc = llama_decode(ctx, b);
+        self->n_forward += llama_context_graph_compute_count(ctx) - forward_last; forward_last = llama_context_graph_compute_count(ctx);
         for (int j = 0; j < n_dummy; j++) llama_memory_seq_rm(llama_get_memory(ctx), self->n_seq + j, -1, -1);
         self->n_pad_tokens += n_dummy;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

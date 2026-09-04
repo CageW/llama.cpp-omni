@@ -713,6 +713,14 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+uint64_t llama_context::graph_compute_count() const {
+    return n_graph_compute;
+}
+
+uint64_t llama_context_graph_compute_count(const struct llama_context * ctx) {
+    return ctx->graph_compute_count();
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -1789,6 +1797,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
+        ++n_graph_compute;   // omni: count each forward (ubatch -> graph compute)
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 

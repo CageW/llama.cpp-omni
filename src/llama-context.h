@@ -67,6 +67,11 @@ struct llama_context {
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
 
+    // omni: number of graph computes (forward passes) executed on this context since creation.
+    // Used to measure how many forwards a batch actually triggers (the hybrid memory splits one
+    // logical batch into many ubatches; that count is what matters for GPU cost).
+    uint64_t graph_compute_count() const;
+
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
 
@@ -267,6 +272,8 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    uint64_t n_graph_compute = 0;   // omni: forwards executed (incremented in the ubatch loop)
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
