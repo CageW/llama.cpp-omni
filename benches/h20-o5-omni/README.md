@@ -116,3 +116,23 @@ OMNI_TTS_CTX=2048 OMNI_TTS_UBATCH=64 OMNI_LLM_UBATCH=128 CUDA_VISIBLE_DEVICES=0 
 # 共享执行器（合批实验）：--exec，OMNI_EXEC_POLICY=decode / OMNI_EXEC_TRACE=1
 ```
 GGUF 在南京节点 `/data/wangkaiqi/o5gguf/`，原始日志 `/data/wangkaiqi/logs/ms-*.log`，结果 CSV `/data/wangkaiqi/o5out/ms/results_*.csv`。
+
+## 2026-09-04 下午补充：部署形态搜索结果（Q8_0 权重、F16 KV、每 session 每秒 1 帧音频 + 1 帧图）
+
+判定标准：每帧 LLM 决策延迟 P95 < 1 s。节点当天 load average 在 2 到 10 之间波动，executor 每 batch 耗时随主机负载变化 30% 以上，因此只在同批次内比较。所有布局都要设 `Omni_BACKEND_DEVICE=CUDA1`，否则 root 编码器会落到 LLM 所在卡。
+
+| 布局（每个 LLM 副本一个进程） | 卡数 | session 总数 | 每副本 P50 / P95 (ms) | 超时帧 | 结论 |
+|---|---|---|---|---|---|
+| 1 LLM + 1 编码器 + 1 TTS/T2W | 3 | 16 | 771 / 1430 | 47/576 | 边缘（负载 4.7） |
+| 1 LLM + 4 编码器副本 + 1 TTS/T2W，vision 合批 4 | 6 | 24 | 845 / 2060 | 122/864 | 不达标 |
+| 同上 | 6 | 28 | 1112 / 15031 | 544/1008 | 不达标 |
+| 2 LLM 副本，各自独占编码器卡与 TTS 卡 | 6 | 2×16 | 680 / 843，692 / 835 | 0 | 达标 |
+| 2 LLM 副本，共用 1 张编码器卡 + 1 张 TTS 卡 | 4 | 2×16 | 685 / 829，683 / 817 | 3/1152 | 达标 |
+| 同上 | 4 | 2×20 | 822 / 1271，804 / 1216 | 155/1440 | 边缘 |
+| 3 LLM 副本，共用 1 张编码器卡 + 1 张 TTS 卡 | 5 | 3×16 | 731 / 869，803 / 920，814 / 989 | 31/1728 | 达标（负载 10） |
+
+结论：单个 LLM 进程无论给多少编码器资源，实时上限都在 16 到 20 session；LLM 卡利用率只有 20%，GPU 时间（prefill batch 93 到 119 ms、decode batch 10 ms）只占每帧 LLM 墙钟（prefill 300 到 500 ms）的四分之一，其余是进程内 CPU 侧开销（每 token 对 248144 词表在主机侧采样、logits 拷贝、fused embedding 拼装、线程争用）。**多开 LLM 进程副本是当前最有效的扩容方式**，编码器和 TTS/Token2Wav 各一张卡可同时服务至少 48 session（利用率 4% 到 18%）。
+
+按此外推 8 卡 H20：6 张 LLM 卡（每卡一个副本、16 session）+ 1 张编码器卡 + 1 张 TTS/Token2Wav 卡，约 96 个 omni session；若把每副本的 CPU 侧开销压下去让单副本到 24，则约 144。
+
+已验证无效的方向：executor 固定形状 padding + MoE decode 走 CUDA graph（MoE decode 耗时随 batch 内 token 数增长，1 token 4.7 ms、16 token 16.5 ms，padding 反而变慢）；decode 优先调度（prefill 排队 1 s 以上）。
