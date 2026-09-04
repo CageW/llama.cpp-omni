@@ -44,7 +44,30 @@ struct omni_llm_exec::impl {
                     // pending, so the window variant collapses to 3 ms and prefills go out 3-4 wide.
                     static const int gather_us = getenv("OMNI_EXEC_PREFILL_GATHER_US") ? atoi(getenv("OMNI_EXEC_PREFILL_GATHER_US")) : 0;
                     static const int gather_target = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
-                    if (gather_us > 0 && any_long) {
+                    // OMNI_EXEC_POLICY=ripe: never hold decode steps; hold prefills until >= OMNI_EXEC_PREFILL_TARGET
+                    // (default n_seq) are queued or the oldest has waited >= OMNI_EXEC_PREFILL_DEADLINE_US (default 200 ms).
+                    // Fixes the circular wait of gather mode: a session submits its next prefill only after this frame's
+                    // decodes finish, and those decodes sat in this queue behind the gather wait.
+                    static const char * pol_env = getenv("OMNI_EXEC_POLICY");
+                    static const bool ripe = pol_env && std::string(pol_env) == "ripe";
+                    static const int ripe_target_env   = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
+                    static const int ripe_deadline_us  = getenv("OMNI_EXEC_PREFILL_DEADLINE_US") ? atoi(getenv("OMNI_EXEC_PREFILL_DEADLINE_US")) : 200000;
+                    if (ripe) {
+                        const int target = ripe_target_env > 0 ? ripe_target_env : self->n_seq;
+                        auto ready = [&]{
+                            if (!running) return true;
+                            int n_long_r = 0; bool any_s = false, old = false;
+                            const auto now = std::chrono::steady_clock::now();
+                            for (auto * s : queue) {
+                                if (s->n <= 8) { any_s = true; continue; }
+                                n_long_r++;
+                                if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= ripe_deadline_us) old = true;
+                            }
+                            return any_s || n_long_r >= target || old;
+                        };
+                        cv.wait_for(lk, std::chrono::microseconds(std::min(ripe_deadline_us, 20000)), ready);
+                        if (running) cv.wait_for(lk, std::chrono::microseconds(window_us_), [&]{ return !running; });   // let same-tick decodes coalesce
+                    } else if (gather_us > 0 && any_long) {
                         const int target = gather_target > 0 ? gather_target : self->n_seq;
                         cv.wait_for(lk, std::chrono::microseconds(gather_us), [&]{
                             if (!running) return true;
@@ -88,6 +111,19 @@ struct omni_llm_exec::impl {
                     for (auto it = queue.begin(); it != queue.end();) {
                         step * s = *it;
                         if (s->n != pick_n || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
+                    }
+                } else if (policy == "ripe") {
+                    static const int ripe_target_sel   = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
+                    static const int ripe_deadline_sel = getenv("OMNI_EXEC_PREFILL_DEADLINE_US") ? atoi(getenv("OMNI_EXEC_PREFILL_DEADLINE_US")) : 200000;
+                    const int target = ripe_target_sel > 0 ? ripe_target_sel : self->n_seq;
+                    int n_long_q = 0; bool old = false;
+                    const auto now = std::chrono::steady_clock::now();
+                    for (auto * s : queue) if (s->n > 8) { n_long_q++; if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= ripe_deadline_sel) old = true; }
+                    const bool take_long = n_long_q >= target || old;   // prefills ripe -> one wide prefill batch; else serve decodes
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        step * s = *it;
+                        if ((s->n > 8) != take_long || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                         seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                     }
                 } else if (policy == "pd") {
