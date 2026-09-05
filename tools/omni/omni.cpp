@@ -351,6 +351,25 @@ static std::atomic<long long> g_prof_sample_n{0}, g_prof_logits_n{0};
 inline double omni_pw() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 static inline bool omni_use_exec(const omni_context * c) { return c && c->llm_exec != nullptr; }
+// ---- TTS executor helpers ----
+static inline bool omni_use_tts_exec(const omni_context * c) { return c && c->tts_exec != nullptr; }
+// hidden state of the most recent TTS forward for this session (executor path) or of the private context
+static inline const float * omni_tts_last_hidden(omni_context * c) {
+    return omni_use_tts_exec(c) ? (c->tts_last_hidden.empty() ? nullptr : c->tts_last_hidden.data())
+                                : llama_get_embeddings_ith(c->ctx_tts_llama, -1);
+}
+// clear this session's TTS KV (whole sequence)
+static inline void omni_tts_kv_clear(omni_context * c) {
+    if (omni_use_tts_exec(c)) { c->tts_exec->seq_clear(c->tts_seq); return; }
+    if (c->ctx_tts_llama) { llama_memory_t m = llama_get_memory(c->ctx_tts_llama); if (m) llama_memory_seq_rm(m, 0, 0, -1); }
+}
+static bool omni_tts_exec_embd(omni_context * c, const float * embd, int n, int * n_past_tts) {
+    omni_llm_step_result r = c->tts_exec->run(c->tts_seq, *n_past_tts, embd, n, /*all_outputs*/ false);
+    if (!r.ok) return false;
+    c->tts_last_hidden.assign(r.hidden.begin(), r.hidden.begin() + c->tts_exec->n_embd);
+    *n_past_tts += n;
+    return true;
+}
 static inline llama_memory_t omni_llm_mem(omni_context * c) { return llama_get_memory(c->llm_exec ? c->llm_exec->ctx : c->ctx_llama); }
 static bool omni_exec_embd(omni_context * c, const float * embd, int n, int * n_past, float * hidden_out) {
     omni_llm_step_result r = c->llm_exec->run(c->llm_seq, *n_past, embd, n, hidden_out != nullptr);
@@ -1111,8 +1130,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
                 ctx_omni->round_start_positions.clear();
                 if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    omni_tts_kv_clear(ctx_omni);
                     ctx_omni->tts_n_past_accumulated = 0;
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
@@ -1156,8 +1174,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 ctx_omni->round_start_positions = new_rounds;
 
                 if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    omni_tts_kv_clear(ctx_omni);
                     ctx_omni->tts_n_past_accumulated = 0;
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
@@ -2430,6 +2447,17 @@ static void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd,
 static bool eval_tokens_tts(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past_tts) {
     fflush(stdout);
     int N = (int) tokens.size();
+    if (omni_use_tts_exec(ctx_omni)) {
+        if (N == 0) return true;
+        const int n_embd = ctx_omni->tts_exec->n_embd;
+        std::vector<float> embd((size_t) N * n_embd);
+        for (int i = 0; i < N; i++) {
+            const float * row = ctx_omni->tts_exec->tok_emb_row(tokens[i]);
+            if (!row) { LOG_ERR("eval_tokens_tts: TTS token embedding table not loaded\n"); return false; }
+            memcpy(embd.data() + (size_t) i * n_embd, row, n_embd * sizeof(float));
+        }
+        return omni_tts_exec_embd(ctx_omni, embd.data(), N, n_past_tts);
+    }
     fflush(stdout);
     // Note: TTS model might need different KV cache management
     // For now, we'll use a simple approach similar to LLM
@@ -2531,6 +2559,9 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
         ctx_omni->tts_condition_saved = true;
     }
     
+    if (omni_use_tts_exec(ctx_omni)) {
+        return omni_tts_exec_embd(ctx_omni, embed, n_pos, n_past_tts);
+    }
     // Save the starting position before the loop
     int text_start_pos = *n_past_tts;
     
@@ -2915,10 +2946,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     
     // Re-forward condition for first audio token
     if (is_audio_bos && ctx_omni->tts_condition_saved && ctx_omni->tts_condition_length > 0) {
-        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-        if (mem) {
-            llama_memory_seq_rm(mem, 0, 0, -1);
-        }
+        omni_tts_kv_clear(ctx_omni);
         int condition_n_past = 0;
         if (!prefill_with_emb_tts(ctx_omni, params, 
                                  ctx_omni->tts_condition_embeddings.data(), 
@@ -2932,7 +2960,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     }
     
     // 使用 head_code 层计算 audio logits
-    const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+    const float * hidden_state = omni_tts_last_hidden(ctx_omni);
     if (hidden_state == nullptr) {
         LOG_ERR("TTS simplex: failed to get hidden state\n");
         return 0;
@@ -3166,12 +3194,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         // Clear KV cache to match Python's past_key_values=None behavior
         // Use llama_memory_seq_rm to remove all tokens from sequence 0
         // seq_id=0, p0=0 (from beginning), p1=-1 (to end) removes all tokens
-        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-        if (mem) {
-            llama_memory_seq_rm(mem, 0, 0, -1);
-        } else {
-            LOG_ERR("TTS: Failed to get memory for KV cache clear\n");
-        }
+        omni_tts_kv_clear(ctx_omni);
         
         // Reset n_past_tts to 0 (like Python's text_start_pos=0)
         int condition_n_past = 0;
@@ -3192,7 +3215,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     
     // 1. 获取TTS模型的最后一个位置的hidden state
     // hidden_state shape: (hidden_size=768,)
-    const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+    const float * hidden_state = omni_tts_last_hidden(ctx_omni);
     if (hidden_state == nullptr) {
         LOG_ERR("TTS: failed to get hidden state from TTS model\n");
         return 0;
@@ -4927,7 +4950,8 @@ void omni_free(struct omni_context * ctx_omni) {
 
     if (ctx_omni->use_tts && !ctx_omni->owns_tts_weights) {
         // session clone: free per-session TTS state only (weights belong to the parent)
-        llama_free(ctx_omni->ctx_tts_llama);
+        if (ctx_omni->tts_exec) { ctx_omni->tts_exec->free_seq(ctx_omni->tts_seq); ctx_omni->tts_exec = nullptr; ctx_omni->ctx_tts_llama = nullptr; }
+        else llama_free(ctx_omni->ctx_tts_llama);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
         if (ctx_omni->tts_condition_graph.initialized) {
             tts_condition_graph_free(ctx_omni);
@@ -4937,7 +4961,8 @@ void omni_free(struct omni_context * ctx_omni) {
             ctx_omni->token2wav_initialized = false;
         }
     } else if (ctx_omni->use_tts) {
-        llama_free(ctx_omni->ctx_tts_llama);
+        if (ctx_omni->tts_exec) { ctx_omni->tts_exec->free_seq(ctx_omni->tts_seq); if (ctx_omni->owns_tts_exec) delete ctx_omni->tts_exec; ctx_omni->tts_exec = nullptr; ctx_omni->ctx_tts_llama = nullptr; }
+        else llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
 
@@ -5120,6 +5145,22 @@ bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_s
     return true;
 }
 
+bool omni_enable_tts_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq) {
+    if (!root || !root->use_tts || !root->model_tts || root->tts_exec) return false;
+    llama_context_params cp = common_context_params_to_llama(*root->params);
+    if (const char * e = getenv("OMNI_TTS_UBATCH")) { int v = atoi(e); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(v, 512); } }
+    auto ex = omni_llm_exec_create(root->model_tts, cp, n_seq, n_ctx_per_seq, nullptr, "OMNI_TTS");
+    if (!ex) { LOG_ERR("omni_enable_tts_exec: failed to create shared TTS context\n"); return false; }
+    if (!ex->load_tok_emb(root->params->tts_model)) { LOG_ERR("omni_enable_tts_exec: failed to load TTS token_embd\n"); return false; }
+    if (root->ctx_tts_llama) llama_free(root->ctx_tts_llama);
+    root->tts_exec = ex.release();
+    root->owns_tts_exec = true;
+    root->tts_seq = root->tts_exec->alloc_seq();
+    root->ctx_tts_llama = root->tts_exec->ctx;
+    print_with_timestamp("=== omni_enable_tts_exec: shared TTS context n_seq=%d n_ctx/seq=%d policy=%s (tok_emb %.1f MB)\n",
+                         n_seq, n_ctx_per_seq, root->tts_exec->policy.c_str(), root->tts_exec->tok_emb.size() * 4.0 / 1e6);
+    return true;
+}
 struct omni_context * omni_session_clone(struct omni_context * parent, struct common_params * params,
                                          const std::string & base_output_dir,
                                          omni::flow::Token2WavSession * t2w_weight_owner) {
@@ -5196,8 +5237,15 @@ struct omni_context * omni_session_clone(struct omni_context * parent, struct co
         tp.n_ctx = params->n_ctx;
         if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tp.n_ctx = v; }
         if (const char * e = getenv("OMNI_TTS_UBATCH")) { int v = atoi(e); if (v > 0) { tp.n_ubatch = v; tp.n_batch = std::max<uint32_t>(v, tp.n_batch > 512 ? 512 : tp.n_batch); } }
-        c->ctx_tts_llama = llama_new_context_with_model(c->model_tts, tp);
-        if (!c->ctx_tts_llama) { LOG_ERR("omni_session_clone: TTS llama_new_context failed\n"); omni_free(c); return nullptr; }
+        if (parent->tts_exec) {
+            c->tts_exec = parent->tts_exec;
+            c->tts_seq  = parent->tts_exec->alloc_seq();
+            if (c->tts_seq < 0) { LOG_ERR("omni_session_clone: no free sequence in TTS executor\n"); omni_free(c); return nullptr; }
+            c->ctx_tts_llama = parent->tts_exec->ctx;   // vocab / n_embd only
+        } else {
+            c->ctx_tts_llama = llama_new_context_with_model(c->model_tts, tp);
+            if (!c->ctx_tts_llama) { LOG_ERR("omni_session_clone: TTS llama_new_context failed\n"); omni_free(c); return nullptr; }
+        }
         common_params_sampling ts = params->sampling;
         ts.temp = parent->tts_temperature; ts.top_p = 0.85f; ts.top_k = 25; ts.penalty_repeat = 1.05f; ts.min_p = 0.01f; ts.penalty_last_n = 16;
         c->ctx_tts_sampler = common_sampler_init(c->model_tts, ts);
@@ -5720,11 +5768,7 @@ static bool generate_audio_tokens_local_simplex(
     int n_past_tts = 0;
     if (chunk_idx == 0) {
         // 第一个 chunk：清空 KV cache
-        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-        if (mem) {
-            llama_memory_seq_rm(mem, 0, 0, -1);
-            print_with_timestamp("TTS Simplex: first chunk - cleared KV cache\n");
-        }
+        omni_tts_kv_clear(ctx_omni);
         ctx_omni->tts_n_past_accumulated = 0;
         ctx_omni->tts_all_generated_tokens.clear();
         ctx_omni->tts_token_buffer.clear();  // 🔧 [与 Python 对齐] 新轮对话清空 buffer
@@ -6151,11 +6195,7 @@ static bool generate_audio_tokens_local(
     int n_past_tts = 0;
     if (chunk_idx == 0) {
         // 第一个 chunk：清空 KV cache 和累积状态
-        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-        if (mem) {
-            llama_memory_seq_rm(mem, 0, 0, -1);
-            print_with_timestamp("TTS Local: first chunk - cleared KV cache\n");
-        }
+        omni_tts_kv_clear(ctx_omni);
         ctx_omni->tts_n_past_accumulated = 0;  // 重置累计 n_past
         ctx_omni->tts_all_generated_tokens.clear();
         if (!ctx_omni->duplex_mode) {
@@ -6671,11 +6711,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             all_audio_tokens.clear();
             incomplete_bytes.clear();
             // 清除 TTS KV cache
-            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-            if (mem) {
-                llama_memory_seq_rm(mem, 0, 0, -1);
-                print_with_timestamp("TTS Duplex: break_event - cleared TTS KV cache\n");
-            }
+            omni_tts_kv_clear(ctx_omni);
             ctx_omni->tts_n_past_accumulated = 0;
             ctx_omni->tts_all_generated_tokens.clear();
             ctx_omni->tts_condition_saved = false;
@@ -6763,10 +6799,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         chunk_idx = 0;
                         tts_n_past = 0;
                         audio_tokens.clear();
-                        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                        if (mem) {
-                            llama_memory_seq_rm(mem, 0, 0, -1);
-                        }
+                        omni_tts_kv_clear(ctx_omni);
                         ctx_omni->tts_n_past_accumulated = 0;
                         ctx_omni->tts_all_generated_tokens.clear();
                         ctx_omni->tts_condition_saved = false;
@@ -6821,10 +6854,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     chunk_idx = 0;
                     tts_n_past = 0;
                     audio_tokens.clear();
-                    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (mem) {
-                        llama_memory_seq_rm(mem, 0, 0, -1);
-                    }
+                    omni_tts_kv_clear(ctx_omni);
                     ctx_omni->tts_n_past_accumulated = 0;
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
@@ -6885,10 +6915,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 chunk_idx = 0;
                 tts_n_past = 0;
                 audio_tokens.clear();
-                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                if (mem && !ctx_omni->duplex_mode) {
-                    llama_memory_seq_rm(mem, 0, 0, -1);
-                }
+                if (true&& !ctx_omni->duplex_mode) omni_tts_kv_clear(ctx_omni);
                 ctx_omni->tts_n_past_accumulated = 0;
                 ctx_omni->tts_all_generated_tokens.clear();
                 ctx_omni->tts_condition_saved = false;
@@ -7133,10 +7160,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         ctx_omni->t2w_thread_info->cv.notify_one();
                     }
                     // 清除 TTS KV cache
-                    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (mem) {
-                        llama_memory_seq_rm(mem, 0, 0, -1);
-                    }
+                    omni_tts_kv_clear(ctx_omni);
                     ctx_omni->tts_n_past_accumulated = 0;
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
@@ -7187,10 +7211,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             
             // 重置 TTS 状态
             merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
-            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-            if (mem) {
-                llama_memory_seq_rm(mem, 0, 0, -1);
-            }
+            omni_tts_kv_clear(ctx_omni);
             ctx_omni->tts_n_past_accumulated = 0;
             ctx_omni->tts_all_generated_tokens.clear();
             ctx_omni->tts_condition_saved = false;
@@ -8184,11 +8205,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         if (should_reset) {
             fflush(stdout);
             // Clear KV cache to start fresh for new round
-            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-            if (mem) {
-                llama_memory_seq_rm(mem, 0, 0, -1);
-            } else {
-            }
+            omni_tts_kv_clear(ctx_omni);
             fflush(stdout);
             tts_n_past = 0;
         } else {

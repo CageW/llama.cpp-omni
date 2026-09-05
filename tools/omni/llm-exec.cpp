@@ -35,54 +35,42 @@ struct omni_llm_exec::impl {
                 // longer (OMNI_EXEC_PREFILL_WINDOW_US) so that a whole 1 s tick of sessions is merged,
                 // but never while a decode step is pending
                 {
+                    const int LT = self->long_threshold;
                     bool any_long = false, any_short = false;
-                    for (auto * s : queue) { (s->n > 8 ? any_long : any_short) = true; }
-                    static const int prefill_window_us = getenv("OMNI_EXEC_PREFILL_WINDOW_US") ? atoi(getenv("OMNI_EXEC_PREFILL_WINDOW_US")) : 0;
-                    // OMNI_EXEC_PREFILL_GATHER_US: when any prefill (long step) is pending, keep gathering for up to this
-                    // long and stop early only once OMNI_EXEC_PREFILL_TARGET (default n_seq) prefills are queued. Unlike
-                    // PREFILL_WINDOW_US, a pending decode step does NOT cut the wait short. Rationale: a 79-token prefill
-                    // costs ~77 ms alone but ~14 ms each when 24-32 are batched; under load there is always some decode
-                    // pending, so the window variant collapses to 3 ms and prefills go out 3-4 wide.
-                    static const int gather_us = getenv("OMNI_EXEC_PREFILL_GATHER_US") ? atoi(getenv("OMNI_EXEC_PREFILL_GATHER_US")) : 0;
-                    static const int gather_target = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
-                    // OMNI_EXEC_POLICY=ripe: never hold decode steps; hold prefills until >= OMNI_EXEC_PREFILL_TARGET
-                    // (default n_seq) are queued or the oldest has waited >= OMNI_EXEC_PREFILL_DEADLINE_US (default 200 ms).
-                    // Fixes the circular wait of gather mode: a session submits its next prefill only after this frame's
-                    // decodes finish, and those decodes sat in this queue behind the gather wait.
-                    static const char * pol_env = getenv("OMNI_EXEC_POLICY");
-                    static const bool ripe = pol_env && std::string(pol_env) == "ripe";
-                    static const int ripe_target_env   = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
-                    static const int ripe_deadline_us  = getenv("OMNI_EXEC_PREFILL_DEADLINE_US") ? atoi(getenv("OMNI_EXEC_PREFILL_DEADLINE_US")) : 200000;
+                    for (auto * s : queue) { (s->n > LT ? any_long : any_short) = true; }
+                    const bool ripe = self->policy == "ripe";
                     if (ripe) {
-                        const int target = ripe_target_env > 0 ? ripe_target_env : self->n_seq;
+                        // never hold decode steps; hold prefills until >= prefill_target are queued or the oldest has waited
+                        // >= prefill_deadline_us (breaks the circular wait of gather mode: a session submits its next prefill
+                        // only after this frame's decodes finish, and those decodes sat in this queue behind the gather wait)
+                        const int target = self->prefill_target > 0 ? self->prefill_target : self->n_seq;
                         auto ready = [&]{
                             if (!running) return true;
                             int n_long_r = 0; bool any_s = false, old = false;
                             const auto now = std::chrono::steady_clock::now();
                             for (auto * s : queue) {
-                                if (s->n <= 8) { any_s = true; continue; }
+                                if (s->n <= LT) { any_s = true; continue; }
                                 n_long_r++;
-                                if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= ripe_deadline_us) old = true;
+                                if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= self->prefill_deadline_us) old = true;
                             }
                             return any_s || n_long_r >= target || old;
                         };
-                        cv.wait_for(lk, std::chrono::microseconds(std::min(ripe_deadline_us, 20000)), ready);
+                        cv.wait_for(lk, std::chrono::microseconds(std::min(self->prefill_deadline_us, 20000)), ready);
                         if (running) cv.wait_for(lk, std::chrono::microseconds(window_us_), [&]{ return !running; });   // let same-tick decodes coalesce
-                    } else if (gather_us > 0 && any_long) {
-                        const int target = gather_target > 0 ? gather_target : self->n_seq;
-                        cv.wait_for(lk, std::chrono::microseconds(gather_us), [&]{
+                    } else if (self->prefill_gather_us > 0 && any_long) {
+                        const int target = self->prefill_target > 0 ? self->prefill_target : self->n_seq;
+                        cv.wait_for(lk, std::chrono::microseconds(self->prefill_gather_us), [&]{
                             if (!running) return true;
                             int n_long = 0;
-                            for (auto * s : queue) n_long += (s->n > 8);
+                            for (auto * s : queue) n_long += (s->n > LT);
                             return n_long >= target;
                         });
                     } else {
-                        const int w = (any_long && !any_short && prefill_window_us > window_us_) ? prefill_window_us : window_us_;
+                        const int w = (any_long && !any_short && self->prefill_window_us > window_us_) ? self->prefill_window_us : window_us_;
                         if (w > 0) {
-                            // wait until a short step arrives or the window elapses
                             cv.wait_for(lk, std::chrono::microseconds(w), [&]{
                                 if (!running) return true;
-                                for (auto * s : queue) if (s->n <= 8) return true;
+                                for (auto * s : queue) if (s->n <= LT) return true;
                                 return false;
                             });
                         }
@@ -101,9 +89,9 @@ struct omni_llm_exec::impl {
                 //             starves. Because a batch now has a single step length, the hybrid memory's
                 //             split_equal stays a single ubatch instead of exploding one mixed batch into
                 //             many forwards (which is what blows up the per-batch time at high concurrency).
-                static const char * pol = getenv("OMNI_EXEC_POLICY");
-                static const std::string policy = pol ? pol : "mixed";
-                static const int max_prefill = getenv("OMNI_EXEC_MAX_PREFILL") ? atoi(getenv("OMNI_EXEC_MAX_PREFILL")) : 2;
+                const std::string & policy = self->policy;
+                const int max_prefill = self->max_prefill;
+                const int LT = self->long_threshold;
                 int tok = 0, n_long = 0;
                 std::vector<bool> seq_taken(self->n_seq, false);
                 if (policy == "equal") {
@@ -115,16 +103,14 @@ struct omni_llm_exec::impl {
                         seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                     }
                 } else if (policy == "ripe") {
-                    static const int ripe_target_sel   = getenv("OMNI_EXEC_PREFILL_TARGET") ? atoi(getenv("OMNI_EXEC_PREFILL_TARGET")) : 0;
-                    static const int ripe_deadline_sel = getenv("OMNI_EXEC_PREFILL_DEADLINE_US") ? atoi(getenv("OMNI_EXEC_PREFILL_DEADLINE_US")) : 200000;
-                    const int target = ripe_target_sel > 0 ? ripe_target_sel : self->n_seq;
+                    const int target = self->prefill_target > 0 ? self->prefill_target : self->n_seq;
                     int n_long_q = 0; bool old = false;
                     const auto now = std::chrono::steady_clock::now();
-                    for (auto * s : queue) if (s->n > 8) { n_long_q++; if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= ripe_deadline_sel) old = true; }
+                    for (auto * s : queue) if (s->n > LT) { n_long_q++; if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= self->prefill_deadline_us) old = true; }
                     const bool take_long = n_long_q >= target || old;   // prefills ripe -> one wide prefill batch; else serve decodes
                     for (auto it = queue.begin(); it != queue.end();) {
                         step * s = *it;
-                        if ((s->n > 8) != take_long || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        if ((s->n > LT) != take_long || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                         seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                     }
                 } else if (policy == "pd") {
@@ -133,10 +119,10 @@ struct omni_llm_exec::impl {
                     const bool want_long = pd_prefill_turn;
                     pd_prefill_turn = !pd_prefill_turn;
                     bool have_wanted = false;
-                    for (auto * s : queue) if ((s->n > 8) == want_long) { have_wanted = true; break; }
+                    for (auto * s : queue) if ((s->n > LT) == want_long) { have_wanted = true; break; }
                     for (auto it = queue.begin(); it != queue.end();) {
                         step * s = *it;
-                        const bool is_long = s->n > 8;
+                        const bool is_long = s->n > LT;
                         if (is_long != want_long) { ++it; continue; }   // only take the wanted class this round
                         if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                         seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
@@ -146,17 +132,17 @@ struct omni_llm_exec::impl {
                         const bool other = !want_long;
                         for (auto it = queue.begin(); it != queue.end();) {
                             step * s = *it;
-                            if ((s->n > 8) != other || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                            if ((s->n > LT) != other || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                             seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                         }
                     }
                 } else {
                     const bool decode_first = policy == "decode";
                     bool have_short = false;
-                    if (decode_first) for (auto * s : queue) if (s->n <= 8) { have_short = true; break; }
+                    if (decode_first) for (auto * s : queue) if (s->n <= LT) { have_short = true; break; }
                     for (auto it = queue.begin(); it != queue.end();) {
                         step * s = *it;
-                        const bool is_long = s->n > 8;
+                        const bool is_long = s->n > LT;
                         if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                         if (decode_first) {
                             if (have_short && is_long) { ++it; continue; }
@@ -186,7 +172,7 @@ struct omni_llm_exec::impl {
         // become their own extra ubatch (a second forward). Pad therefore with 1-token steps on distinct reserved
         // sequences (ids n_seq .. n_seq+pad-1), bringing the step count up to a multiple of the granularity: the
         // decode ubatch then always has the same n_seqs / n_outputs and the captured CUDA graph is reused.
-        static const int pad_steps = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
+        const int pad_steps = self->pad_steps;
         int n_dummy = 0;
         if (pad_steps > 0) {
             const int n_steps_tgt = ((int) batch.size() + pad_steps - 1) / pad_steps * pad_steps;
@@ -229,7 +215,7 @@ struct omni_llm_exec::impl {
         self->n_pad_tokens += n_dummy;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         self->decode_ms_total += ms;
-        static const bool trace = getenv("OMNI_EXEC_TRACE") != nullptr;
+        const bool trace = self->trace;
         if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f qwait_avg=%.1f qwait_max=%.1f\n", batch.size(), n_tok, mx, ms, qwait_sum / batch.size(), qwait_max); }
         self->n_batches++; self->n_steps += batch.size(); self->n_tokens_total += n_tok;
         for (auto * s : batch) self->step_len_hist[s->n]++;
@@ -320,16 +306,30 @@ omni_llm_exec::~omni_llm_exec() {
 }
 
 std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, const struct llama_context_params & base,
-                                                    int n_seq, int n_ctx_per_seq, const char * device) {
+                                                    int n_seq, int n_ctx_per_seq, const char * device, const char * env_prefix) {
     auto e = std::make_unique<omni_llm_exec>();
+    // knob lookup: <prefix>_EXEC_<NAME>, falling back to OMNI_EXEC_<NAME> when no prefix is given
+    const std::string pfx = env_prefix && env_prefix[0] ? env_prefix : "OMNI";
+    auto knob = [&](const char * name) -> const char * { std::string k = pfx + "_EXEC_" + name; return getenv(k.c_str()); };
+    auto knob_i = [&](const char * name, int dflt) { const char * v = knob(name); return v ? atoi(v) : dflt; };
     llama_context_params cp = base;
-    const int pad = getenv("OMNI_EXEC_PAD") ? atoi(getenv("OMNI_EXEC_PAD")) : 0;
+    const int pad = knob_i("PAD", 0);
+    e->pad_steps = pad;
     cp.n_seq_max  = n_seq + std::max(pad, 0);       // reserved sequences for fixed-shape padding steps
     cp.n_ctx      = (uint32_t) n_ctx_per_seq * cp.n_seq_max;   // n_ctx must be a multiple of n_seq_max
-    cp.kv_unified = getenv("OMNI_EXEC_KV_UNIFIED") != nullptr;
+    cp.kv_unified = knob("KV_UNIFIED") != nullptr;
     cp.embeddings = true;              // hidden states for TTS
     cp.n_batch    = std::max<uint32_t>(cp.n_batch, 4096);
-    if (const char * u = getenv("OMNI_EXEC_UBATCH")) { int v = atoi(u); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(cp.n_batch, v); } }
+    if (const char * u = knob("UBATCH")) { int v = atoi(u); if (v > 0) { cp.n_ubatch = v; cp.n_batch = std::max<uint32_t>(cp.n_batch, v); } }
+    if (const char * v = knob("POLICY")) e->policy = v;
+    e->long_threshold      = knob_i("LONG_THRESHOLD", 8);
+    e->prefill_target      = knob_i("PREFILL_TARGET", 0);
+    e->prefill_deadline_us = knob_i("PREFILL_DEADLINE_US", 200000);
+    e->prefill_gather_us   = knob_i("PREFILL_GATHER_US", 0);
+    e->prefill_window_us   = knob_i("PREFILL_WINDOW_US", 0);
+    e->max_prefill         = knob_i("MAX_PREFILL", 2);
+    e->trace               = knob("TRACE") != nullptr;
+    if (const char * w = knob("WINDOW_US")) e->window_us = atoi(w);
     if (device && device[0]) {
         // NOTE: a llama_context cannot be pinned to a GPU independently of its model: device placement is fixed
         // at llama_model load (llama_model_params.devices), and every context shares the model's device set.
@@ -346,7 +346,6 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->max_tokens = (int) cp.n_batch;
     e->p = std::make_unique<omni_llm_exec::impl>();
     e->p->self = e.get();
-    if (const char * w = getenv("OMNI_EXEC_WINDOW_US")) e->window_us = atoi(w);
     e->p->window_us_ = e->window_us;
     e->p->worker = std::thread([pi = e->p.get()]{ pi->loop(); });
     return e;

@@ -56,7 +56,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv, start_file; int start_delay_ms = 0; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false; std::vector<std::string> enc_devs;
+    std::string out_csv, start_file; int start_delay_ms = 0; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false, use_tts_exec = false; std::vector<std::string> enc_devs;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -69,6 +69,7 @@ int main(int argc, char ** argv) {
         else if (a == "--ctk" && i + 1 < argc) { std::string t = argv[++i]; ctk = t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; }
         else if (a == "--ub" && i + 1 < argc) n_ubatch = atoi(argv[++i]);
         else if (a == "--exec") use_exec = true;
+        else if (a == "--tts-exec") use_tts_exec = true;
         else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (a == "--start-file" && i + 1 < argc) start_file = argv[++i];
         else if (a == "--start-delay-ms" && i + 1 < argc) start_delay_ms = atoi(argv[++i]);
@@ -102,6 +103,10 @@ int main(int argc, char ** argv) {
     if (!root) { fprintf(stderr, "omni_init failed\n"); return 1; }
     root->clean_kvcache = true;
     if (use_exec && !omni_enable_llm_exec(root, n_sessions, n_ctx)) { fprintf(stderr, "omni_enable_llm_exec failed\n"); return 1; }
+    if (use_tts_exec && use_tts) {
+        int tts_ctx = 2048; if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tts_ctx = v; }
+        if (!omni_enable_tts_exec(root, n_sessions, tts_ctx)) { fprintf(stderr, "omni_enable_tts_exec failed\n"); return 1; }
+    }
     if (!enc_devs.empty() && !omni_add_encoder_devices(root, enc_devs)) { fprintf(stderr, "omni_add_encoder_devices failed\n"); return 1; }
     const size_t mem_root = gpu_used_mib();
 
@@ -232,6 +237,14 @@ int main(int argc, char ** argv) {
     if (root->llm_exec) printf("[exec] queue wait per step: avg %.1f ms, max %.1f ms\n", root->llm_exec->n_steps ? root->llm_exec->qwait_ms_total / root->llm_exec->n_steps : 0.0, root->llm_exec->qwait_ms_max);
     if (root->ctx_vision) { uint64_t c = 0, im = 0; vision_batcher_stats(root->ctx_vision, &c, &im); if (c) printf("[vision] batched calls %llu images %llu (avg %.2f/call)\n", (unsigned long long) c, (unsigned long long) im, (double) im / c); }
     if (root->llm_exec) { printf("[exec] step length histogram:"); for (auto & kv : root->llm_exec->step_len_hist) printf(" %d:%llu", kv.first, (unsigned long long) kv.second); printf("\n"); }
+    if (root->tts_exec) { omni_llm_exec * ex = root->tts_exec;
+        printf("[tts-exec] batches %llu steps %llu tokens %llu forwards %llu | avg steps/batch %.2f max %llu | decode wall %.1f s (avg %.1f ms/batch) | queue wait avg %.1f ms max %.1f ms\n",
+            (unsigned long long) ex->n_batches, (unsigned long long) ex->n_steps, (unsigned long long) ex->n_tokens_total, (unsigned long long) ex->n_forward,
+            ex->n_batches ? (double) ex->n_steps / ex->n_batches : 0.0, (unsigned long long) ex->max_steps_in_batch,
+            ex->decode_ms_total / 1000.0, ex->n_batches ? ex->decode_ms_total / ex->n_batches : 0.0,
+            ex->n_steps ? ex->qwait_ms_total / ex->n_steps : 0.0, ex->qwait_ms_max);
+        printf("[tts-exec] step length histogram:"); for (auto & kv : ex->step_len_hist) printf(" %d:%llu", kv.first, (unsigned long long) kv.second); printf("\n");
+    }
     if (root->llm_exec_count > 1) {
         // multi-worker: per-worker batched-stats summary
         for (int w = 0; w < root->llm_exec_count; ++w) {

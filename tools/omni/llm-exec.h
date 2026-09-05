@@ -33,6 +33,14 @@ struct omni_llm_exec {
     int n_pos_per_embd = 1;
     int window_us  = 3000;        // how long the worker waits for more sessions to join a batch
     int max_tokens = 4096;        // logical batch cap
+    // scheduling knobs (per executor; filled from OMNI_EXEC_* or OMNI_<PREFIX>_EXEC_* at create time)
+    std::string policy = "mixed";  // mixed | equal | decode | pd | ripe
+    int long_threshold = 8;        // a step with n > long_threshold counts as "prefill" for scheduling
+    int prefill_target = 0;        // ripe/gather: release prefills once this many are queued (0 = n_seq)
+    int prefill_deadline_us = 200000;
+    int prefill_gather_us = 0, prefill_window_us = 0, max_prefill = 2;
+    bool trace = false;
+    int pad_steps = 0;             // fixed-shape padding (OMNI_EXEC_PAD)
 
     // submit a run of embeddings for `seq` starting at `pos0`; returns when the forward is done
     omni_llm_step_result run(int seq, int pos0, const float * embd, int n_tokens, bool all_outputs);
@@ -68,5 +76,8 @@ struct omni_llm_exec {
 // embeddings on (hidden states are needed for TTS).
 // `device` (optional): name of a single GPU (e.g. "CUDA1") to pin this executor to; nullptr/empty uses the
 // default device list from `base`. Used for the multi-worker layout (one executor per GPU).
+// `env_prefix` (optional, e.g. "OMNI_TTS"): read scheduling knobs from <prefix>_EXEC_* instead of OMNI_EXEC_*,
+// so a second executor (the TTS model) can be tuned independently of the LLM executor.
 std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, const struct llama_context_params & base,
-                                                    int n_seq, int n_ctx_per_seq, const char * device = nullptr);
+                                                    int n_seq, int n_ctx_per_seq, const char * device = nullptr,
+                                                    const char * env_prefix = nullptr);

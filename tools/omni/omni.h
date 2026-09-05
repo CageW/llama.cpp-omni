@@ -180,6 +180,11 @@ struct omni_context {
     struct llama_context * ctx_tts_llama = NULL;
     struct llama_model * model_tts = NULL;
     struct common_sampler * ctx_tts_sampler = NULL;
+    // ---- shared batched TTS executor (one llama_context on model_tts for all sessions; see omni_enable_tts_exec) ----
+    omni_llm_exec * tts_exec = nullptr;          // when set, TTS forwards go through tts_exec on sequence tts_seq
+    bool owns_tts_exec = false;
+    int  tts_seq = 0;
+    std::vector<float> tts_last_hidden;          // hidden state of the last TTS forward (replaces llama_get_embeddings_ith(ctx_tts_llama,-1))
     
     // struct TTSContext * ctx_tts = NULL;
     struct vocal_ctx * vocal = NULL;
@@ -516,6 +521,9 @@ struct omni_context {
 // LLM executor: one llama_context with n_seq sequences, one worker thread that merges the
 // forwards of concurrent sessions into a single llama_decode.
 bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq);
+// Same for the TTS model: one context with n_seq sequences, forwards of all sessions' TTS steps merged.
+// Knobs read from OMNI_TTS_EXEC_* (POLICY, WINDOW_US, KV_UNIFIED, UBATCH, ...). Must be called before cloning sessions.
+bool omni_enable_tts_exec(struct omni_context * root, int n_seq, int n_ctx_per_seq);
 // Load additional vision+audition weight copies on the given devices (e.g. {"CUDA1","CUDA3"}); sessions
 // cloned afterwards are spread round-robin over all encoder owners (including the root's).
 bool omni_add_encoder_devices(struct omni_context * root, const std::vector<std::string> & devices);
