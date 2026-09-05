@@ -200,4 +200,6 @@ GGUF 在南京节点 `/data/wangkaiqi/o5gguf/`，原始日志 `/data/wangkaiqi/l
 
 后两行说明两件事：TTS 的执行器不能和 Token2Wav 同卡（Token2Wav 把卡占到 88% 后，TTS 那些 1 毫秒的小 forward 被拉长五倍，整条语音链积压）；而放在 LLM 卡上只多占 14% 的 GPU 时间。另一条不改代码的路（把 TTS 的独立上下文直接放到 LLM 卡）不可行，24 个各自解码的 TTS 上下文会把主干 LLM 的 forward 挤碎，P95 到 2 到 4 秒。
 
-80 个 session 时的利用率：LLM 卡 66% 到 86%，Token2Wav 卡 87%，编码器卡 49% 到 60%。下一个卡住的仍然是 Token2Wav。
+80 在另一台节点重复一次：P95 1041 / 954 / 983 / 956，超时 4.2%，可复现。再加到 4×22 = 88 时 P95 1001 到 1094，超时 7.9%，属于边缘。
+
+80 个 session 时的利用率：LLM 卡 66% 到 86%，Token2Wav 卡 87%，编码器卡 49% 到 60%；88 时 Token2Wav 卡到 90%。下一个卡住的是 Token2Wav：它现在每个 session 的每个音频 chunk 单独过一遍 flow matching 和声码器，没有跨 session 的合批。
