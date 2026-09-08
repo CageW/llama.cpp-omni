@@ -56,7 +56,7 @@ static double pct(std::vector<double> v, double p) {
 
 int main(int argc, char ** argv) {
     std::string llm_path, prefix; int cnt = 36, n_sessions = 4, interval_ms = 1000, n_ctx = 8192; bool use_tts = true;
-    std::string out_csv, start_file; int start_delay_ms = 0; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false, use_tts_exec = false; std::vector<std::string> enc_devs;
+    std::string out_csv, start_file; int start_delay_ms = 0, main_gpu = 0, stagger_groups = 1, begin_threads = 1; ggml_type ctk = GGML_TYPE_F16; int n_ubatch = 512; int n_threads = 4; std::vector<std::string> t2w_devs{"gpu:0"}; bool use_exec = false, use_tts_exec = false; std::vector<std::string> enc_devs;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) llm_path = argv[++i];
@@ -73,6 +73,9 @@ int main(int argc, char ** argv) {
         else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (a == "--start-file" && i + 1 < argc) start_file = argv[++i];
         else if (a == "--start-delay-ms" && i + 1 < argc) start_delay_ms = atoi(argv[++i]);
+        else if (a == "--main-gpu" && i + 1 < argc) main_gpu = atoi(argv[++i]);   // omni EP: dense LLM layers on this CUDA device
+        else if (a == "--stagger-groups" && i + 1 < argc) stagger_groups = atoi(argv[++i]);   // session i starts at (i % G) * interval / G
+        else if (a == "--begin-threads" && i + 1 < argc) begin_threads = atoi(argv[++i]);   // run omni_duplex_session_begin with this many threads (each begin takes ~14 s)
         else if (a == "--enc-devices" && i + 1 < argc) { std::string l = argv[++i]; size_t q0 = 0; while (q0 <= l.size()) { size_t q = l.find(',', q0); if (q == std::string::npos) q = l.size(); if (q > q0) enc_devs.push_back(l.substr(q0, q - q0)); q0 = q + 1; } }
         else if (a == "--t2w-devices" && i + 1 < argc) { t2w_devs.clear(); std::string l = argv[++i]; size_t p = 0; while (p <= l.size()) { size_t q = l.find(',', p); if (q == std::string::npos) q = l.size(); if (q > p) t2w_devs.push_back(l.substr(p, q - p)); p = q + 1; } }
         else { fprintf(stderr, "usage: %s -m llm.gguf --test <prefix> <n> [-n sessions] [--interval ms] [-c n_ctx] [--no-tts] [--csv out]\n", argv[0]); return 1; }
@@ -85,12 +88,13 @@ int main(int argc, char ** argv) {
     params.cache_type_k = ctk; params.cache_type_v = ctk; params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.n_parallel = 1;
     params.cpuparams.n_threads = n_threads; params.cpuparams_batch.n_threads = n_threads;   // per-session CPU threads: default -1 = all cores -> N sessions oversubscribe the host
-    params.split_mode = LLAMA_SPLIT_MODE_NONE; params.main_gpu = 0;   // LLM/APM/VPM stay on the first visible GPU
+    params.split_mode = LLAMA_SPLIT_MODE_NONE; params.main_gpu = main_gpu;   // LLM (dense) on main_gpu; experts may be expert-split via LLAMA_EXPERT_SPLIT_DEVICES
     params.sampling.temp = 0.7f; params.sampling.top_p = 0.8f; params.sampling.top_k = 20; params.sampling.penalty_repeat = 1.05f;
     const std::string base = parent_dir(llm_path);
     const bool o5 = llm_path.find("o5") != std::string::npos;
     const std::string tag = o5 ? "MiniCPM-o5" : "MiniCPM-o-4_5";
     params.vpm_model = base + "/vision/" + tag + "-vision-F16.gguf";
+    if (const char * e = getenv("OMNI_VPM_MODEL")) params.vpm_model = e;   // omni: vision weight variant experiments (e.g. Q8_0)
     params.apm_model = base + "/audio/" + tag + "-audio-F16.gguf";
     params.tts_model = base + "/tts/" + tag + "-tts-F16.gguf";
     params.tts_bin_dir = base + "/tts";
@@ -152,9 +156,18 @@ int main(int argc, char ** argv) {
             stats[si].wav_chunks++;
         };
     }
-    // begin all sessions (system prompt prefill) sequentially
-    for (int i = 0; i < n_sessions; ++i) {
-        if (!omni_duplex_session_begin(sess[i], "", "./tools/omni/output/ms" + std::to_string(i))) { fprintf(stderr, "session_begin %d failed\n", i); return 1; }
+    // begin all sessions (system prompt prefill + Token2Wav prompt cache): ~14 s each, so optionally in parallel
+    {
+        std::atomic<int> next{0}, failed{0};
+        auto begin_worker = [&]() {
+            for (int i = next.fetch_add(1); i < n_sessions; i = next.fetch_add(1)) {
+                if (!omni_duplex_session_begin(sess[i], "", "./tools/omni/output/ms" + std::to_string(i))) { fprintf(stderr, "session_begin %d failed\n", i); failed++; }
+            }
+        };
+        std::vector<std::thread> bt;
+        for (int t = 0; t < std::max(1, begin_threads); ++t) bt.emplace_back(begin_worker);
+        for (auto & t : bt) t.join();
+        if (failed) return 1;
     }
     const size_t mem_begun = gpu_used_mib();
     printf("[mem] after session_begin x%d: %zu MiB\n", n_sessions, mem_begun);
@@ -172,10 +185,13 @@ int main(int argc, char ** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
     std::vector<std::thread> producers, consumers;
     for (int i = 0; i < n_sessions; ++i) {
-        t0[i] = t_start;
-        producers.emplace_back([&, i]() {
+        // --stagger-groups G: spread the sessions' frame ticks over G phases within one process (in-process analogue
+        // of the per-process --start-delay-ms offsets; keeps the encoder cards from seeing all frames at once)
+        const int64_t off_ms = stagger_groups > 1 ? (int64_t) (i % stagger_groups) * interval_ms / stagger_groups : 0;
+        t0[i] = t_start + std::chrono::milliseconds(off_ms);
+        producers.emplace_back([&, i, off_ms]() {
             for (int il = 0; il < cnt; ++il) {
-                std::this_thread::sleep_until(t_start + std::chrono::milliseconds((int64_t) il * interval_ms));
+                std::this_thread::sleep_until(t_start + std::chrono::milliseconds((int64_t) il * interval_ms + off_ms));
                 if (omni_duplex_push_frame(sess[i], frames[il]) < 0) { fprintf(stderr, "[s%d] push %d failed\n", i, il); break; }
             }
         });
