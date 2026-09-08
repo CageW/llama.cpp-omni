@@ -1,11 +1,27 @@
 #include "llm-exec.h"
 #include "omni-impl.h"
 #include "gguf.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <deque>
+
+struct omni_exec_lockstep {
+    std::mutex m;
+    std::condition_variable cv;
+    int n_members = 0, arrived = 0, with_work = 0;
+    int round_len = 0;          // step length (tokens) admitted in the requested round
+    uint64_t round = 0;
+    bool requested = false;
+    std::vector<struct omni_llm_exec::impl *> members;
+};
+static omni_exec_lockstep * g_lockstep = nullptr;
+void omni_llm_exec_lockstep_init(int n_members) {
+    g_lockstep = new omni_exec_lockstep();
+    g_lockstep->n_members = n_members;
+}
 
 struct omni_llm_exec::impl {
     struct step {
@@ -22,6 +38,7 @@ struct omni_llm_exec::impl {
     std::mutex run_mtx;              // serializes llama_decode with memory ops on the shared ctx
     std::vector<bool> seq_used;
     uint64_t forward_last = 0;       // last-read graph compute count of this executor's context (per executor)
+    bool lockstep_member = false;    // EP lock-step: only the LLM worker executors take part (not the TTS executor)
 
     void loop() {
         std::vector<step *> batch;
@@ -29,8 +46,68 @@ struct omni_llm_exec::impl {
             batch.clear();
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv.wait(lk, [&]{ return !queue.empty() || !running; });
+                cv.wait(lk, [&]{ return !queue.empty() || !running || (lockstep_member && g_lockstep->requested); });
                 if (!running && queue.empty()) return;
+                if (lockstep_member) {
+                    // ---- EP lock-step round: decide/join a round, take only steps of the round's length
+                    const int LT = self->long_threshold;
+                    int L = 0;
+                    { std::lock_guard<std::mutex> g(g_lockstep->m); if (g_lockstep->requested) L = g_lockstep->round_len; }
+                    if (L == 0 && !queue.empty()) {
+                        // ripe rule on the own queue: decodes are never held, prefills wait for >= target or the deadline
+                        const int target = self->prefill_target > 0 ? self->prefill_target : self->n_seq;
+                        const auto now = std::chrono::steady_clock::now();
+                        int n_long_q = 0, long_len = 0, short_len = 0; bool old = false;
+                        for (auto * s : queue) {
+                            if (s->n > LT) {
+                                n_long_q++; if (!long_len) long_len = s->n;
+                                if (std::chrono::duration_cast<std::chrono::microseconds>(now - s->t_enq).count() >= self->prefill_deadline_us) old = true;
+                            } else if (!short_len) { short_len = s->n; }
+                        }
+                        if (short_len) { L = short_len; } else if (n_long_q >= target || old) { L = long_len; }
+                        if (L == 0) {
+                            // prefills not ripe yet: wait a little, or until a round is requested
+                            cv.wait_for(lk, std::chrono::microseconds(std::min(self->prefill_deadline_us, 20000)),
+                                        [&]{ return !running || g_lockstep->requested; });
+                            continue;
+                        }
+                        std::vector<omni_llm_exec::impl *> members;
+                        {
+                            std::lock_guard<std::mutex> g(g_lockstep->m);
+                            if (!g_lockstep->requested) { g_lockstep->requested = true; g_lockstep->round_len = L; } else { L = g_lockstep->round_len; }
+                            members = g_lockstep->members;
+                        }
+                        for (auto * m : members) { if (m != this) { m->cv.notify_all(); } }
+                    }
+                    if (L == 0) { continue; }
+                    int tok = 0;
+                    std::vector<bool> seq_taken(self->n_seq, false);
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        step * s = *it;
+                        if (s->n != L || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                        seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
+                    }
+                    std::sort(batch.begin(), batch.end(), [](const step * a, const step * b){ return a->seq < b->seq; });
+                    lk.unlock();
+                    // barrier: the last member to arrive publishes the participant count and releases the round
+                    {
+                        std::unique_lock<std::mutex> g(g_lockstep->m);
+                        g_lockstep->arrived++;
+                        g_lockstep->with_work += batch.empty() ? 0 : 1;
+                        if (g_lockstep->arrived == g_lockstep->n_members) {
+                            ggml_backend_cuda_esplit_set_participants(g_lockstep->with_work);
+                            if (self->trace) fprintf(stderr, "[lockstep] round %llu len %d participants %d\n", (unsigned long long) g_lockstep->round + 1, g_lockstep->round_len, g_lockstep->with_work);
+                            g_lockstep->arrived = 0; g_lockstep->with_work = 0; g_lockstep->requested = false; g_lockstep->round++;
+                            g_lockstep->cv.notify_all();
+                        } else {
+                            const uint64_t r = g_lockstep->round;
+                            g_lockstep->cv.wait(g, [&]{ return g_lockstep->round != r; });
+                        }
+                    }
+                    if (self->trace) fprintf(stderr, "[lockstep] dev-exec %p round %llu: %zu steps of len %d\n", (void *) this, (unsigned long long) g_lockstep->round, batch.size(), L);
+                    if (batch.empty()) { continue; }
+                    goto lockstep_run;
+                }
                 // short window so concurrent sessions land in one forward; long steps (prefill) may wait
                 // longer (OMNI_EXEC_PREFILL_WINDOW_US) so that a whole 1 s tick of sessions is merged,
                 // but never while a decode step is pending
@@ -152,6 +229,7 @@ struct omni_llm_exec::impl {
                     }
                 }
             }
+            lockstep_run:
             if (batch.empty()) continue;
             // llama.cpp's equal-split for non-unified KV only merges sequences whose ids are increasing
             // in batch order; keep the batch sorted by sequence id so one forward stays one ubatch.
@@ -210,6 +288,7 @@ struct omni_llm_exec::impl {
         for (auto * s : batch) { double w = std::chrono::duration<double, std::milli>(t0 - s->t_enq).count(); qwait_sum += w; qwait_max = std::max(qwait_max, w); }
         self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
         const int rc = llama_decode(ctx, b);
+        if (rc != 0) fprintf(stderr, "[exec] llama_decode rc=%d (steps=%zu tok=%d)\n", rc, batch.size(), n_tok);
         self->n_forward += llama_context_graph_compute_count(ctx) - forward_last; forward_last = llama_context_graph_compute_count(ctx);
         for (int j = 0; j < n_dummy; j++) llama_memory_seq_rm(llama_get_memory(ctx), self->n_seq + j, -1, -1);
         self->n_pad_tokens += n_dummy;
@@ -347,6 +426,11 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->p = std::make_unique<omni_llm_exec::impl>();
     e->p->self = e.get();
     e->p->window_us_ = e->window_us;
+    if (g_lockstep && (env_prefix == nullptr || env_prefix[0] == 0)) {
+        std::lock_guard<std::mutex> g(g_lockstep->m);
+        g_lockstep->members.push_back(e->p.get());
+        e->p->lockstep_member = true;
+    }
     e->p->worker = std::thread([pi = e->p.get()]{ pi->loop(); });
     return e;
 }

@@ -514,6 +514,7 @@ struct omni_context {
     std::vector<omni_llm_exec *> llm_execs;      // root only; one per worker
     int llm_exec_count = 0;
     int llm_exec_rr = 0;                          // round-robin index for session -> worker assignment
+    std::vector<struct llama_model *> llm_worker_models;   // EP: extra dense model instances (one per worker GPU, experts shared via esplit)
     std::vector<float> last_logits;
 };
 

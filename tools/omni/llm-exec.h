@@ -78,6 +78,12 @@ struct omni_llm_exec {
 // default device list from `base`. Used for the multi-worker layout (one executor per GPU).
 // `env_prefix` (optional, e.g. "OMNI_TTS"): read scheduling knobs from <prefix>_EXEC_* instead of OMNI_EXEC_*,
 // so a second executor (the TTS model) can be tuned independently of the LLM executor.
+// omni EP lock-step: the N LLM executors (one per card, experts shared/split) run their forwards in rounds. A round is
+// started by an executor with ripe work; every executor joins with its pending steps of the round's step length
+// (or with nothing), the number of participants is published to the CUDA backend, and the participants' forwards
+// meet at every expert op for one merged grouped GEMM per card. Call before creating the executors.
+void omni_llm_exec_lockstep_init(int n_members);
+
 std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, const struct llama_context_params & base,
                                                     int n_seq, int n_ctx_per_seq, const char * device = nullptr,
                                                     const char * env_prefix = nullptr);

@@ -5026,6 +5026,8 @@ void omni_free(struct omni_context * ctx_omni) {
             if (ctx_omni->llm_exec_count > 1) {
                 for (auto * ex : ctx_omni->llm_execs) { if (ex) delete ex; }   // frees all worker contexts
                 ctx_omni->llm_execs.clear();
+                for (auto * m : ctx_omni->llm_worker_models) { if (m) llama_model_free(m); }   // EP dense instances
+                ctx_omni->llm_worker_models.clear();
             } else {
                 delete ctx_omni->llm_exec;   // frees the shared context
             }
@@ -5101,6 +5103,7 @@ bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_s
     // OMNI_EXEC_WORKER_DEVICES="CUDA0,CUDA1,..." pins each worker to a GPU (default CUDA0..CUDA{N-1}).
     const int workers = getenv("OMNI_EXEC_WORKERS") ? std::max(1, atoi(getenv("OMNI_EXEC_WORKERS"))) : 1;
     if (workers > 1) {
+        if (getenv("OMNI_EXEC_LOCKSTEP")) { omni_llm_exec_lockstep_init(workers); }   // EP: workers step together
         const char * devs = getenv("OMNI_EXEC_WORKER_DEVICES");
         int per = std::max(1, n_seq / workers);
         for (int w = 0; w < workers; ++w) {
@@ -5116,7 +5119,23 @@ bool omni_enable_llm_exec(struct omni_context * root, int n_seq, int n_ctx_per_s
             } else {
                 snprintf(dname, sizeof(dname), "CUDA%d", w);
             }
-            auto ex = omni_llm_exec_create(root->model, cp, per, n_ctx_per_seq, dname);
+            // EP (expert parallel): worker 0 uses the root model; every further worker gets its own model instance with
+            // the dense weights on its GPU (main_gpu = that device). With LLAMA_EXPERT_SPLIT_DEVICES + GGML_CUDA_ESPLIT_SHARE
+            // the expert shards are shared between the instances, so memory is N x dense + 1 x experts.
+            struct llama_model * wmodel = root->model;
+            if (w > 0) {
+                int dev_idx = w;
+                sscanf(dname, "CUDA%d", &dev_idx);
+                llama_model_params mp = common_model_params_to_llama(*root->params);
+                mp.split_mode = LLAMA_SPLIT_MODE_NONE;
+                mp.main_gpu   = dev_idx;
+                mp.devices    = nullptr;
+                wmodel = llama_model_load_from_file(root->params->model.path.c_str(), mp);
+                if (!wmodel) { LOG_ERR("omni_enable_llm_exec: worker %d (%s) model load failed\n", w, dname); return false; }
+                root->llm_worker_models.push_back(wmodel);
+                print_with_timestamp("=== omni_enable_llm_exec: worker %d dense model instance on %s\n", w, dname);
+            }
+            auto ex = omni_llm_exec_create(wmodel, cp, per, n_ctx_per_seq, dname);
             if (!ex) { LOG_ERR("omni_enable_llm_exec: worker %d (%s) create failed\n", w, dname); return false; }
             if (!ex->load_tok_emb(root->params->model.path)) { LOG_ERR("omni_enable_llm_exec: worker %d load_tok_emb failed\n", w); return false; }
             root->llm_execs.push_back(ex.release());
