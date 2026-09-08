@@ -1391,6 +1391,8 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    cudaEvent_t esplit_events[GGML_CUDA_MAX_DEVICES] = { nullptr };   // omni: expert-split MUL_MAT_ID fan-out/fan-in
+    cudaEvent_t esplit_ready = nullptr;                                 // omni: expert-split lock-step: 'my activations are quantized'
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

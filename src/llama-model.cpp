@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -904,6 +905,34 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
+            }
+        }
+    }
+
+    // omni: expert-parallel experiment. LLAMA_EXPERT_SPLIT_DEVICES="0,1,2,3" shards the MoE expert tensors of this
+    // device's layers over the listed CUDA devices (expert-split buffer type); everything else stays on `dev`.
+    if (const char * ep = getenv("LLAMA_EXPERT_SPLIT_DEVICES")) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        typedef ggml_backend_buffer_type_t (*esplit_fn_t)(int, const int *, int);
+        auto esplit_fn = reg ? (esplit_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_esplit_buffer_type") : nullptr;
+        if (esplit_fn) {
+            std::vector<int> devs;
+            for (const char * p = ep; *p; ) {
+                char * end; long v = strtol(p, &end, 10);
+                if (end == p) { break; }
+                devs.push_back((int) v);
+                p = (*end == ',') ? end + 1 : end;
+            }
+            int dev_index = -1;
+            for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                if (ggml_backend_reg_dev_get(reg, i) == dev) { dev_index = (int) i; }
+            }
+            if (!devs.empty() && dev_index >= 0) {
+                ggml_backend_buffer_type_t buft = esplit_fn(dev_index, devs.data(), (int) devs.size());
+                if (buft) {
+                    LLAMA_LOG_INFO("%s: expert-split buffer type %s for device %s\n", __func__, ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
+                    buft_list.emplace_back(dev, buft);
+                }
             }
         }
     }

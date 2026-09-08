@@ -20,6 +20,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
+#include "ggml-cuda/esplit.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
@@ -544,11 +545,35 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemRelease(handle));
 
             // set access
-            CUmemAccessDesc access = {};
-            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = device;
-            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CU_CHECK(cuMemSetAccess((CUdeviceptr)((char *)(pool_addr) + pool_size), reserve_size, &access, 1));
+            // omni: GGML_CUDA_VMM_PEER=1 also grants every peer-capable device access to this pool's memory. VMM
+            // mappings are NOT covered by cudaDeviceEnablePeerAccess, and the expert-split MUL_MAT_ID lets kernels on
+            // the expert-owner devices read the main device's pool buffers (sorted ids, quantized activations) directly.
+            std::vector<CUmemAccessDesc> accesses;
+            {
+                CUmemAccessDesc access = {};
+                access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                access.location.id = device;
+                access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                accesses.push_back(access);
+            }
+            static const bool vmm_peer = getenv("GGML_CUDA_VMM_PEER") != nullptr;
+            if (vmm_peer) {
+                for (int d = 0; d < ggml_backend_cuda_get_device_count(); ++d) {
+                    if (d == device) {
+                        continue;
+                    }
+                    int can = 0;
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can, d, device));
+                    if (can) {
+                        CUmemAccessDesc access = {};
+                        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                        access.location.id = d;
+                        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                        accesses.push_back(access);
+                    }
+                }
+            }
+            CU_CHECK(cuMemSetAccess((CUdeviceptr)((char *)(pool_addr) + pool_size), reserve_size, accesses.data(), accesses.size()));
 
             // add to the pool
             pool_size += reserve_size;
@@ -2460,8 +2485,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    const bool split = ggml_backend_buft_is_cuda_split(ffn_up->src[0]->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(ffn_gate->src[0]->buffer->buft);
+    const bool split = (ggml_backend_buft_is_cuda_split(ffn_up->src[0]->buffer->buft) || ggml_backend_buft_is_cuda_esplit(ffn_up->src[0]->buffer->buft)) ||
+                       (ggml_backend_buft_is_cuda_split(ffn_gate->src[0]->buffer->buft) || ggml_backend_buft_is_cuda_esplit(ffn_gate->src[0]->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2485,8 +2510,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    const bool split = (ggml_backend_buft_is_cuda_split(src0->buffer->buft) || ggml_backend_buft_is_cuda_esplit(src0->buffer->buft)) ||
+                       (ggml_backend_buft_is_cuda_split(src1->buffer->buft) || ggml_backend_buft_is_cuda_esplit(src1->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2533,8 +2558,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
 
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    const bool split = (ggml_backend_buft_is_cuda_split(src0->buffer->buft) || ggml_backend_buft_is_cuda_esplit(src0->buffer->buft)) ||
+                       (ggml_backend_buft_is_cuda_split(src1->buffer->buft) || ggml_backend_buft_is_cuda_esplit(src1->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2545,7 +2570,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    const bool split = (ggml_backend_buft_is_cuda_split(src0->buffer->buft) || ggml_backend_buft_is_cuda_esplit(src0->buffer->buft));
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2643,6 +2668,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    if (ggml_backend_buft_is_cuda_esplit(src0->buffer->buft)) {   // omni: expert-parallel path
+        ggml_cuda_mul_mat_id_esplit(ctx, dst);
+        return;
+    }
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -2664,6 +2693,28 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
+            }
+        }
+
+        // omni: decode-size MUL_MAT_ID beyond the vector kernel's token limit (e.g. 22 sessions x 1 token): the tiled
+        // MMQ kernel sees ~1.4 (token, expert) columns per active expert and spends its time on tile setup, while the
+        // vector kernel is weight-bandwidth bound. Split the tokens into chunks of <= mmvq_mmid_max and run the vector
+        // kernel per chunk (each chunk re-reads its experts' weights, so this only pays off for small token counts).
+        // GGML_CUDA_MMVQ_MMID_CHUNK_MAX=<tokens> enables it up to that token count (default 0 = off).
+        if (ggml_is_quantized(src0->type)) {
+            static const int chunk_max_tokens = getenv("GGML_CUDA_MMVQ_MMID_CHUNK_MAX") ? atoi(getenv("GGML_CUDA_MMVQ_MMID_CHUNK_MAX")) : 0;
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            if (ne2 > mmvq_mmid_max && ne2 <= chunk_max_tokens) {
+                for (int64_t i0 = 0; i0 < ne2; i0 += mmvq_mmid_max) {
+                    const int64_t n = std::min<int64_t>(mmvq_mmid_max, ne2 - i0);
+                    ggml_tensor src1_c = *src1; ggml_tensor ids_c = *ids; ggml_tensor dst_c = *dst;
+                    src1_c.ne[2] = n; src1_c.data = (char *) src1->data + i0*src1->nb[2];
+                    ids_c.ne[1]  = n; ids_c.data  = (char *) ids->data  + i0*ids->nb[1];
+                    dst_c.ne[2]  = n; dst_c.data  = (char *) dst->data  + i0*dst->nb[2];
+                    dst_c.src[1] = &src1_c; dst_c.src[2] = &ids_c;
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, &ids_c, &dst_c);
+                }
+                return;
             }
         }
 
@@ -3269,7 +3320,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
+        if (node->src[0] && node->src[0]->buffer && (ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft) || ggml_backend_buft_is_cuda_esplit(node->src[0]->buffer->buft))) {
             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
@@ -4405,7 +4456,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || ggml_backend_buft_is_cuda_esplit(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
 #else
@@ -5067,6 +5118,14 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // omni: expert-split buffers can only be the weight (src0) of GGML_OP_MUL_MAT_ID, on the buffer's main device
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_esplit(op->src[i]->buffer->buft)) {
+            if (!(op->op == GGML_OP_MUL_MAT_ID && i == 0 && op->src[i]->buffer->buft->device == dev)) {
+                return false;
+            }
+        }
+    }
     // split buffers can only be used with GGML_OP_MUL_MAT
     if (op->op != GGML_OP_MUL_MAT) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -5454,7 +5513,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_split(buft)) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)));
+    return (((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_split(buft) || ggml_backend_buft_is_cuda_esplit(buft)) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -5622,6 +5681,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_esplit_buffer_type") == 0) {   // omni
+        return (void *)ggml_backend_cuda_esplit_buffer_type;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
