@@ -481,8 +481,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
+    // omni: 2-D (all tokens in one column dimension) instead of [.., n_seq_tokens, n_seqs]. With the 3-D layout a
+    // multi-sequence decode step (n_seq_tokens = 1, n_seqs = 22) made the CUDA backend run the output projection as 22
+    // per-sequence matrix-vector products, re-reading the 8 MB weight 22 times (2.9 ms of a 33 ms forward on H20);
+    // as one [n_embd_v, n_tokens] matmul it is a single tiled GEMM. Memory order is identical, the result is the
+    // same [n_embd, n_seq_tokens * n_seqs] tensor as before.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
