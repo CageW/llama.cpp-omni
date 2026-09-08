@@ -291,6 +291,14 @@ static bool is_minicpm_o_4_6(const vision_model & model) {
 }
 
 struct vision_graph {
+    // omni: OMNI_VISION_MM_F32=1 (default) asks cuBLAS for an F32 result directly; the default F16-result path adds a
+    // convert kernel after every linear layer (6.6% of the encoder's GPU time). 0 restores the default precision.
+    static bool mm_f32() { static const bool v = [] { const char * e = getenv("OMNI_VISION_MM_F32"); return !e || atoi(e) != 0; }(); return v; }
+    ggml_tensor * mm(ggml_tensor * w, ggml_tensor * x) const {
+        ggml_tensor * r = ggml_mul_mat(ctx0, w, x);
+        if (mm_f32()) ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+        return r;
+    }
     vision_ctx * ctx;
     const vision_model & model;
     const vision_hparams & hparams;
@@ -368,7 +376,7 @@ struct vision_graph {
         // resampler projector (it is just another transformer)
 
         ggml_tensor * q = model.mm_model_query;
-        ggml_tensor * v = ggml_mul_mat(ctx0, model.mm_model_kv_proj, embeddings);
+        ggml_tensor * v = mm(model.mm_model_kv_proj, embeddings);
 
         // norm
         q = build_norm(q, model.mm_model_ln_q_w, model.mm_model_ln_q_b, NORM_TYPE_NORMAL, eps, -1);
@@ -384,13 +392,13 @@ struct vision_graph {
             int n_head = n_embd/d_head;
             int num_query = ctx->model.hparams.minicpmv_query_num;
             ggml_tensor * Q = ggml_add(ctx0,
-                ggml_mul_mat(ctx0, model.mm_model_attn_q_w, q),
+                mm(model.mm_model_attn_q_w, q),
                 model.mm_model_attn_q_b);
             ggml_tensor * K = ggml_add(ctx0,
-                ggml_mul_mat(ctx0, model.mm_model_attn_k_w, k),
+                mm(model.mm_model_attn_k_w, k),
                 model.mm_model_attn_k_b);
             ggml_tensor * V = ggml_add(ctx0,
-                ggml_mul_mat(ctx0, model.mm_model_attn_v_w, v),
+                mm(model.mm_model_attn_v_w, v),
                 model.mm_model_attn_v_b);
 
             Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, num_query);
@@ -421,7 +429,7 @@ struct vision_graph {
         embeddings = build_norm(embeddings, model.mm_model_ln_post_w, model.mm_model_ln_post_b, NORM_TYPE_NORMAL, eps, -1);
 
         // projection
-        embeddings = ggml_mul_mat(ctx0, model.mm_model_proj, embeddings);
+        embeddings = mm(model.mm_model_proj, embeddings);
 
         // build the graph
         ggml_build_forward_expand(gf, embeddings);
@@ -508,15 +516,15 @@ struct vision_graph {
             cb(cur, "layer_inp_normed", il);
 
             {
-                ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                ggml_tensor * Qcur = mm(layer.q_w, cur);
                 if (layer.q_b) {
                     Qcur = ggml_add(ctx0, Qcur, layer.q_b);
                 }
-                ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                ggml_tensor * Kcur = mm(layer.k_w, cur);
                 if (layer.k_b) {
                     Kcur = ggml_add(ctx0, Kcur, layer.k_b);
                 }
-                ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                ggml_tensor * Vcur = mm(layer.v_w, cur);
                 if (layer.v_b) {
                     Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                 }
@@ -572,15 +580,15 @@ struct vision_graph {
             cur = ggml_get_rows(ctx0, cur, vit_merger_window_idx);
             cb(cur, "vit_merger_window_reorder", -1);
 
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.vit_merger_attn_q_w, cur);
+            ggml_tensor * Qcur = mm(model.vit_merger_attn_q_w, cur);
             if (model.vit_merger_attn_q_b) {
                 Qcur = ggml_add(ctx0, Qcur, model.vit_merger_attn_q_b);
             }
-            ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.vit_merger_attn_k_w, cur);
+            ggml_tensor * Kcur = mm(model.vit_merger_attn_k_w, cur);
             if (model.vit_merger_attn_k_b) {
                 Kcur = ggml_add(ctx0, Kcur, model.vit_merger_attn_k_b);
             }
-            ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.vit_merger_attn_v_w, cur);
+            ggml_tensor * Vcur = mm(model.vit_merger_attn_v_w, cur);
             if (model.vit_merger_attn_v_b) {
                 Vcur = ggml_add(ctx0, Vcur, model.vit_merger_attn_v_b);
             }
@@ -646,15 +654,15 @@ struct vision_graph {
                 cb(cur, "layer_inp_normed", il);
 
                 {
-                    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                    ggml_tensor * Qcur = mm(layer.q_w, cur);
                     if (layer.q_b) {
                         Qcur = ggml_add(ctx0, Qcur, layer.q_b);
                     }
-                    ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                    ggml_tensor * Kcur = mm(layer.k_w, cur);
                     if (layer.k_b) {
                         Kcur = ggml_add(ctx0, Kcur, layer.k_b);
                     }
-                    ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                    ggml_tensor * Vcur = mm(layer.v_w, cur);
                     if (layer.v_b) {
                         Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                     }
@@ -783,17 +791,17 @@ private:
 
             // self-attention
             {
-                ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                ggml_tensor * Qcur = mm(layer.q_w, cur);
                 if (layer.q_b) {
                     Qcur = ggml_add(ctx0, Qcur, layer.q_b);
                 }
 
-                ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                ggml_tensor * Kcur = mm(layer.k_w, cur);
                 if (layer.k_b) {
                     Kcur = ggml_add(ctx0, Kcur, layer.k_b);
                 }
 
-                ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                ggml_tensor * Vcur = mm(layer.v_w, cur);
                 if (layer.v_b) {
                     Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                 }
@@ -949,7 +957,7 @@ private:
             ffn_op_type type_op,
             int il) const {
 
-        ggml_tensor * tmp = up ? ggml_mul_mat(ctx0, up, cur) : cur;
+        ggml_tensor * tmp = up ? mm(up, cur) : cur;
         cb(tmp, "ffn_up", il);
 
         if (up_b) {
@@ -958,7 +966,7 @@ private:
         }
 
         if (gate) {
-            cur = ggml_mul_mat(ctx0, gate, cur);
+            cur = mm(gate, cur);
             cb(cur, "ffn_gate", il);
 
             if (gate_b) {
@@ -1006,7 +1014,7 @@ private:
         }
 
         if (down) {
-            cur = ggml_mul_mat(ctx0, down, cur);
+            cur = mm(down, cur);
         }
 
         if (down_b) {
@@ -1035,6 +1043,43 @@ private:
         ggml_build_forward_expand(gf, k_cur);
         ggml_build_forward_expand(gf, v_cur);
 
+        ggml_tensor * cur;
+
+        // omni: flash attention for the ViT (OMNI_VISION_FA=0 restores the mul_mat + soft_max path).
+        // The old path materializes the [n_pos x n_pos] KQ matrix per head in F32 and runs a memory-bound
+        // softmax over it (22% of the encoder's GPU time at 1024 patches), plus F32<->F16 conversions around
+        // cuBLAS (13%). FA fuses QK^T, softmax and the V product; K/V are cast to F16 (required by the CUDA
+        // kernels), the window mask (merger layer only) to F16.
+        static const bool use_fa = [] { const char * e = getenv("OMNI_VISION_FA"); return !e || atoi(e) != 0; }();
+        if (use_fa) {
+            const auto n_tokens = q_cur->ne[2];
+            const auto n_head   = q_cur->ne[1];
+            const auto n_batch  = q_cur->ne[3];
+            // head size 72 (SigLIP 1152/16) is excluded from the CUDA tensor-core (mma) FA kernels and falls back to
+            // the generic tile kernel, which is no faster than mul_mat + soft_max. Zero-pad the head dim to
+            // OMNI_VISION_FA_PAD (default 80, an mma size): QK^T is unchanged by zero dims, the V product gets zero
+            // columns that are sliced off below.
+            static const int fa_pad = [] { const char * e = getenv("OMNI_VISION_FA_PAD"); return e ? atoi(e) : 80; }();
+            const int64_t d_head = q_cur->ne[0];
+            const int     pad    = (fa_pad > d_head) ? (int) (fa_pad - d_head) : 0;
+            ggml_tensor * q_src = pad ? ggml_pad(ctx0, q_cur, pad, 0, 0, 0) : q_cur;        // [d', n_head, n_pos, B]
+            ggml_tensor * k_src = pad ? ggml_pad(ctx0, k_cur, pad, 0, 0, 0) : k_cur;
+            ggml_tensor * v_src = pad ? ggml_pad(ctx0, v_cur, pad, 0, 0, 0) : v_cur;
+            ggml_tensor * q = ggml_permute(ctx0, q_src, 0, 2, 1, 3);                          // [d', n_pos, n_head, B]
+            ggml_tensor * k = ggml_cast(ctx0, ggml_permute(ctx0, k_src, 0, 2, 1, 3), GGML_TYPE_F16);
+            ggml_tensor * v = ggml_cast(ctx0, ggml_permute(ctx0, v_src, 0, 2, 1, 3), GGML_TYPE_F16);
+            ggml_tensor * mask = kq_mask ? ggml_cast(ctx0, kq_mask, GGML_TYPE_F16) : nullptr;   // [n_kv, n_pos]
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale, 0.0f, 0.0f);            // [d', n_head, n_pos, B]
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            if (pad) {
+                cur = ggml_cont(ctx0, ggml_view_4d(ctx0, cur, d_head, n_head, n_tokens, n_batch, cur->nb[1], cur->nb[2], cur->nb[3], 0));
+            }
+            if (n_batch > 1) {
+                cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]*n_head, n_tokens, n_batch);
+            } else {
+                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
+            }
+        } else {
         ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
         //cb(q, "q", il);
 
@@ -1045,22 +1090,15 @@ private:
         v = ggml_cont(ctx0, v);
         //cb(k, "v", il);
 
-        ggml_tensor * cur;
-
-        // TODO @ngxson : support flash attention
         {
             const auto n_tokens = q->ne[1];
             const auto n_head   = q->ne[2];
             const auto n_batch  = q->ne[3];
-            // const auto n_kv     = k->ne[1]; // for flash attention
 
-            ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-            // F32 may not needed for vision encoders?
-            // ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
+            ggml_tensor * kq = mm(k, q);
             kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
 
-            ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+            ggml_tensor * kqv = mm(v, kq);
             cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
             if (n_batch > 1) {
                 cur = ggml_cont(ctx0, cur);
@@ -1069,11 +1107,12 @@ private:
                 cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
             }
         }
+        }
 
         cb(cur, "kqv_out", il);
 
         if (wo) {
-            cur = ggml_mul_mat(ctx0, wo, cur);
+            cur = mm(wo, cur);
         }
 
         if (wo_b) {
@@ -2616,6 +2655,17 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     // copy the embeddings to the location passed by the user
     // for batch>1, output is contiguous: [embd * n_tokens * batch_size]
     ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
+    // omni: OMNI_VISION_DUMP=<path> writes the first batch's output embeddings once (numeric A/B of graph variants)
+    {
+        static const char * dump = getenv("OMNI_VISION_DUMP");
+        static bool dumped = false;
+        if (dump && !dumped) {
+            dumped = true;
+            if (FILE * fo = fopen(dump, "wb")) { fwrite(vec, 1, ggml_nbytes(embeddings), fo); fclose(fo); }
+            LOG_INF("%s: dumped %zu bytes of embeddings (ne0=%lld ne1=%lld ne2=%lld) to %s\n", __func__, (size_t) ggml_nbytes(embeddings),
+                    (long long) embeddings->ne[0], (long long) embeddings->ne[1], (long long) embeddings->ne[2], dump);
+        }
+    }
 
     return true;
 }
