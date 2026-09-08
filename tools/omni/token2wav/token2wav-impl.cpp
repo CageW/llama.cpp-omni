@@ -5,6 +5,8 @@
 #include "token2wav-profile.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <map>
 #include <cstdio>
 #include <string>
 #include <cmath>
@@ -6672,9 +6674,11 @@ bool voc_hg2_runner::init_own_backend() {
     omni_try_enable_cuda_batched_add(own_backend);
     own_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(own_backend));
     if (!own_galloc) { ggml_backend_free(own_backend); own_backend = nullptr; return false; }
+    gen_local.reset(new hifigan2::hg2_hift_generator(model->hg2->gen));   // private per-eval state (see header)
     return true;
 }
 void voc_hg2_runner::free_own_backend() {
+    gen_local.reset();
     if (own_galloc)  { ggml_gallocr_free(own_galloc); own_galloc = nullptr; }
     if (own_backend) { ggml_backend_free(own_backend); own_backend = nullptr; }
 }
@@ -6688,15 +6692,15 @@ bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
         !out_source_t1_b) {
         return false;
     }
-    model->hg2->gen.dsp.hg_stft16_params_init(ctx);
-    model->hg2->gen.source_nsf.sine_gen.sine_amp         = 0.1f;
-    model->hg2->gen.source_nsf.sine_gen.noise_std        = 0.003f;
-    model->hg2->gen.source_nsf.sine_gen.voiced_threshold = 10.0f;
-    model->hg2->gen.source_nsf.sine_gen.flag_for_pulse   = false;
-    model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_init(ctx, 8);
+    gen().dsp.hg_stft16_params_init(ctx);
+    gen().source_nsf.sine_gen.sine_amp         = 0.1f;
+    gen().source_nsf.sine_gen.noise_std        = 0.003f;
+    gen().source_nsf.sine_gen.voiced_threshold = 10.0f;
+    gen().source_nsf.sine_gen.flag_for_pulse   = false;
+    gen().source_nsf.sine_gen.hg_sine_gen2_init(ctx, 8);
     ggml_tensor * wave_t_b    = nullptr;
     ggml_tensor * source_t1_b = nullptr;
-    if (!model->hg2->gen.build_graph_forward(ctx, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
+    if (!gen().build_graph_forward(ctx, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
         return false;
     }
     wave_t_b    = ggml_cont(ctx, wave_t_b);
@@ -6769,11 +6773,15 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             ggml_free(ctx);
             return false;
         }
+        {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 2) std::fprintf(stderr, "[voc-mem] vocoder galloc reserved %zu MiB (T_mel=%lld, own_backend=%d)\n", (size_t) ggml_gallocr_get_buffer_size(galloc(), 0) >> 20, (long long) T_mel, own_backend ? 1 : 0);
+        }
     }
     {
         omni::flow::profile::ScopeTimer _t("voc.upload");
-        model->hg2->gen.dsp.hg_stft16_params_upload_consts(backend());
-        model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(backend());
+        gen().dsp.hg_stft16_params_upload_consts(backend());
+        gen().source_nsf.sine_gen.hg_sine_gen2_upload_consts(backend());
         hg_backend_tensor_set(backend(), speech_upload_tcb, speech_feat_bct.data(),
                                                  speech_feat_bct.size() * sizeof(float));
         if (Tc > 0) {
@@ -7624,12 +7632,22 @@ bool flowGGUFModelRunner::load_from_gguf(const std::string & encoder_gguf_path,
     reset_stream();
     return true;
 }
-void flowGGUFModelRunner::attach_loader(std::shared_ptr<flowGGUFModelLoader> loader) {
+ggml_tensor * flowGGUFModelRunner::stream_cache_tensor(int i) const {
+    if (!sess_) { return nullptr; }
+    switch (i) {
+        case 0: return sess_->conf_cnn_cache;
+        case 1: return sess_->conf_att_cache;
+        case 2: return sess_->est_cnn_cache;
+        case 3: return sess_->est_att_cache;
+        default: return nullptr;
+    }
+}
+void flowGGUFModelRunner::attach_loader(std::shared_ptr<flowGGUFModelLoader> loader, bool own_backend) {
     if (sess_) { sess_->clear(); sess_.reset(); }
     if (sess_enc_only_) { sess_enc_only_->clear(); sess_enc_only_.reset(); }
     if (compute_backend_) { ggml_backend_free(compute_backend_); compute_backend_ = nullptr; }
     loader_ = loader ? loader : std::make_shared<flowGGUFModelLoader>();
-    if (loader_->backend() && runner_backend_is_device(loader_->backend())) {
+    if (own_backend && loader_->backend() && runner_backend_is_device(loader_->backend())) {
         compute_backend_ = ggml_backend_dev_init(ggml_backend_get_device(loader_->backend()), nullptr);
         if (compute_backend_) omni_try_enable_cuda_batched_add(compute_backend_);
     }
@@ -7853,6 +7871,17 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         if (!ggml_gallocr_alloc_graph(sess_->galloc, gf_alloc)) {
             sess_->clear();
             return false;
+        }
+        std::fprintf(stderr, "[t2m-mem] session galloc reserved %zu MiB (backend %s)\n", (size_t) ggml_gallocr_get_buffer_size(sess_->galloc, 0) >> 20, ggml_backend_name(backend()));
+        {   // omni: what part of the reservation is persistent per-session state (caches, prompt) vs activations
+            auto nb = [](const ggml_tensor * t) { return t ? (size_t) ggml_nbytes(t) >> 10 : (size_t) 0; };
+            std::fprintf(stderr, "[t2m-mem]   caches KiB: conf_cnn=%zu conf_att=%zu est_cnn=%zu est_att=%zu | prompt: tokens=%zu mel=%zu spk=%zu | chunk_tokens=%zu out_feat=%zu/%zu\n",
+                         nb(sess_->conf_cnn_cache), nb(sess_->conf_att_cache), nb(sess_->est_cnn_cache), nb(sess_->est_att_cache),
+                         nb(sess_->prompt_token_ids_tb), nb(sess_->prompt_mel_ctb), nb(sess_->spk_cb), nb(sess_->chunk_token_ids_tb),
+                         nb(sess_->out_feat_nonlast_ctb), nb(sess_->out_feat_last_ctb));
+            size_t total = 0; int n_t = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(sess_->ctx); t; t = ggml_get_next_tensor(sess_->ctx, t)) { total += ggml_nbytes(t); n_t++; }
+            std::fprintf(stderr, "[t2m-mem]   session ctx: %d tensors, %zu MiB if all were live (galloc reuses activations)\n", n_t, total >> 20);
         }
     }
     std::vector<int32_t> token_tb;
@@ -8177,6 +8206,7 @@ bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *          
             s.clear();
             return false;
         }
+        std::fprintf(stderr, "[t2m-mem] session galloc reserved %zu MiB (backend %s)\n", (size_t) ggml_gallocr_get_buffer_size(s.galloc, 0) >> 20, ggml_backend_name(backend()));
         // 把 cache_in 的 conformer cache 字节写入持久 tensor
         backend_tensor_set(backend(), s.conf_cnn_cache,
                            cache_in_conformer.conformer_cnn_cache.data(),
@@ -8491,6 +8521,17 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             sess_->clear();
             return false;
         }
+        std::fprintf(stderr, "[t2m-mem] session galloc reserved %zu MiB (backend %s)\n", (size_t) ggml_gallocr_get_buffer_size(sess_->galloc, 0) >> 20, ggml_backend_name(backend()));
+        {   // omni: what part of the reservation is persistent per-session state (caches, prompt) vs activations
+            auto nb = [](const ggml_tensor * t) { return t ? (size_t) ggml_nbytes(t) >> 10 : (size_t) 0; };
+            std::fprintf(stderr, "[t2m-mem]   caches KiB: conf_cnn=%zu conf_att=%zu est_cnn=%zu est_att=%zu | prompt: tokens=%zu mel=%zu spk=%zu | chunk_tokens=%zu out_feat=%zu/%zu\n",
+                         nb(sess_->conf_cnn_cache), nb(sess_->conf_att_cache), nb(sess_->est_cnn_cache), nb(sess_->est_att_cache),
+                         nb(sess_->prompt_token_ids_tb), nb(sess_->prompt_mel_ctb), nb(sess_->spk_cb), nb(sess_->chunk_token_ids_tb),
+                         nb(sess_->out_feat_nonlast_ctb), nb(sess_->out_feat_last_ctb));
+            size_t total = 0; int n_t = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(sess_->ctx); t; t = ggml_get_next_tensor(sess_->ctx, t)) { total += ggml_nbytes(t); n_t++; }
+            std::fprintf(stderr, "[t2m-mem]   session ctx: %d tensors, %zu MiB if all were live (galloc reuses activations)\n", n_t, total >> 20);
+        }
     }
     std::vector<float> spk_cb;
     runner_bc_to_cb(spk_bc, B, 192, spk_cb);
@@ -8733,7 +8774,7 @@ bool Token2Mel::attach_shared_model(std::shared_ptr<flowGGUFModelLoader> loader,
         model_loaded_ = false;
         return false;
     }
-    runner_.attach_loader(loader);
+    runner_.attach_loader(loader, /*own_backend=*/slot_pool_ == nullptr);
     runner_.set_num_threads(threads);
     runner_.set_export_caches_to_host(false);
     backend_kind_ = Backend::GGUF;
@@ -8966,6 +9007,146 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
     return true;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// omni slot mode (OMNI_T2W_SLOTS=K): a per-card pool of K compute slots. A slot owns a token2mel runner with its
+// prebuilt chunk graphs and activation space (~800 MB, of which only ~200 MB are the session's stream caches) and a
+// vocoder runner with its own backend. A session keeps only a device snapshot of its 4 stream caches; per chunk it
+// borrows a slot, copies the snapshot into the slot's cache tensors (device-to-device), runs, copies them back.
+struct t2w_slot {
+    flowGGUFModelRunner            runner;
+    omni::vocoder::voc_hg2_runner  voc{};
+    int                            id = 0;
+};
+struct t2w_slot_pool {
+    std::mutex                              m;
+    std::condition_variable                 cv;
+    std::vector<std::unique_ptr<t2w_slot>>  slots;
+    std::vector<t2w_slot *>                 free_list;
+    std::shared_ptr<flowGGUFModelLoader>    loader;
+    std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model;
+    int                                     n_slots = 0;
+    bool                                    initialized = false;
+    bool                                    init_failed = false;
+    std::vector<int64_t> tmpl_ne[4];
+    int                  tmpl_nt = 0;
+
+    bool ensure_initialized(const flowStreamCacheHost & cache_host, const std::vector<float> & spk_bc, int n_timesteps, float temperature) {
+        std::lock_guard<std::mutex> lock(m);
+        const std::vector<int64_t> * ne[4] = { &cache_host.conformer_cnn_ne, &cache_host.conformer_att_ne, &cache_host.estimator_cnn_ne, &cache_host.estimator_att_ne };
+        if (initialized) {
+            for (int i = 0; i < 4; ++i) {
+                if (*ne[i] != tmpl_ne[i]) { LOG_ERROR("t2w_slot_pool: cache shape differs from the pool template; session falls back to a private runner\n"); return false; }
+            }
+            return n_timesteps == tmpl_nt;
+        }
+        if (init_failed) { return false; }
+        for (int s = 0; s < n_slots; ++s) {
+            auto slot = std::make_unique<t2w_slot>();
+            slot->id = s;
+            slot->runner.attach_loader(loader, /*own_backend=*/true);
+            slot->runner.set_num_threads(8);
+            slot->runner.set_export_caches_to_host(false);
+            if (!slot->runner.init_from_host_caches(cache_host, spk_bc.data(), 1, n_timesteps, temperature)) {
+                LOG_ERROR("t2w_slot_pool: slot %d runner init failed\n", s);
+                init_failed = true;
+                return false;
+            }
+            slot->voc.model = voc_model.get();
+            if (!slot->voc.init_own_backend()) {
+                LOG_ERROR("t2w_slot_pool: slot %d vocoder backend init failed\n", s);
+                init_failed = true;
+                return false;
+            }
+            free_list.push_back(slot.get());
+            slots.push_back(std::move(slot));
+        }
+        for (int i = 0; i < 4; ++i) { tmpl_ne[i] = *ne[i]; }
+        tmpl_nt = n_timesteps;
+        initialized = true;
+        std::fprintf(stderr, "[t2w-slots] pool ready: %d slots on %s\n", n_slots, ggml_backend_name(loader->backend()));
+        return true;
+    }
+    t2w_slot * acquire() {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&]{ return !free_list.empty(); });
+        t2w_slot * s = free_list.back();
+        free_list.pop_back();
+        return s;
+    }
+    void release(t2w_slot * s) {
+        { std::lock_guard<std::mutex> lock(m); free_list.push_back(s); }
+        cv.notify_one();
+    }
+};
+t2w_slot_pool * t2w_slot_pool_get(std::shared_ptr<flowGGUFModelLoader> loader, std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model) {
+    static std::mutex mutex;
+    static std::map<void *, std::unique_ptr<t2w_slot_pool>> pools;
+    const char * e = getenv("OMNI_T2W_SLOTS");
+    const int n = e ? atoi(e) : 0;
+    if (n <= 0 || !loader || !voc_model) { return nullptr; }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & p = pools[loader.get()];
+    if (!p) {
+        p.reset(new t2w_slot_pool());
+        p->loader = loader; p->voc_model = voc_model; p->n_slots = n;
+    }
+    return p.get();
+}
+
+bool Token2Mel::init_snapshot_(const flowStreamCacheHost & cache_host) {
+    free_snapshot_();
+    ggml_init_params p{};
+    p.mem_size   = ggml_tensor_overhead() * 8;
+    p.no_alloc   = true;
+    snap_ctx_ = ggml_init(p);
+    if (!snap_ctx_) { return false; }
+    const auto & c0 = cache_host.conformer_cnn_ne; const auto & c1 = cache_host.conformer_att_ne;
+    const auto & c2 = cache_host.estimator_cnn_ne; const auto & c3 = cache_host.estimator_att_ne;
+    if (c0.size() != 3 || c1.size() != 4 || c2.size() != 4 || c3.size() != 4) { free_snapshot_(); return false; }
+    snap_[0] = ggml_new_tensor_3d(snap_ctx_, GGML_TYPE_F32, c0[0], c0[1], c0[2]);
+    snap_[1] = ggml_new_tensor_4d(snap_ctx_, GGML_TYPE_F32, c1[0], c1[1], c1[2], c1[3]);
+    snap_[2] = ggml_new_tensor_4d(snap_ctx_, GGML_TYPE_F32, c2[0], c2[1], c2[2], c2[3]);
+    snap_[3] = ggml_new_tensor_4d(snap_ctx_, GGML_TYPE_F32, c3[0], c3[1], c3[2], c3[3]);
+    ggml_backend_t be = runner_.shared_loader()->backend();
+    snap_buf_ = ggml_backend_alloc_ctx_tensors(snap_ctx_, be);
+    if (!snap_buf_) { free_snapshot_(); return false; }
+    const std::vector<uint8_t> * host[4] = { &cache_host.conformer_cnn_cache, &cache_host.conformer_att_cache, &cache_host.estimator_cnn_cache, &cache_host.estimator_att_cache };
+    for (int i = 0; i < 4; ++i) {
+        if (host[i]->size() != ggml_nbytes(snap_[i])) { LOG_ERROR("Token2Mel: snapshot cache %d size mismatch\n", i); free_snapshot_(); return false; }
+        ggml_backend_tensor_set(snap_[i], host[i]->data(), 0, host[i]->size());
+    }
+    return true;
+}
+void Token2Mel::free_snapshot_() {
+    if (snap_buf_) { ggml_backend_buffer_free(snap_buf_); snap_buf_ = nullptr; }
+    if (snap_ctx_) { ggml_free(snap_ctx_); snap_ctx_ = nullptr; }
+    for (auto & t : snap_) { t = nullptr; }
+    active_runner_ = nullptr;
+}
+bool Token2Mel::bind_slot_runner(flowGGUFModelRunner * r) {
+    if (!r || !snap_buf_) { return false; }
+    for (int i = 0; i < 4; ++i) {
+        ggml_tensor * dst = r->stream_cache_tensor(i);
+        if (!dst || ggml_nbytes(dst) != ggml_nbytes(snap_[i])) { LOG_ERROR("Token2Mel.bind_slot_runner: cache %d shape mismatch\n", i); return false; }
+        ggml_backend_tensor_copy(snap_[i], dst);
+    }
+    active_runner_ = r;
+    return true;
+}
+bool Token2Mel::unbind_slot_runner() {
+    if (!active_runner_) { return false; }
+    // The slot's compute runs on its own backend stream; the copies below go through the per-thread stream, so there is
+    // no ordering guarantee between them and an in-flight graph compute. Synchronize the slot's backend before reading
+    // the caches back (the classic path never rounds its caches to the host, which is why it had no such race).
+    if (ggml_backend_t be = active_runner_->compute_backend()) { ggml_backend_synchronize(be); }
+    for (int i = 0; i < 4; ++i) {
+        ggml_backend_tensor_copy(active_runner_->stream_cache_tensor(i), snap_[i]);
+    }
+    active_runner_ = nullptr;
+    return true;
+}
+
 bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                                     int                 n_timesteps,
                                                     float               temperature) {
@@ -9017,6 +9198,17 @@ bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
         return true;
     }
 
+    if (slot_pool_) {
+        // omni slot mode: no private graphs; only a device snapshot of the stream caches
+        if (slot_pool_->ensure_initialized(cache_host, spk_bc, use_nt, use_temp) && init_snapshot_(cache_host)) {
+            cache_in_.clear();
+            stream_started_ = true;
+            return true;
+        }
+        LOG_ERROR("Token2Mel.start_stream_with_prompt_cache_gguf: slot mode unavailable for this session, using a private runner\n");
+        slot_pool_ = nullptr;
+        runner_.attach_loader(runner_.shared_loader(), /*own_backend=*/true);
+    }
     if (!runner_.init_from_host_caches(cache_host, spk_bc.data(), B, use_nt, use_temp)) {
         LOG_ERROR( "Token2Mel.start_stream_with_prompt_cache_gguf: runner.init_from_host_caches failed\n");
         return false;
@@ -9057,7 +9249,12 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
     }
 
     flowStreamCacheHost cache_out;
-    if (!runner_.inference_chunk(chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim, last_chunk, cache_in_, n_timesteps_,
+    if (slot_mode() && !active_runner_) {
+        LOG_ERROR("Token2Mel.infer_one_chunk: slot mode but no slot bound\n");
+        return false;
+    }
+    flowGGUFModelRunner & R = active_runner_ ? *active_runner_ : runner_;
+    if (!R.inference_chunk(chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim, last_chunk, cache_in_, n_timesteps_,
                                  temperature_, mel_bct, cache_out)) {
         LOG_ERROR( "Token2Mel.infer_one_chunk: runner.inference_chunk failed\n");
         return false;
@@ -9504,6 +9701,7 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
 
 void Token2Mel::reset_stream() {
     runner_.reset_stream();
+    free_snapshot_();
     stream_started_ = false;
     spk_bc_.clear();
     cache_in_.clear();
@@ -9717,6 +9915,8 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
 bool Token2Wav::attach_shared_models(std::shared_ptr<flowGGUFModelLoader> t2m_loader,
                                      std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model) {
     reset_stream();
+    slot_pool_ = t2w_slot_pool_get(t2m_loader, voc_model);   // omni slot mode (OMNI_T2W_SLOTS), nullptr = classic per-session
+    t2m_.set_slot_pool(slot_pool_);
     if (!t2m_.attach_shared_model(t2m_loader, 8)) {
         models_loaded_ = false;
         return false;
@@ -9728,10 +9928,13 @@ bool Token2Wav::attach_shared_models(std::shared_ptr<flowGGUFModelLoader> t2m_lo
     }
     voc_model_        = voc_model;
     voc_runner_.model = voc_model_.get();
-    // NOTE: hg2_model keeps per-eval constant tensors (STFT window/DFT tables) that every eval
-    // (re)allocates through the allocator; independent allocators on the same hg2_model race on them.
-    // Keep the vocoder on the shared backend (serialized by omni_backend_mutex) unless opted in.
-    if (getenv("OMNI_VOC_OWN_BACKEND")) voc_runner_.init_own_backend();
+    // Each cloned session runs the vocoder on its own backend instance (own CUDA stream + pool + allocator)
+    // with a private copy of the generator's per-eval state, so sessions' vocoder calls no longer serialize
+    // on the shared model backend. OMNI_VOC_OWN_BACKEND=0 restores the shared-backend (serialized) path.
+    if (!slot_pool_) {
+        const char * e = getenv("OMNI_VOC_OWN_BACKEND");
+        if (!e || atoi(e) != 0) voc_runner_.init_own_backend();
+    }
     models_loaded_    = true;
     return true;
 }
@@ -9786,14 +9989,23 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
                                    int64_t &            out_T_audio) {
     wave_bt_out.clear();
     out_T_audio = 0;
-    // weights (and their backend memory pools) may be shared by several sessions
+    // Each stage locks only its own backend, only while it runs. Token2Mel computes on the session's private
+    // backend; the vocoder on its private backend (default) or the shared model backend (OMNI_VOC_OWN_BACKEND=0).
+    // Holding both mutexes for the whole call (previous behaviour) serialized every session's entire chunk
+    // (token2mel + vocoder, ~60 ms) on the shared vocoder mutex: 24 sessions -> 1.4 s bursts, p50 850 ms.
     ggml_backend_t b1 = t2m_.compute_backend();
     ggml_backend_t b2 = voc_runner_.backend();
-    if (b1 && b2 && (uintptr_t) b1 > (uintptr_t) b2) std::swap(b1, b2);
-    std::unique_lock<std::mutex> l1(omni_backend_mutex(b1));
-    std::unique_lock<std::mutex> l2(b2 != b1 ? omni_backend_mutex(b2) : omni_backend_mutex(nullptr), std::defer_lock);
-    if (b2 != b1) l2.lock();
-
+    // omni slot mode: borrow one compute slot for the whole chunk (exclusive), no backend mutexes needed
+    struct slot_guard { t2w_slot_pool * pool = nullptr; t2w_slot * slot = nullptr; Token2Mel * t2m = nullptr;
+        ~slot_guard() { if (slot) { if (t2m) t2m->unbind_slot_runner(); pool->release(slot); } } } sg;
+    const bool use_slot = slot_pool_ != nullptr && t2m_.slot_mode();
+    if (use_slot) {
+        sg.pool = slot_pool_; sg.slot = slot_pool_->acquire(); sg.t2m = &t2m_;
+        if (!t2m_.bind_slot_runner(&sg.slot->runner)) { LOG_ERROR("Token2Wav.push_tokens_window: bind slot failed\n"); return false; }
+        b2 = sg.slot->voc.backend();
+    }
+    std::unique_lock<std::mutex> l1(omni_backend_mutex(b1), std::defer_lock);
+    if (!use_slot) { l1.lock(); }
     if (!models_loaded_) {
         LOG_ERROR( "Token2Wav.push_tokens_window: models not loaded\n");
         return false;
@@ -9819,6 +10031,8 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     }
     const auto   t_t2m1  = clock::now();
     const double t2m_ms  = std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
+    if (l1.owns_lock()) { l1.unlock(); }   // token2mel done; mel_bct is host memory owned by this call
+    if (use_slot) { t2m_.unbind_slot_runner(); sg.t2m = nullptr; }   // caches back to the session snapshot; slot still held for the vocoder
 
     if (mel_bct.empty()) {
         const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
@@ -9846,10 +10060,15 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
-    if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
-        LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
-        return false;
+    {
+        std::unique_lock<std::mutex> l2(omni_backend_mutex(b2), std::defer_lock);
+        if (!use_slot) { l2.lock(); }
+        omni::vocoder::voc_hg2_runner & VR = use_slot ? sg.slot->voc : voc_runner_;
+        if (!VR.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
+                                                    out_T_audio, out_source_bt1, out_T_source)) {
+            LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
+            return false;
+        }
     }
     const auto t_voc1 = clock::now();
 

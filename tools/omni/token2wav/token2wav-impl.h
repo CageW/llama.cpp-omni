@@ -1660,7 +1660,9 @@ class flowGGUFModelRunner {
                         const std::string & device);
     // Share already-loaded weights/backend with another runner (multi-session): no GPU memory is duplicated.
     // Concurrent compute on the shared backend must be serialized by the caller.
-    void attach_loader(std::shared_ptr<flowGGUFModelLoader> loader);   // creates an own compute backend on the loader's device
+    void attach_loader(std::shared_ptr<flowGGUFModelLoader> loader, bool own_backend = true);   // own compute backend on the loader's device (unless slot mode)
+    // omni slot mode: the 4 persistent stream caches of the current session (0 conf_cnn, 1 conf_att, 2 est_cnn, 3 est_att)
+    ggml_tensor * stream_cache_tensor(int i) const;
     ggml_backend_t compute_backend() const { return backend(); }
     std::shared_ptr<flowGGUFModelLoader> shared_loader() const { return loader_; }
     void set_num_threads(int n_threads);
@@ -2016,6 +2018,12 @@ struct voc_hg2_runner {
     // multi-session: optional own backend instance + allocator (weights stay in `model`)
     ggml_backend_t own_backend = nullptr;
     ggml_gallocr_t own_galloc  = nullptr;
+    // omni multi-session: hg2_hift_generator carries per-eval mutable state (STFT window / DFT tables and the
+    // sine-generator constants are re-created in every eval's ggml_context and stored as pointers in the
+    // generator). Sessions that run the vocoder concurrently on their own backend therefore need their own
+    // copy of the generator; the weight tensor pointers inside the copy still point at the shared buffers.
+    std::unique_ptr<hifigan2::hg2_hift_generator> gen_local;
+    hifigan2::hg2_hift_generator & gen() const { return gen_local ? *gen_local : model->hg2->gen; }
     ggml_backend_t backend() const { return own_backend ? own_backend : (model ? model->backend : nullptr); }
     ggml_gallocr_t galloc()  const { return own_galloc  ? own_galloc  : (model ? model->galloc  : nullptr); }
     bool init_own_backend();      // create own stream/pool on model->backend's device
@@ -2093,6 +2101,12 @@ class Token2Mel {
     void reset_stream();
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
+    // omni slot mode: the session keeps only a device snapshot of its 4 stream caches (~200 MB); the graphs and their
+    // activation space (~800 MB) live in a per-card pool of slots that sessions borrow per chunk.
+    void set_slot_pool(struct t2w_slot_pool * pool) { slot_pool_ = pool; }
+    bool slot_mode() const { return slot_pool_ != nullptr && snap_buf_ != nullptr; }
+    bool bind_slot_runner(flowGGUFModelRunner * r);     // snapshot -> slot caches, run on this runner until unbind
+    bool unbind_slot_runner();                          // slot caches -> snapshot
 
     static constexpr int32_t kMelChannels  = 80;
     static constexpr int32_t kSpkDim       = 192;
@@ -2138,6 +2152,14 @@ class Token2Mel {
 
     flowStreamCacheHost cache_in_;
 
+    struct t2w_slot_pool * slot_pool_ = nullptr;
+    flowGGUFModelRunner *  active_runner_ = nullptr;
+    ggml_context *         snap_ctx_ = nullptr;
+    ggml_backend_buffer_t  snap_buf_ = nullptr;
+    ggml_tensor *          snap_[4]  = { nullptr, nullptr, nullptr, nullptr };
+    bool init_snapshot_(const flowStreamCacheHost & cache_host);
+    void free_snapshot_();
+
     // ANE 模式专用 state（仅当 backend_kind_ == ANE 时有效）
     void *                          ane_handle_ = nullptr;  // t2w_dit_handle_t (opaque)
     std::string                     coreml_model_path_;
@@ -2149,6 +2171,11 @@ class Token2Mel {
     // 的 static std::mt19937 gen(42)）对齐——跨 chunk 顺序消费，**绝不能每个 chunk 重置 seed**，
     // 否则每帧 x_init 都从同一组随机数开始，导致音色帧间不连续（听起来像"卡字"/重音节）。
 };
+
+// omni slot mode: per-card pool of Token2Wav compute slots (token2mel graphs + activations, vocoder backend)
+struct t2w_slot;
+struct t2w_slot_pool;
+t2w_slot_pool * t2w_slot_pool_get(std::shared_ptr<flowGGUFModelLoader> loader, std::shared_ptr<omni::vocoder::voc_hg2_model> voc_model);
 
 struct Token2MelSession {
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
@@ -2277,6 +2304,7 @@ class Token2Wav {
     std::vector<float> voc_speech_window_;
 
     bool models_loaded_ = false;
+    t2w_slot_pool * slot_pool_ = nullptr;   // omni slot mode (OMNI_T2W_SLOTS)
 };
 
 struct Token2WavSession {
