@@ -2,6 +2,9 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <type_traits>
+#include <cstdint>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -36,6 +39,29 @@ static __global__ void k_get_rows(
 
             dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(v.x);
             dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(v.y);
+        }
+    }
+}
+
+// omni: float4-vectorized variant for F32 -> F32 rows whose row length and strides are multiples of 4 elements.
+// The scalar kernel moves one 4-byte element per thread and reaches ~0.6 TB/s on the gated-delta-net state gather
+// (22 rows x 2 MB per layer, 30 layers per decode step: 4.4 ms of a 33 ms forward on H20).
+static __global__ void k_get_rows_float4(
+        const float4 * __restrict__ src0, const int32_t * __restrict__ src1, float4 * __restrict__ dst,
+        const int64_t ne00_4, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1_4, const size_t s2_4, const size_t s3_4,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        float4 * dst_row = dst + i10*s1_4 + i11*s2_4 + i12*s3_4;
+        const float4 * src0_row = (const float4 *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00_4; i += gridDim.y*blockDim.x) {
+            dst_row[i] = src0_row[i];
         }
     }
 }
@@ -160,6 +186,20 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+    if constexpr (std::is_same<src0_t, float>::value && std::is_same<dst_t, float>::value) {
+        const bool vec4 = ne00 % 4 == 0 && nb01 % 16 == 0 && nb02 % 16 == 0 && nb03 % 16 == 0 &&
+                          nb1 % 16 == 0 && nb2 % 16 == 0 && nb3 % 16 == 0 &&
+                          ((uintptr_t) src0_d) % 16 == 0 && ((uintptr_t) dst_d) % 16 == 0 && ne00 >= 4096;
+        if (vec4) {
+            const int64_t ne00_4 = ne00 / 4;
+            const int block_num_y4 = (int) ((ne00_4 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE);
+            const dim3 block_nums4(ne10, MIN(block_num_y4, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            k_get_rows_float4<<<block_nums4, block_dims, 0, stream>>>(
+                (const float4 *) src0_d, src1_d, (float4 *) dst_d, ne00_4, ne11, ne12_fdv,
+                s1/4, s2/4, s3/4, nb01, nb02, nb03, s10, s11, s12);
+            return;
+        }
+    }
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
         src0_d, src1_d, dst_d,
