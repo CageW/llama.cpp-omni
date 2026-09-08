@@ -74,6 +74,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// omni: run MMQ from prepared arguments (expert-split MUL_MAT_ID)
+void ggml_cuda_mul_mat_q_args(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -156,7 +161,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1, nullptr};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -172,6 +177,10 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    // omni: compact expert tiles (GGML_CUDA_MMQ_ID_COMPACT=0 restores the classic tile enumeration)
+    static const bool compact_tiles = !getenv("GGML_CUDA_MMQ_ID_COMPACT") || atoi(getenv("GGML_CUDA_MMQ_ID_COMPACT")) != 0;
+    ggml_cuda_pool_alloc<int32_t> tile_start(ctx.pool(), compact_tiles ? ne02 + 1 : 1);
+    int32_t * tile_start_ptr = compact_tiles ? tile_start.get() : nullptr;
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -217,7 +226,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12, tile_start_ptr};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -257,7 +266,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols, nullptr};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 
