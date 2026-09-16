@@ -1,0 +1,19 @@
+[project]
+name = "omni-load-sim"
+version = "0.1.0"
+description = "多 session 实时双工压测：按到达分布投放客户端，测量并发与播放缓冲"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=16.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["loadsim"]
