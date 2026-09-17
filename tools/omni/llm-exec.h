@@ -54,12 +54,12 @@ struct omni_llm_exec {
     //   fixed_cost_us  : initial estimate of the per-forward fixed cost; refined online from 1-token batches
     //                                                                      (OMNI_EXEC_FIXED_COST_US, default 6500)
     //   batch_target_ms: when busy, cap prefill tokens per forward so one forward stays near this (OMNI_EXEC_BATCH_TARGET_MS,
-    //                    default 60; 0 = no cap). Decode steps are taken first; at least one prefill always goes.
+    //                    default 0 = off; it measured worse at the ceiling). Decode steps are taken first; at least one prefill always goes.
     //   cap_min_tokens : floor of that cap (OMNI_EXEC_CAP_MIN_TOKENS, default 32)
     //   cap_busy_threshold: busy fraction above which the cap engages (OMNI_EXEC_CAP_BUSY_THRESHOLD, default 0.5)
     double hold_gain = 1.5;
     int hold_max_us = 20000;
-    int batch_target_ms = 60;
+    int batch_target_ms = 0;
     int cap_min_tokens = 32;
     double cap_busy_threshold = 0.5;
     int chain_gap_max_us = 60000;

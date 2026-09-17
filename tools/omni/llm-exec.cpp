@@ -572,7 +572,7 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->hold_max_us         = knob_i("HOLD_MAX_US", 20000);
     e->chain_gap_max_us    = knob_i("CHAIN_GAP_MAX_US", 60000);
     e->fixed_cost_us       = knob_i("FIXED_COST_US", 6500);
-    e->batch_target_ms     = knob_i("BATCH_TARGET_MS", 60);
+    e->batch_target_ms     = knob_i("BATCH_TARGET_MS", 0);   // off: measured strictly worse at the ceiling (docs/adaptive-batching.md)
     e->cap_min_tokens      = knob_i("CAP_MIN_TOKENS", 32);
     if (const char * v = knob("CAP_BUSY_THRESHOLD")) e->cap_busy_threshold = atof(v);
     if (device && device[0]) {
