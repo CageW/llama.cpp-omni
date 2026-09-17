@@ -494,25 +494,45 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        state.session_mgr.request_transport_close(session_id);
+        omni_context * octx = session->octx;
 
-        // close is a completion primitive: do not return until inference
-        // threads are stopped and the shared omni_context is safe to reuse.
-        {
-            std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
-            auto * closing = state.session_mgr.get(session_id);
-            if (closing && closing->octx) {
-                closing->octx->break_event = true;
+        // Signal the WebSocket handler to stop, then wait for inference threads
+        // to drain.  In pool mode we do NOT hold octx_mutex across this — each
+        // slot owns its own omni_context, so there is nothing to serialize with.
+        // In legacy single-session mode we continue to hold the mutex to protect
+        // the one shared context.
+        if (state.n_slots > 0) {
+            // Pool mode: operate directly on the slot's octx.
+            if (octx) {
+                octx->break_event = true;
                 {
-                    std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
-                    closing->octx->text_queue.clear();
-                    closing->octx->text_done_flag = true;
+                    std::lock_guard<std::mutex> lk(octx->text_mtx);
+                    octx->text_queue.clear();
+                    octx->text_done_flag = true;
                 }
-                closing->octx->text_cv.notify_all();
-                omni_prepare_for_reuse(closing->octx);
+                octx->text_cv.notify_all();
+                omni_prepare_for_reuse(octx);
             }
-
+            // close() returns the slot to the pool.
             state.session_mgr.close(session_id);
+        } else {
+            // Legacy single-session mode: hold octx_mutex while stopping inference.
+            state.session_mgr.request_transport_close(session_id);
+            {
+                std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
+                auto * closing = state.session_mgr.get(session_id);
+                if (closing && closing->octx) {
+                    closing->octx->break_event = true;
+                    {
+                        std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
+                        closing->octx->text_queue.clear();
+                        closing->octx->text_done_flag = true;
+                    }
+                    closing->octx->text_cv.notify_all();
+                    omni_prepare_for_reuse(closing->octx);
+                }
+                state.session_mgr.close(session_id);
+            }
         }
 
         json resp;
