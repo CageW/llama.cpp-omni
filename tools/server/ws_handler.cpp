@@ -849,7 +849,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
             if (!result.is_speak) {
                 send_event(make_listen_delta(session_id, response_id, metrics));
-            } else if (!result.text.empty()) {
+            } else {
+                // Always answer a speak frame, even with empty text (the model emitted <|speak|> and ended the
+                // chunk at once, which it does often when nudged to speak with nothing to say). A frame with no
+                // event at all is indistinguishable, to the client, from a frame the server never processed.
                 send_event(make_text_delta(session_id, response_id, result.text, metrics));
                 // Audio deltas are emitted asynchronously via audio_output_cb.
             }
