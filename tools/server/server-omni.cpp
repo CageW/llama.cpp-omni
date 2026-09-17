@@ -83,10 +83,74 @@ static bool ensure_omni_model_paths_from_llm(common_params & params) {
 }
 
 struct omni_server_state {
-    omni_context * octx = nullptr;    // WS backend uses this as shared_octx
+    omni_context * octx = nullptr;    // WS backend uses this as shared_octx (legacy mode)
     std::mutex octx_mutex;            // protects omni_context lifecycle + prefill/decode entry
     SessionManager session_mgr;       // WS backend session management
+    SessionPool  session_pool;        // multi-session slot pool (empty in legacy mode)
+    int          n_slots = 0;         // 0 = legacy single-session mode
 };
+
+// Build the multi-session pool: one root context that owns all model weights
+// plus (n_slots - 1) clones that share those weights and own only per-session
+// state (LLM/TTS llama_context, KV caches, worker threads, Token2Wav stream).
+//
+// Returns false if any stage fails; the caller should fall back to legacy
+// single-session mode rather than aborting, so an under-provisioned box still
+// serves one session instead of refusing to start.
+static bool build_session_pool(omni_server_state & state, common_params & params, int n_slots) {
+    if (!ensure_omni_model_paths_from_llm(params)) {
+        LOG_ERR("pool: LLM model path (-m) is required to derive omni model paths\n");
+        return false;
+    }
+
+    const std::string out_root = "./tools/omni/output";
+
+    LOG_INF("pool: loading root context (all weights)...\n");
+    omni_context * root = omni_init(&params, /*media_type*/2, /*use_tts*/true,
+                                    params.tts_bin_dir, /*tts_gpu_layers*/99,
+                                    /*token2wav_device*/"gpu:0", /*duplex_mode*/true,
+                                    /*existing_model*/nullptr, /*existing_ctx*/nullptr,
+                                    out_root + "/slot0");
+    if (!root) {
+        LOG_ERR("pool: omni_init failed for root context\n");
+        return false;
+    }
+    root->async = true;
+    root->clean_kvcache = true;
+
+    // Batched LLM executor: runs all slots' decode steps as one batch per round.
+    // Without it each clone decodes independently and the GPU sees n_slots tiny
+    // batches instead of one wide one.
+    if (n_slots > 1) {
+        if (!omni_enable_llm_exec(root, n_slots, params.n_ctx)) {
+            LOG_WRN("pool: omni_enable_llm_exec failed; falling back to per-slot decode\n");
+        }
+    }
+
+    std::vector<omni_context *> contexts;
+    contexts.push_back(root);
+
+    for (int i = 1; i < n_slots; ++i) {
+        LOG_INF("pool: cloning session context %d/%d...\n", i, n_slots - 1);
+        omni_context * clone = omni_session_clone(root, &params,
+                                                  out_root + "/slot" + std::to_string(i));
+        if (!clone) {
+            LOG_ERR("pool: omni_session_clone failed at slot %d; keeping %d slots\n",
+                    i, (int)contexts.size());
+            break;   // partial pool is still usable
+        }
+        clone->async = true;
+        clone->clean_kvcache = true;
+        contexts.push_back(clone);
+    }
+
+    state.n_slots = (int)contexts.size();
+    state.session_pool.init_slots(std::move(contexts));
+    state.session_mgr.set_pool(&state.session_pool);
+
+    LOG_INF("pool: ready with %d session slot(s)\n", state.n_slots);
+    return true;
+}
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -97,18 +161,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // omni HTTP server is single-session (1:1 duplex), so 1 sequence is enough.
+    // -np/--parallel selects how many concurrent duplex sessions this server
+    // can hold. Each slot is a cloned omni_context: it shares the model weights
+    // with the root but owns its own KV caches and worker threads, so GPU memory
+    // grows by roughly the per-session KV footprint, not by a whole model.
+    //
     // common_params defaults n_parallel to -1 ("auto"); each example resolves it
     // itself (see tools/server/server.cpp). Without this, n_seq_max overflows
     // uint32 and trips LLAMA_MAX_SEQ(256) inside llama_context.
     if (params.n_parallel < 0) {
         params.n_parallel = 1;
     }
+    const int n_sessions = params.n_parallel;
+
+    // Each cloned session gets its own llama_context with n_seq_max=1; the batch
+    // executor (omni_enable_llm_exec) is what groups them. Keep the per-context
+    // sequence count at 1 so cloning does not multiply KV allocation.
+    params.n_parallel = 1;
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    LOG_INF("Omni HTTP server starting...\n");
+    LOG_INF("Omni HTTP server starting (requested sessions: %d)...\n", n_sessions);
 
     // auto-detect omni model paths
     if (!params.vpm_model.empty() || !params.apm_model.empty() || !params.tts_model.empty()) {
@@ -124,17 +198,52 @@ int main(int argc, char ** argv) {
 
     omni_server_state state;
 
+    // If multi-session mode was requested and the model path is available,
+    // build the pool now so the first connection is never the slow path.
+    if (n_sessions > 1 && !params.model.path.empty()) {
+        if (!build_session_pool(state, params, n_sessions)) {
+            LOG_WRN("pool: initialization failed; falling back to single-session mode\n");
+            state.n_slots = 0;
+        }
+    } else if (n_sessions > 1) {
+        LOG_WRN("pool: -m required for pool init; falling back to single-session mode\n");
+    } else {
+        LOG_INF("single-session mode (pass -np N to enable concurrent sessions)\n");
+    }
+
+    // Multi-session pool: built eagerly at startup so the first client does not
+    // pay the model-load cost and so an out-of-memory condition surfaces before
+    // the server starts accepting traffic. Falls back to legacy single-session
+    // (lazy omni_init on first /v1/stream/omni_init or /backend) if it fails.
+    if (n_sessions > 1) {
+        if (!build_session_pool(state, params, n_sessions)) {
+            LOG_WRN("pool: initialization failed, falling back to single-session mode\n");
+            state.n_slots = 0;
+        }
+    } else {
+        LOG_INF("single-session mode (-np 1); pass -np N for concurrent sessions\n");
+    }
+
+    auto health_json = [&state]() {
+        json health = {{"status", "ok"}, {"engine", "comni"}};
+        // Advertise pool capacity so load generators can size their concurrency
+        // to the server instead of guessing.
+        health["sessions"] = {
+            {"mode",     state.n_slots > 0 ? "pool" : "single"},
+            {"capacity", state.n_slots > 0 ? state.n_slots : 1},
+        };
+        return health;
+    };
+
     // GET /health
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "comni"}};
         res.set_header("X-Engine", "comni");
-        res_ok(res, health);
+        res_ok(res, health_json());
     });
 
     svr.Get("/v1/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "comni"}};
         res.set_header("X-Engine", "comni");
-        res_ok(res, health);
+        res_ok(res, health_json());
     });
 
     // POST /v1/stream/omni_init
@@ -370,7 +479,8 @@ int main(int argc, char ** argv) {
     svr.WebSocket("/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
         handle_ws_backend(ws, state.session_mgr, params,
                           /*model*/nullptr, /*ctx*/nullptr,
-                          state.octx, state.octx_mutex);
+                          state.octx, state.octx_mutex,
+                          state.n_slots > 0 ? &state.session_pool : nullptr);
     });
 
     svr.Post("/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
@@ -415,8 +525,10 @@ int main(int argc, char ** argv) {
     // start server
     svr.listen("0.0.0.0", params.port);
 
-    // cleanup
-    {
+    // cleanup — pool shutdown frees all contexts (root and clones)
+    if (state.n_slots > 0) {
+        state.session_pool.shutdown();
+    } else {
         std::lock_guard<std::mutex> lock(state.octx_mutex);
         if (state.octx) {
             omni_free(state.octx);

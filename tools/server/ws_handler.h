@@ -11,6 +11,7 @@ struct common_params;
 struct llama_model;
 struct llama_context;
 class SessionManager;
+class SessionPool;
 
 namespace httplib {
 namespace ws { class WebSocket; }
@@ -18,6 +19,20 @@ namespace ws { class WebSocket; }
 
 // ============================================================================
 // WS /backend handler — main entry point called from server.cpp
+//
+// Two operation modes:
+//
+//  Pool mode  (pool != nullptr):
+//    handle_ws_backend blocks on pool->checkout_slot() to obtain an idle
+//    omni_context. The context is reset for the new session via
+//    omni_prepare_for_reuse() + omni_duplex_session_begin() and returned to
+//    the pool via pool->return_slot() when the WS closes. shared_octx and
+//    octx_mutex are ignored in this path.
+//
+//  Legacy single-session mode (pool == nullptr):
+//    Behaviour is unchanged from the original implementation: one active
+//    session at a time, shared_octx is reused or reallocated per session,
+//    and octx_mutex serialises access.
 // ============================================================================
 
 void handle_ws_backend(httplib::ws::WebSocket & ws,
@@ -25,8 +40,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                        common_params & params_base,
                        llama_model * model,
                        llama_context * ctx,
-                       omni_context *& shared_octx,  // server-owned, reused across sessions
-                       std::mutex & octx_mutex);
+                       omni_context *& shared_octx,  // used only in legacy mode
+                       std::mutex & octx_mutex,       // used only in legacy mode
+                       SessionPool * pool = nullptr); // multi-session pool
 
 // ============================================================================
 // Helpers: base64 audio/JPEG → temp files

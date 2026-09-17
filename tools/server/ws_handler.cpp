@@ -578,7 +578,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_model * model,
                         llama_context * ctx,
                         omni_context *& shared_octx,
-                        std::mutex & octx_mutex) {
+                        std::mutex & octx_mutex,
+                        SessionPool * pool) {
     const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
@@ -633,6 +634,216 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // ================================================================
     // Step 2: Allocate & activate session, create omni_context
     // ================================================================
+
+    // ---- Pool mode: borrow a pre-cloned slot ----
+    if (pool != nullptr) {
+        OmniSlot * slot = pool->checkout_slot();
+        if (!slot) {
+            LOG_ERR("WS /backend: pool shut down, rejecting connection\n");
+            ws.close();
+            return;
+        }
+
+        omni_context * octx = slot->octx;
+        LOG_INF("WS /backend (pool): checked out slot %d\n", slot->slot_idx);
+
+        // Reset per-session state: stop any prior threads, clear KV caches,
+        // reinstate sampling config.  omni_duplex_session_begin() does a
+        // stream_prefill(index=0) for the system prompt + voice clone, so we
+        // don't need to call stream_prefill separately here.
+        //
+        // Keep the slot's own output dir (assigned at pool construction) so
+        // concurrent sessions never write audio chunks into the same folder.
+        reset_octx_for_session(octx, parsed_init, octx->base_output_dir);
+        apply_session_config(params_base, octx, parsed_init);
+
+        // Voice reference audio
+        std::string pool_voice_wav;
+        if (!parsed_init.ref_audio_b64.empty()) {
+            pool_voice_wav = TempMediaFiles::write_audio_wav(
+                parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+            if (pool_voice_wav.empty()) {
+                pool->return_slot(slot->slot_idx);
+                ws.close();
+                return;
+            }
+        }
+
+        // Full-duplex session begin (initializes system prompt KV cache)
+        if (parsed_init.mode == "full_duplex") {
+            if (!omni_duplex_session_begin(octx, pool_voice_wav, octx->base_output_dir)) {
+                LOG_ERR("WS /backend (pool): omni_duplex_session_begin failed for slot %d\n",
+                        slot->slot_idx);
+                if (!pool_voice_wav.empty()) { fs::remove(pool_voice_wav); }
+                omni_prepare_for_reuse(octx);
+                pool->return_slot(slot->slot_idx);
+                ws.close();
+                return;
+            }
+            if (!pool_voice_wav.empty()) { fs::remove(pool_voice_wav); }
+        }
+
+        // Register the session with the manager.
+        std::string session_id = session_mgr.register_slot_session(slot->slot_idx, octx);
+        session_mgr.set_close_callback(session_id, [&ws, session_id]() {
+            ws.send(make_session_closed(session_id, "client_closed").dump());
+            ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
+        });
+
+        send_event(make_session_created(session_id, parsed_init.mode, make_runtime_metrics(octx)));
+        LOG_INF("WS /backend (pool): session %s on slot %d, mode=%s\n",
+                session_id.c_str(), slot->slot_idx, parsed_init.mode.c_str());
+
+        // ---- Audio callback ----
+        struct AudioCbState {
+            std::string session_id;
+            std::string response_id;
+            httplib::ws::WebSocket * ws = nullptr;
+            omni_context * octx = nullptr;
+            std::mutex mtx;
+            std::chrono::steady_clock::time_point response_start = std::chrono::steady_clock::now();
+            bool accumulate = false;
+            std::vector<float> accum;
+            bool emitted_audio = false;
+        };
+        auto audio_state = std::make_shared<AudioCbState>();
+        audio_state->session_id = session_id;
+        audio_state->ws = &ws;
+        audio_state->octx = octx;
+
+        octx->audio_output_cb = [audio_state](const float * samples, int n_samples, int, bool) {
+            {
+                std::lock_guard<std::mutex> lk(audio_state->mtx);
+                if (audio_state->accumulate) {
+                    if (samples && n_samples > 0) {
+                        audio_state->accum.insert(audio_state->accum.end(),
+                                                  samples, samples + n_samples);
+                    }
+                    return;
+                }
+            }
+            if (audio_state->ws && audio_state->ws->is_open()) {
+                std::string rid;
+                std::chrono::steady_clock::time_point rstart;
+                {
+                    std::lock_guard<std::mutex> lk(audio_state->mtx);
+                    rid    = audio_state->response_id;
+                    rstart = audio_state->response_start;
+                    audio_state->emitted_audio = true;
+                }
+                std::string b64 = float32_pcm_to_b64(samples, n_samples);
+                ProtocolMetrics metrics = make_runtime_metrics(
+                    audio_state->octx, 0.0, 0.0, elapsed_ms(rstart));
+                audio_state->ws->send(
+                    make_audio_delta(audio_state->session_id, rid, b64, metrics).dump());
+            }
+        };
+
+        // ---- Full-duplex input loop ----
+        std::string raw;
+        int response_seq = 0;
+        while (true) {
+            auto rr = ws.read(raw);
+            if (rr != httplib::ws::ReadResult::Text) { break; }
+
+            json msg;
+            try { msg = json::parse(raw); } catch (...) {
+                ws.send(make_session_closed(session_id, "invalid_json").dump());
+                break;
+            }
+            const std::string msg_type = msg.value("type", "");
+
+            if (msg_type == "session.close") { break; }
+
+            if (msg_type != "input.append") {
+                LOG_WRN("WS /backend (pool): unexpected msg type '%s'\n", msg_type.c_str());
+                break;
+            }
+
+            // Full-duplex: push audio frame and stream listen/text/audio deltas.
+            auto parsed_input = parse_input_append(msg);
+            if (!parsed_input.ok) {
+                ws.send(make_session_closed(session_id, "invalid_input").dump());
+                break;
+            }
+
+            response_seq++;
+            const std::string response_id =
+                session_id + "_resp_" + std::to_string(response_seq);
+            const auto t_req = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(audio_state->mtx);
+                audio_state->response_id     = response_id;
+                audio_state->response_start  = t_req;
+                audio_state->emitted_audio   = false;
+                audio_state->accumulate      = false;
+            }
+
+            // Write the input audio to a temp file and push a duplex frame.
+            std::string audio_path;
+            if (!parsed_input.audio_b64.empty()) {
+                audio_path = TempMediaFiles::write_audio_wav(
+                    parsed_input.audio_b64, temp_dir, msg_counter++);
+            }
+            OmniDuplexFrame frame;
+            frame.aud_fname = audio_path;
+            frame.user_seq  = response_seq;
+            if (omni_duplex_push_frame(octx, frame) < 0) {
+                LOG_ERR("WS /backend (pool): push_frame failed, session %s\n",
+                        session_id.c_str());
+                if (!audio_path.empty()) { fs::remove(audio_path); }
+                break;
+            }
+            if (!audio_path.empty()) {
+                retained_media_files.push_back(audio_path);
+            }
+
+            OmniDuplexFrameResult result;
+            if (!omni_duplex_wait_next_frame(octx, &result)) {
+                LOG_WRN("WS /backend (pool): wait_next_frame failed, session %s\n",
+                        session_id.c_str());
+                break;
+            }
+
+            // Emit listen or speak deltas. is_speak=false means the model chose
+            // to keep listening for this frame (protocol: kind=listen).
+            ProtocolMetrics metrics = make_runtime_metrics(
+                octx, result.ms_prefill_submit, result.ms_decode,
+                elapsed_ms(t_req), /*n_tokens*/0, /*vision_slices*/0);
+
+            if (!result.is_speak) {
+                send_event(make_listen_delta(session_id, response_id, metrics));
+            } else if (!result.text.empty()) {
+                send_event(make_text_delta(session_id, response_id, result.text, metrics));
+                // Audio deltas are emitted asynchronously via audio_output_cb.
+            }
+        }
+
+        // ---- Pool cleanup ----
+        LOG_INF("WS /backend (pool): session %s slot %d disconnecting\n",
+                session_id.c_str(), slot->slot_idx);
+        ws.send(make_session_closed(session_id, "client_disconnected").dump());
+        {
+            octx->break_event = true;
+            {
+                std::lock_guard<std::mutex> lk(octx->text_mtx);
+                octx->text_queue.clear();
+                octx->text_done_flag = true;
+            }
+            octx->text_cv.notify_all();
+            omni_duplex_session_end(octx);
+            omni_prepare_for_reuse(octx);
+        }
+        session_mgr.close(session_id);
+        // return_slot is called inside session_mgr.close via the pool reference.
+
+        for (const auto & p : retained_media_files) { fs::remove(p); }
+        retained_media_files.clear();
+        ws.close();
+        return;
+    }
+
+    // ---- Legacy single-session mode (unchanged) ----
     std::string session_id = session_mgr.allocate();
     if (session_id.empty()) {
         // Already an active session
