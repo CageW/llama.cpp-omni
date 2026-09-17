@@ -351,7 +351,8 @@ class PlaybackBuffer:
         self.underrun_total_s += gap
         self.max_underrun_s = max(self.max_underrun_s, gap)
         if len(self.underrun_intervals) < self.INTERVALS_KEPT:
-            self.underrun_intervals.append((self._underrun_started, end))
+            # 到货补得多时恢复时刻会算到起点之前(欠账在到货前就已还清),区间记成空的而不是倒着的
+            self.underrun_intervals.append((self._underrun_started, max(self._underrun_started, end)))
 
     @property
     def underrun_intervals(self) -> List[Tuple[float, float]]:
