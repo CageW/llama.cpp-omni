@@ -34,13 +34,29 @@ struct omni_llm_exec {
     int window_us  = 3000;        // how long the worker waits for more sessions to join a batch
     int max_tokens = 4096;        // logical batch cap
     // scheduling knobs (per executor; filled from OMNI_EXEC_* or OMNI_<PREFIX>_EXEC_* at create time)
-    std::string policy = "mixed";  // mixed | equal | decode | pd | ripe
+    std::string policy = "mixed";  // mixed | equal | decode | pd | ripe | adaptive
     int long_threshold = 8;        // a step with n > long_threshold counts as "prefill" for scheduling
     int prefill_target = 0;        // ripe/gather: release prefills once this many are queued (0 = n_seq)
     int prefill_deadline_us = 200000;
     int prefill_gather_us = 0, prefill_window_us = 0, max_prefill = 2;
     bool trace = false;
     int pad_steps = 0;             // fixed-shape padding (OMNI_EXEC_PAD)
+    // adaptive policy (OMNI_EXEC_POLICY=adaptive). A session's forwards form a chain: after its result is
+    // delivered it resubmits the next step after a short host-side gap (sampling), so the executor can predict
+    // WHEN the sequences it just served will be back. Holding Δ for k predicted arrivals saves k forwards' fixed
+    // cost of GPU time and costs Δ of latency for each step already queued; GPU time is only worth something when
+    // the GPU is the bottleneck, so the saving is weighted by the busy fraction. The worker holds only while
+    // Δ < k·F·busy·hold_gain, re-evaluated every time a step lands. Idle GPU -> no hold -> pure latency mode.
+    //   hold_gain      : weight of saved GPU time vs added latency         (OMNI_EXEC_HOLD_GAIN, default 1.5)
+    //   hold_max_us    : total hold bound per queued step, and the ETA horizon   (OMNI_EXEC_HOLD_MAX_US, default 20000)
+    //   chain_gap_max_us: a resubmit later than this is a frame boundary, not a chain link, and is not predicted
+    //                                                                      (OMNI_EXEC_CHAIN_GAP_MAX_US, default 60000)
+    //   fixed_cost_us  : initial estimate of the per-forward fixed cost; refined online from 1-token batches
+    //                                                                      (OMNI_EXEC_FIXED_COST_US, default 6500)
+    double hold_gain = 1.5;
+    int hold_max_us = 20000;
+    int chain_gap_max_us = 60000;
+    int fixed_cost_us = 6500;
 
     // submit a run of embeddings for `seq` starting at `pos0`; returns when the forward is done
     omni_llm_step_result run(int seq, int pos0, const float * embd, int n_tokens, bool all_outputs);
@@ -63,9 +79,22 @@ struct omni_llm_exec {
     uint64_t n_batches = 0, n_steps = 0, n_tokens_total = 0, n_pad_tokens = 0;
     uint64_t n_forward = 0;   // omni: actual graph computes (ubatches) executed; one logical batch can split into many
     uint64_t max_steps_in_batch = 0;
-    double   decode_ms_total = 0;
+    double   decode_ms_total = 0;   // wall time inside llama_decode + device sync (what the GPU was actually busy for)
     double   qwait_ms_total = 0, qwait_ms_max = 0;   // time steps spent waiting in the executor queue
+    double   hold_ms_total = 0;     // adaptive: time the worker deliberately held a non-empty queue waiting for predicted arrivals
+    uint64_t n_hold = 0, n_hold_hit = 0;   // adaptive: holds started / holds where at least one predicted sequence arrived
+    double   busy_fraction = 0;     // EMA of decode time over wall time, the GPU pressure signal the adaptive policy uses
+    double   fixed_cost_ms = 6.5;   // online estimate of the per-forward fixed cost (from 1-token batches)
     std::map<int, uint64_t> step_len_hist;   // token count of submitted steps -> count
+    std::map<int, uint64_t> batch_width_hist; // steps per batch -> count (the batching width actually achieved)
+
+    // thread-safe copy of the counters above (for /health and reports)
+    struct snapshot_t {
+        uint64_t n_batches, n_steps, n_tokens_total, n_forward, max_steps_in_batch, n_hold, n_hold_hit;
+        double decode_ms_total, qwait_ms_total, qwait_ms_max, hold_ms_total, busy_fraction, fixed_cost_ms;
+        std::map<int, uint64_t> batch_width_hist;
+    };
+    snapshot_t snapshot() const;
 
     ~omni_llm_exec();
     struct impl;

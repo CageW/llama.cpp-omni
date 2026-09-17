@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 
@@ -39,6 +40,72 @@ struct omni_llm_exec::impl {
     std::vector<bool> seq_used;
     uint64_t forward_last = 0;       // last-read graph compute count of this executor's context (per executor)
     bool lockstep_member = false;    // EP lock-step: only the LLM worker executors take part (not the TTS executor)
+    mutable std::mutex stats_mtx;    // guards the public counters while snapshot() copies them
+
+    // ---- adaptive policy state (touched only by the worker thread) ----
+    struct seq_pred {
+        std::chrono::steady_clock::time_point t_deliver{};   // when this sequence's last result was handed back
+        double gap_ema_us = 0;     // EMA of (resubmit - deliver) for chain links (short gaps)
+        double gap_var_us = 0;     // EMA of |deviation|, used as the wait margin
+        bool   in_flight = false;  // delivered and not yet resubmitted: a candidate to wait for
+        bool   was_long = false;   // the step just delivered was a prefill (its follow-up is the frame's first decode)
+    };
+    std::vector<seq_pred> pred;
+    std::chrono::steady_clock::time_point t_last_batch_end{};
+    double busy_ema = 0;           // decode_ms / (decode_ms + idle_ms), EMA over batches
+    double fixed_cost_ema_us = 0;  // 1-token single-step batch cost, EMA (the amortizable part of a forward)
+
+    // called by the worker just before a step's promise is fulfilled; takes mtx because submitters update
+    // the same table (note_submitted) under mtx, and the worker's hold decision reads it under mtx too
+    void note_delivered(const step * s, std::chrono::steady_clock::time_point now) {
+        if ((size_t) s->seq >= pred.size()) return;
+        std::lock_guard<std::mutex> lk(mtx);
+        auto & p = pred[s->seq];
+        p.t_deliver = now; p.in_flight = true; p.was_long = s->n > self->long_threshold;
+    }
+    void note_submitted(const step * s) {
+        if ((size_t) s->seq >= pred.size()) return;
+        auto & p = pred[s->seq];
+        if (!p.in_flight) return;
+        p.in_flight = false;
+        const double gap = std::chrono::duration<double, std::micro>(s->t_enq - p.t_deliver).count();
+        if (gap > self->chain_gap_max_us) return;   // frame boundary (waited for the client), not a chain link
+        if (p.gap_ema_us <= 0) { p.gap_ema_us = gap; p.gap_var_us = gap * 0.5; return; }
+        const double dev = std::fabs(gap - p.gap_ema_us);
+        p.gap_ema_us = 0.7 * p.gap_ema_us + 0.3 * gap;
+        p.gap_var_us = 0.7 * p.gap_var_us + 0.3 * dev;
+    }
+    // adaptive: how long (us) the worker should hold the current queue for sequences predicted to resubmit.
+    // 0 = dispatch now. Called with mtx held.
+    //
+    // Holding Δ for k predicted arrivals saves k forwards' fixed cost (k·F of GPU time). When the GPU is the
+    // bottleneck every active chain queues behind it, so each saved forward is F of latency for all of them,
+    // not just for the k that arrive; the steps already queued pay Δ. Hold iff Δ < k·F·busy·gain. busy is the
+    // GPU pressure (0 when idle -> never hold), gain absorbs the active/queued ratio (OMNI_EXEC_HOLD_GAIN).
+    int adaptive_hold_us(std::chrono::steady_clock::time_point now, size_t q_steps, int * n_expected_out) {
+        const double fixed_us = fixed_cost_ema_us > 0 ? fixed_cost_ema_us : (double) self->fixed_cost_us;
+        (void) q_steps;
+        // candidates: in-flight sequences with a known chain gap whose ETA is still ahead of us and within the hard cap
+        int k = 0; std::vector<double> etas;
+        for (auto & p : pred) {
+            if (!p.in_flight || p.gap_ema_us <= 0) continue;
+            const double since = std::chrono::duration<double, std::micro>(now - p.t_deliver).count();
+            const double eta = p.gap_ema_us + 2.0 * p.gap_var_us - since;   // margin: 2x mean abs deviation
+            if (eta <= 0 || eta > self->hold_max_us) continue;               // overdue (not coming) or too far away
+            etas.push_back(eta); k++;
+        }
+        if (k == 0) { if (n_expected_out) *n_expected_out = 0; return 0; }
+        std::sort(etas.begin(), etas.end());
+        // take the largest prefix of arrivals (sorted by ETA) that still pays for its own wait
+        int best = 0; double best_wait = 0;
+        for (int i = 0; i < k; i++) {
+            const double wait = etas[i];
+            const double value = (i + 1) * fixed_us * busy_ema * self->hold_gain;
+            if (wait < value) { best = i + 1; best_wait = wait; }
+        }
+        if (n_expected_out) *n_expected_out = best;
+        return best > 0 ? (int) best_wait + 1 : 0;
+    }
 
     void loop() {
         std::vector<step *> batch;
@@ -116,7 +183,38 @@ struct omni_llm_exec::impl {
                     bool any_long = false, any_short = false;
                     for (auto * s : queue) { (s->n > LT ? any_long : any_short) = true; }
                     const bool ripe = self->policy == "ripe";
-                    if (ripe) {
+                    if (self->policy == "adaptive") {
+                        // Hold the queue only for sequences predicted to resubmit within the budget. Each hold is
+                        // re-evaluated when a new step lands (cv notify): a sequence that arrived is no longer expected,
+                        // one that is now overdue is dropped, and the wait shrinks to the latest remaining ETA.
+                        // The budget itself follows GPU pressure (busy_ema): idle GPU -> ~0 hold -> pure latency mode.
+                        // The oldest queued step bounds the total hold: however many arrivals keep being predicted,
+                        // no step may be held longer than hold_max_us in total. Without this bound a steady stream
+                        // of predicted arrivals (N sessions resubmitting in staggered fashion) keeps the worker
+                        // waiting forever and the steps already queued never run (seen as two sessions at 5 s
+                        // decision latency while the other ten sat at 0.5 s).
+                        const auto t_hold0 = std::chrono::steady_clock::now();
+                        int n_expected = 0; bool held = false; size_t q0 = queue.size(); int n_iter = 0;
+                        for (;;) {
+                            if (!running) break;
+                            const auto now = std::chrono::steady_clock::now();
+                            auto oldest = now; for (auto * s : queue) oldest = std::min(oldest, s->t_enq);
+                            const long held_us = std::chrono::duration_cast<std::chrono::microseconds>(now - oldest).count();
+                            if (held_us >= self->hold_max_us) break;
+                            int wait_us = adaptive_hold_us(now, queue.size(), &n_expected);
+                            if (wait_us <= 0) break;
+                            wait_us = std::min<int>(wait_us, self->hold_max_us - (int) held_us);
+                            held = true; n_iter++;
+                            const size_t before = queue.size();
+                            cv.wait_for(lk, std::chrono::microseconds(wait_us), [&]{ return !running || queue.size() != before; });
+                        }
+                        if (held) {
+                            const double held_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hold0).count();
+                            if (self->trace) fprintf(stderr, "[hold] q0=%zu q=%zu iters=%d expected=%d held_ms=%.2f busy=%.2f F=%.1f\n", q0, queue.size(), n_iter, n_expected, held_ms, busy_ema, fixed_cost_ema_us / 1000.0);
+                            std::lock_guard<std::mutex> sg(stats_mtx);
+                            self->hold_ms_total += held_ms; self->n_hold++; if (queue.size() > q0) self->n_hold_hit++;
+                        }
+                    } else if (ripe) {
                         // never hold decode steps; hold prefills until >= prefill_target are queued or the oldest has waited
                         // >= prefill_deadline_us (breaks the circular wait of gather mode: a session submits its next prefill
                         // only after this frame's decodes finish, and those decodes sat in this queue behind the gather wait)
@@ -286,21 +384,41 @@ struct omni_llm_exec::impl {
         const auto t0 = std::chrono::steady_clock::now();
         double qwait_max = 0, qwait_sum = 0;
         for (auto * s : batch) { double w = std::chrono::duration<double, std::milli>(t0 - s->t_enq).count(); qwait_sum += w; qwait_max = std::max(qwait_max, w); }
-        self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
         const int rc = llama_decode(ctx, b);
         if (rc != 0) fprintf(stderr, "[exec] llama_decode rc=%d (steps=%zu tok=%d)\n", rc, batch.size(), n_tok);
+        // llama_decode returns before the device finishes; the logits read below synchronizes anyway, so do it here
+        // to make `ms` the real forward time (the number the adaptive hold budget is derived from).
+        llama_synchronize(ctx);
+        const auto t1 = std::chrono::steady_clock::now();
         self->n_forward += llama_context_graph_compute_count(ctx) - forward_last; forward_last = llama_context_graph_compute_count(ctx);
         for (int j = 0; j < n_dummy; j++) llama_memory_seq_rm(llama_get_memory(ctx), self->n_seq + j, -1, -1);
-        self->n_pad_tokens += n_dummy;
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        self->decode_ms_total += ms;
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        // GPU pressure: fraction of wall time the executor spent inside forwards, EMA over batches
+        if (t_last_batch_end.time_since_epoch().count() != 0) {
+            const double wall = std::chrono::duration<double, std::milli>(t1 - t_last_batch_end).count();
+            const double b = wall > 0 ? std::min(1.0, ms / wall) : 1.0;
+            busy_ema = busy_ema <= 0 ? b : 0.8 * busy_ema + 0.2 * b;
+        }
+        t_last_batch_end = t1;
+        if (batch.size() == 1 && n_tok == 1) fixed_cost_ema_us = fixed_cost_ema_us <= 0 ? ms * 1000.0 : 0.9 * fixed_cost_ema_us + 0.1 * ms * 1000.0;
         const bool trace = self->trace;
-        if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f qwait_avg=%.1f qwait_max=%.1f\n", batch.size(), n_tok, mx, ms, qwait_sum / batch.size(), qwait_max); }
-        self->n_batches++; self->n_steps += batch.size(); self->n_tokens_total += n_tok;
-        for (auto * s : batch) self->step_len_hist[s->n]++;
-        self->max_steps_in_batch = std::max<uint64_t>(self->max_steps_in_batch, batch.size());
-        // scatter outputs: output rows are in batch order over tokens with out[i]!=0
-        int row = 0;
+        if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f qwait_avg=%.1f qwait_max=%.1f busy=%.2f\n", batch.size(), n_tok, mx, ms, qwait_sum / batch.size(), qwait_max, busy_ema); }
+        {
+            std::lock_guard<std::mutex> sg(stats_mtx);
+            self->qwait_ms_total += qwait_sum; self->qwait_ms_max = std::max(self->qwait_ms_max, qwait_max);
+            self->n_pad_tokens += n_dummy;
+            self->decode_ms_total += ms;
+            self->n_batches++; self->n_steps += batch.size(); self->n_tokens_total += n_tok;
+            for (auto * s : batch) self->step_len_hist[s->n]++;
+            self->batch_width_hist[(int) batch.size()]++;
+            self->max_steps_in_batch = std::max<uint64_t>(self->max_steps_in_batch, batch.size());
+            self->busy_fraction = busy_ema;
+            if (fixed_cost_ema_us > 0) self->fixed_cost_ms = fixed_cost_ema_us / 1000.0;
+        }
+        // scatter outputs. llama_get_logits_ith / get_embeddings_ith take the BATCH TOKEN index (they map it through
+        // output_ids to the compacted output row), not the output row number. Walk the batch by token offset and
+        // ask for the tokens whose out[] flag was set: all of a step's tokens when it asked for all_outputs, else its last.
+        int tok_off = 0;
         for (auto * s : batch) {
             omni_llm_step_result r; r.ok = (rc == 0);
             const int n_out = s->all_outputs ? s->n : 1;
@@ -308,13 +426,16 @@ struct omni_llm_exec::impl {
                 r.logits.resize((size_t) n_out * n_vocab);
                 r.hidden.resize((size_t) n_out * n_embd);
                 for (int j = 0; j < n_out; j++) {
-                    const float * lg = llama_get_logits_ith(ctx, row + j);
-                    const float * hd = llama_get_embeddings_ith(ctx, row + j);
-                    if (lg) memcpy(r.logits.data() + (size_t) j * n_vocab, lg, n_vocab * sizeof(float));
+                    const int ti = s->all_outputs ? tok_off + j : tok_off + s->n - 1;
+                    const float * lg = llama_get_logits_ith(ctx, ti);
+                    const float * hd = llama_get_embeddings_ith(ctx, ti);
+                    if (!lg) { r.ok = false; fprintf(stderr, "[exec] no logits for step seq=%d n=%d (batch token %d)\n", s->seq, s->n, ti); break; }
+                    memcpy(r.logits.data() + (size_t) j * n_vocab, lg, n_vocab * sizeof(float));
                     if (hd) memcpy(r.hidden.data() + (size_t) j * n_embd, hd, n_embd * sizeof(float));
                 }
             }
-            row += n_out;
+            tok_off += s->n;
+            note_delivered(s, std::chrono::steady_clock::now());
             s->done.set_value(std::move(r));
         }
     }
@@ -323,11 +444,22 @@ struct omni_llm_exec::impl {
 omni_llm_step_result omni_llm_exec::run(int seq, int pos0, const float * embd, int n_tokens, bool all_outputs) {
     auto * s = new impl::step(); s->seq = seq; s->pos0 = pos0; s->embd = embd; s->n = n_tokens; s->all_outputs = all_outputs; s->t_enq = std::chrono::steady_clock::now();
     auto fut = s->done.get_future();
-    { std::lock_guard<std::mutex> lk(p->mtx); p->queue.push_back(s); }
+    { std::lock_guard<std::mutex> lk(p->mtx); p->queue.push_back(s); p->note_submitted(s); }
     p->cv.notify_all();
     omni_llm_step_result r = fut.get();
     delete s;
     return r;
+}
+
+omni_llm_exec::snapshot_t omni_llm_exec::snapshot() const {
+    std::lock_guard<std::mutex> sg(p->stats_mtx);
+    snapshot_t s;
+    s.n_batches = n_batches; s.n_steps = n_steps; s.n_tokens_total = n_tokens_total; s.n_forward = n_forward;
+    s.max_steps_in_batch = max_steps_in_batch; s.n_hold = n_hold; s.n_hold_hit = n_hold_hit;
+    s.decode_ms_total = decode_ms_total; s.qwait_ms_total = qwait_ms_total; s.qwait_ms_max = qwait_ms_max;
+    s.hold_ms_total = hold_ms_total; s.busy_fraction = busy_fraction; s.fixed_cost_ms = fixed_cost_ms;
+    s.batch_width_hist = batch_width_hist;
+    return s;
 }
 
 // memory ops: run on the worker thread to serialize with decode (queue an empty step is awkward,
@@ -409,6 +541,10 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->max_prefill         = knob_i("MAX_PREFILL", 2);
     e->trace               = knob("TRACE") != nullptr;
     if (const char * w = knob("WINDOW_US")) e->window_us = atoi(w);
+    if (const char * v = knob("HOLD_GAIN")) e->hold_gain = atof(v);
+    e->hold_max_us         = knob_i("HOLD_MAX_US", 20000);
+    e->chain_gap_max_us    = knob_i("CHAIN_GAP_MAX_US", 60000);
+    e->fixed_cost_us       = knob_i("FIXED_COST_US", 6500);
     if (device && device[0]) {
         // NOTE: a llama_context cannot be pinned to a GPU independently of its model: device placement is fixed
         // at llama_model load (llama_model_params.devices), and every context shares the model's device set.
@@ -426,6 +562,8 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->p = std::make_unique<omni_llm_exec::impl>();
     e->p->self = e.get();
     e->p->window_us_ = e->window_us;
+    e->p->pred.resize(n_seq);
+    e->fixed_cost_ms = e->fixed_cost_us / 1000.0;
     if (g_lockstep && (env_prefix == nullptr || env_prefix[0] == 0)) {
         std::lock_guard<std::mutex> g(g_lockstep->m);
         g_lockstep->members.push_back(e->p.get());
