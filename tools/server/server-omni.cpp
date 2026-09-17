@@ -139,13 +139,17 @@ static bool build_session_pool(omni_server_state & state, common_params & params
                     i, (int)contexts.size());
             break;   // partial pool is still usable
         }
+        LOG_INF("pool: clone %d returned, marking async/clean_kvcache\n", i);
         clone->async = true;
         clone->clean_kvcache = true;
         contexts.push_back(clone);
+        LOG_INF("pool: clone %d stored (contexts=%zu)\n", i, contexts.size());
     }
 
+    LOG_INF("pool: registering %zu contexts into SessionPool...\n", contexts.size());
     state.n_slots = (int)contexts.size();
     state.session_pool.init_slots(std::move(contexts));
+    LOG_INF("pool: init_slots done, attaching to SessionManager...\n");
     state.session_mgr.set_pool(&state.session_pool);
 
     LOG_INF("pool: ready with %d session slot(s)\n", state.n_slots);
@@ -198,30 +202,19 @@ int main(int argc, char ** argv) {
 
     omni_server_state state;
 
-    // If multi-session mode was requested and the model path is available,
-    // build the pool now so the first connection is never the slow path.
+    // Multi-session pool: built eagerly at startup so the first client does not
+    // pay the model-load cost and so an out-of-memory condition surfaces before
+    // the server starts accepting traffic. Falls back to legacy single-session
+    // (lazy omni_init on first /v1/stream/omni_init or /backend) if it fails.
     if (n_sessions > 1 && !params.model.path.empty()) {
         if (!build_session_pool(state, params, n_sessions)) {
-            LOG_WRN("pool: initialization failed; falling back to single-session mode\n");
+            LOG_WRN("pool: initialization failed, falling back to single-session mode\n");
             state.n_slots = 0;
         }
     } else if (n_sessions > 1) {
         LOG_WRN("pool: -m required for pool init; falling back to single-session mode\n");
     } else {
         LOG_INF("single-session mode (pass -np N to enable concurrent sessions)\n");
-    }
-
-    // Multi-session pool: built eagerly at startup so the first client does not
-    // pay the model-load cost and so an out-of-memory condition surfaces before
-    // the server starts accepting traffic. Falls back to legacy single-session
-    // (lazy omni_init on first /v1/stream/omni_init or /backend) if it fails.
-    if (n_sessions > 1) {
-        if (!build_session_pool(state, params, n_sessions)) {
-            LOG_WRN("pool: initialization failed, falling back to single-session mode\n");
-            state.n_slots = 0;
-        }
-    } else {
-        LOG_INF("single-session mode (-np 1); pass -np N for concurrent sessions\n");
     }
 
     auto health_json = [&state]() {
@@ -543,7 +536,9 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    LOG_INF("=== all routes registered, calling listen on 0.0.0.0:%d ===\n", params.port);
+    bool listen_ok = svr.listen("0.0.0.0", params.port);
+    LOG_INF("=== svr.listen returned %d (server stopped) ===\n", (int) listen_ok);
 
     // cleanup — pool shutdown frees all contexts (root and clones)
     if (state.n_slots > 0) {

@@ -605,12 +605,41 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     };
 
     // ================================================================
+    // Step 0: Admit the connection — check out a pool slot if we have one.
+    //
+    // The gateway protocol has the client wait for session.queue_done before
+    // sending session.init.  This server used to skip that event entirely and
+    // treat the first inbound message as the init, which deadlocks against any
+    // client written to the documented handshake: both sides wait, nothing is
+    // ever sent, and the load generator reports a queue timeout with zero
+    // frames.  Emitting it here — before the first read — makes the two sides
+    // agree.
+    //
+    // In pool mode checkout happens first so the event reflects a real wait,
+    // and the slot is released on every exit path below.
+    // ================================================================
+    OmniSlot * pool_slot = nullptr;
+    if (pool != nullptr) {
+        pool_slot = pool->checkout_slot();
+        if (!pool_slot) {
+            LOG_ERR("WS /backend: pool shut down, rejecting connection\n");
+            ws.close();
+            return;
+        }
+        LOG_INF("WS /backend (pool): checked out slot %d\n", pool_slot->slot_idx);
+    }
+    send_event(make_session_queue_done(/*position*/0, /*eta_s*/0.0));
+
+    // ================================================================
     // Step 1: Read first message — must be session.init
     // ================================================================
     std::string raw_first;
     auto read_result = ws.read(raw_first);
     if (read_result != httplib::ws::ReadResult::Text) {
         LOG_WRN("WS /backend: failed to read init message\n");
+        if (pool_slot != nullptr) {
+            pool->return_slot(pool_slot->slot_idx);
+        }
         return; // no session yet, just return
     }
 
@@ -619,6 +648,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         first_msg = json::parse(raw_first);
     } catch (...) {
         LOG_ERR("WS /backend: invalid JSON in init message\n");
+        if (pool_slot != nullptr) {
+            pool->return_slot(pool_slot->slot_idx);
+        }
         ws.close();
         return;
     }
@@ -627,6 +659,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     if (!parsed_init.ok) {
         LOG_ERR("WS /backend: session.init parse failed: %s\n", parsed_init.error.c_str());
         // Fail-fast without session — just close
+        if (pool_slot != nullptr) {
+            pool->return_slot(pool_slot->slot_idx);
+        }
         ws.close();
         return;
     }
@@ -635,17 +670,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // Step 2: Allocate & activate session, create omni_context
     // ================================================================
 
-    // ---- Pool mode: borrow a pre-cloned slot ----
+    // ---- Pool mode: use the already-checked-out slot ----
     if (pool != nullptr) {
-        OmniSlot * slot = pool->checkout_slot();
-        if (!slot) {
-            LOG_ERR("WS /backend: pool shut down, rejecting connection\n");
-            ws.close();
-            return;
-        }
-
+        OmniSlot * slot = pool_slot;
         omni_context * octx = slot->octx;
-        LOG_INF("WS /backend (pool): checked out slot %d\n", slot->slot_idx);
 
         // Reset per-session state: stop any prior threads, clear KV caches,
         // reinstate sampling config.  omni_duplex_session_begin() does a

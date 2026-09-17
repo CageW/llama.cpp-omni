@@ -60,6 +60,15 @@ static double server_timestamp() {
     ).count();
 }
 
+json make_session_queue_done(int position, double eta_s) {
+    json ev;
+    ev["type"] = "session.queue_done";
+    ev["position"] = position;
+    ev["eta_s"] = eta_s;
+    ev["server_send_ts"] = server_timestamp();
+    return ev;
+}
+
 json make_session_created(const std::string & session_id,
                            const std::string & mode,
                            const ProtocolMetrics & metrics) {

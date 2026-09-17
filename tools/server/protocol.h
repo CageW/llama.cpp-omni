@@ -36,6 +36,13 @@ struct ProtocolMetrics {
 // Downstream event builders
 // ============================================================================
 
+// session.queue_done — the connection has been admitted and may send
+// session.init.  Emitted immediately after the WebSocket opens so that clients
+// which follow the gateway protocol (wait for queue_done before initialising)
+// do not hang.  With a session pool this fires when a slot has been checked
+// out; `position` and `eta_s` describe the wait when one was required.
+json make_session_queue_done(int position = 0, double eta_s = 0.0);
+
 // session.created — init success, session enters active
 json make_session_created(const std::string & session_id,
                           const std::string & mode,
