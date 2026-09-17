@@ -15,8 +15,9 @@
 - 说话段内抖动: 每帧的实际发送时刻加一点抖动,模拟真实网络与浏览器音频采集的抖动,
   避免所有客户端精确同步到同一个 tick。
 
-每一帧音频固定 80ms(1280 采样 @16kHz),这是实时语音客户端常用的上行粒度;
-服务端的 TDM 时间片处理也在这个量级。
+帧长默认 80ms(1280 采样 @16kHz),这是 OpenAI Realtime 默认 server VAD 的分块粒度。
+但产品前端实际上行的是 1000ms 一帧,模型每秒决策一次;按 80ms 发会把服务端的决策
+次数抬到真实流量的 12.5 倍,压出来的容量偏悲观。所以帧长做成可配,压容量时用 1000。
 """
 
 from __future__ import annotations
@@ -28,6 +29,10 @@ from typing import List, Optional, Tuple
 FRAME_MS = 80
 SAMPLE_RATE = 16000
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
+
+
+def samples_per_frame(frame_ms: int) -> int:
+    return SAMPLE_RATE * frame_ms // 1000
 
 
 @dataclass
@@ -79,7 +84,7 @@ class SpeechPattern:
 class SpeechActivity:
     """按固定时间片推进的说话/静音状态机。
 
-    调用方每隔 FRAME_MS 查询一次,得到本片是否要上行音频。状态推进用累积的时长
+    调用方每隔一帧查询一次,得到本片是否要上行音频。状态推进用累积的时长
     而不是 sleep 累加,避免长会话里时钟漂移让所有客户端慢慢错开成同一个相位。
     """
 

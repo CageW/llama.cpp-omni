@@ -119,7 +119,29 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 - **失败构成**(`failure_breakdown`)——连接失败、握手超时、服务端 error、排队过久
   分开计数。混成一个「错误率」会掩盖「容量不足」和「服务崩了」的区别。
 
-工具只记录结构化数据,不做判定。什么算达标是每次压测之前要定的事。
+### 帧长与决策延迟
+
+上行帧长由 `--frame-ms` 控制,默认 80 毫秒。80 是 OpenAI Realtime 默认 server VAD 的
+分块粒度,但 MiniCPM-o 的产品前端实际发的是 1000 毫秒一帧,模型每秒决策一次。按 80 毫秒
+发,服务端每秒要做 12.5 次决策而不是 1 次,压出来的容量比真实流量低得多。所以压容量
+时应当加 `--frame-ms 1000`,让每个会话对服务端的压力与真实前端一致;80 保留为默认值
+只是为了与已有的自检、发压机自证和验证记录对得上。
+
+每一帧都有一条决策延迟:从第 k 个 `input.append` 发出,到收到第一条 `response_id`
+以 `_resp_<k>` 结尾的 listen 或 text delta。audio delta 是 TTS 异步吐的,不算决策。
+这个量直接回答服务端有没有跟上帧节奏:决策落后于一帧,后面的帧就开始排队。汇总里的
+`decision_p50_s / decision_p95_s / decision_p99_s / decision_max_s` 是把所有会话的所有
+帧合在一起算的分位数,不是逐会话分位数再平均;`decision_over_budget_ratio` 是超过预算
+的帧占比,预算由 `--decision-budget-ms` 给,默认等于帧长。服务端如果在 delta 的
+`metrics` 里带了自己的 `prefill_ms` 和 `generate_ms`,也会一并收下来(`server_decode_ms_*`),
+用来区分「决策慢是排队慢还是算得慢」。会话结束时还没等到决策的帧记在
+`frames_unanswered`。内置假服务端不给 `response_id` 编号,所以 selftest 里这几栏是空的。
+
+汇总末尾有一个 `verdict`,pass 的条件是:没有失败会话、没有排队超时、决策延迟 p95 不超过
+预算、断流会话占比不超过 5%。任一条不满足就是 fail,`verdict_reasons` 列出具体是哪几条。
+前两条是「服务还扛得住」的底线;p95 不超过一帧是项目里多 session 容量压测判到顶的判据;
+5% 沿用 `burn` 子命令的口径。阈值集中在 runner.py 顶部的几个常量里。并发扫描脚本读
+这一个字段就够,不必自己再定判据。
 
 ## 跑压测的纪律
 

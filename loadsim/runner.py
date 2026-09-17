@@ -8,6 +8,8 @@
    平均延迟好看但尾部断流严重,对实时语音来说就是不能用。
 3. 失败长什么样。连接失败、握手超时、服务端 error、排队过久要分开计数。混成一个
    「错误率」会掩盖掉「容量不足」和「服务端崩了」的区别。
+
+报告末尾给一个 pass/fail 判定,供并发扫描脚本直接读。判据集中在下面几个常量里。
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from loadsim.arrival import (
     build_arrival_plan,
     check_load_feasibility,
 )
-from loadsim.activity import SpeechPattern
+from loadsim.activity import FRAME_MS, SpeechPattern
 from loadsim.client import SimClient, build_ssl_context
 from loadsim.metrics import SessionStats, percentile
 
@@ -42,6 +44,14 @@ TRANSIENT_FAILURES = {
 # 排队超时不算服务端故障,单独统计。它的含义是「容量不够」而不是「服务坏了」,
 # 两者要分开报:前者该加 worker,后者该查日志。混成一个失败率会把处置方向带偏。
 CAPACITY_FAILURES = {"queue_timeout"}
+
+# 判定阈值。决策延迟 p95 不得超过帧长预算(decision_budget_s,默认等于帧长):这是
+# 项目里多 session 容量压测判「到顶」的判据,决策落后于帧节奏就是在积压。断流会话
+# 占比 5% 沿用 burn 子命令发压机自证的口径。失败会话与排队超时都要求为零:前者是
+# 服务故障,后者说明连会话都建不起来,两者任一非零都谈不上「扛得住」。
+VERDICT_MAX_STARVING_SESSION_RATIO = 0.05
+VERDICT_MAX_FAILED_SESSIONS = 0
+VERDICT_MAX_QUEUE_TIMEOUT_RATIO = 0.0
 
 
 @dataclass
@@ -71,6 +81,14 @@ class RunConfig:
     handshake_timeout_s: float = 30.0
     concurrency_sample_s: float = 1.0
     label: str = ""
+    # 上行帧长。产品前端发 1000ms 一帧,80 是 OpenAI Realtime server VAD 的分块粒度
+    frame_ms: int = FRAME_MS
+    # 决策延迟预算,None 时取帧长:决策慢过一帧就是落后于实时
+    decision_budget_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.decision_budget_s is None:
+            self.decision_budget_s = self.frame_ms / 1000.0
 
 
 @dataclass
@@ -172,6 +190,7 @@ async def run_load(
             send_silence_during_pause=cfg.send_silence_during_pause,
             ssl_context=ssl_context,
             handshake_timeout_s=cfg.handshake_timeout_s,
+            frame_ms=cfg.frame_ms,
         )
         task = asyncio.create_task(client.run())
         task.add_done_callback(_on_done)
@@ -249,7 +268,8 @@ async def run_load(
     summary = summarize(results, cfg, plan, sampled_concurrency, peak_running)
     _p(
         f"完成: {summary['sessions_total']} 会话, 峰值并发 {summary['concurrency_peak']}, "
-        f"失败 {summary['sessions_failed']}, 断流会话占比 {summary['starving_session_ratio']:.1%}"
+        f"失败 {summary['sessions_failed']}, 断流会话占比 {summary['starving_session_ratio']:.1%}, "
+        f"判定 {summary['verdict']}"
     )
     return RunReport(
         config=asdict(cfg),
@@ -324,19 +344,55 @@ def summarize(
     tail_n = max(1, len(steady) // 2) if steady else 1
     steady_mean = float(np.mean(steady[-tail_n:])) if steady else 0.0
 
+    # 决策延迟按帧汇总,不按会话:先算每会话分位数再取平均会把长会话与短会话等权,
+    # 而容量判据问的是「所有帧里有多少比例落后」,只有把全部样本合起来才是这个口径。
+    decisions = [v for s in sessions for v in s.decision_latencies]
+    decode_ms = [v for s in sessions for v in s.server_decode_ms]
+    budget = cfg.decision_budget_s if cfg.decision_budget_s is not None else cfg.frame_ms / 1000.0
+    over_budget = sum(1 for v in decisions if v > budget)
+
+    queue_timeout_ratio = round(len(capacity) / total, 4) if total else 0.0
+    starving_ratio = round(len(starving) / total, 4) if total else 0.0
+    decision_p95 = _stat(decisions, "p95")
+    reasons: List[str] = []
+    if len(failed) > VERDICT_MAX_FAILED_SESSIONS:
+        reasons.append(f"失败会话 {len(failed)} 个,要求为 {VERDICT_MAX_FAILED_SESSIONS}")
+    if queue_timeout_ratio > VERDICT_MAX_QUEUE_TIMEOUT_RATIO:
+        reasons.append(f"排队超时会话占比 {queue_timeout_ratio:.1%},要求为 {VERDICT_MAX_QUEUE_TIMEOUT_RATIO:.0%}")
+    if decision_p95 is None:
+        reasons.append("没有收到任何带 response_id 的决策事件,决策延迟无法判定")
+    elif decision_p95 > budget:
+        reasons.append(f"决策延迟 p95 {decision_p95:.3f}s 超过预算 {budget:.3f}s")
+    if starving_ratio > VERDICT_MAX_STARVING_SESSION_RATIO:
+        reasons.append(f"断流会话占比 {starving_ratio:.1%} 超过 {VERDICT_MAX_STARVING_SESSION_RATIO:.0%}")
+
     return {
+        "verdict": "pass" if not reasons else "fail",
+        "verdict_reasons": reasons,
+        "decision_budget_s": round(budget, 4),
+        "decision_p50_s": _stat(decisions, "p50"),
+        "decision_p95_s": decision_p95,
+        "decision_p99_s": _stat(decisions, "p99"),
+        "decision_max_s": round(max(decisions), 4) if decisions else None,
+        "decision_over_budget_ratio": round(over_budget / len(decisions), 4) if decisions else 0.0,
+        "frames_answered_total": len(decisions),
+        "frames_unanswered_total": sum(s.frames_unanswered for s in sessions),
+        "speak_frames_total": sum(s.speak_frames for s in sessions),
+        "listen_frames_total": sum(s.listen_frames for s in sessions),
+        "server_decode_ms_p50": _stat(decode_ms, "p50"),
+        "server_decode_ms_p95": _stat(decode_ms, "p95"),
         "sessions_total": total,
         "sessions_planned": plan.n_sessions,
         "sessions_failed": len(failed),
         "failure_rate": round(len(failed) / total, 4) if total else 0.0,
         "failure_breakdown": _counter(s.end_reason for s in sessions),
         "sessions_queue_timed_out": len(capacity),
-        "queue_timeout_ratio": round(len(capacity) / total, 4) if total else 0.0,
+        "queue_timeout_ratio": queue_timeout_ratio,
         "concurrency_peak": peak_running,
         "concurrency_target": plan.target_concurrency,
         "concurrency_steady_mean": round(steady_mean, 2),
         "concurrency_overshoot": round(peak_running / plan.target_concurrency, 3) if plan.target_concurrency else 0.0,
-        "starving_session_ratio": round(len(starving) / total, 4) if total else 0.0,
+        "starving_session_ratio": starving_ratio,
         "starve_ratio_mean": _stat(starve_ratio, "mean"),
         "starve_ratio_p50": _stat(starve_ratio, "p50"),
         "starve_ratio_p95": _stat(starve_ratio, "p95"),

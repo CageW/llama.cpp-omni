@@ -9,13 +9,17 @@
 延迟的分母要小心:服务端发的是 80ms 一帧的音频,客户端每 20ms 播掉一帧的音频,
 两者节奏不同,所以「相邻 delta 的间隔」本身不是延迟,只是到达节奏。真正能被听到的
 是缓冲算术:收到一秒音频就多一秒库存,过了一秒墙钟就烧掉一秒库存。
+
+另一条主指标是逐帧的决策延迟:从第 k 个 input.append 发出,到模型对这一帧的
+listen/text 决策抵达。它直接对应服务端有没有跟上帧节奏——决策延迟的 p95 超过帧长,
+服务端就已经在积压,这是项目里多 session 容量压测判「到顶」的判据。
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import ClassVar, Tuple, Any, Dict, List, Optional
 
 import numpy as np
 
@@ -68,11 +72,20 @@ class SessionStats:
     audio_received_s: float = 0.0
     listen_events: int = 0
 
+    # 逐帧决策。三个列表只留在内存里,不进 to_dict:一个几分钟的会话就有几千帧
+    decision_latencies: List[float] = field(default_factory=list)
+    server_decode_ms: List[float] = field(default_factory=list)
+    server_prefill_ms: List[float] = field(default_factory=list)
+    speak_frames: int = 0
+    listen_frames: int = 0
+    frames_unanswered: int = 0
+
     # 播放缓冲
     underrun_total_s: float = 0.0
     underrun_events: int = 0
     max_underrun_s: float = 0.0
     worst_buffer_deficit_s: float = 0.0
+    underrun_intervals: List[Tuple[float, float]] = field(default_factory=list)   # 相对 session.created 的秒数
 
     # 输出节奏
     audio_gap_samples: List[float] = field(default_factory=list)
@@ -136,6 +149,22 @@ class SessionStats:
         return min(1.0, self.underrun_total_s / dur)
 
     @property
+    def decision_p50_s(self) -> Optional[float]:
+        return percentile(self.decision_latencies, 50)
+
+    @property
+    def decision_p95_s(self) -> Optional[float]:
+        return percentile(self.decision_latencies, 95)
+
+    @property
+    def decision_max_s(self) -> Optional[float]:
+        return max(self.decision_latencies) if self.decision_latencies else None
+
+    def frames_over_budget(self, budget_s: float) -> int:
+        """决策延迟超过帧长预算的帧数。超预算意味着这一帧的决策在下一帧到来之后才出。"""
+        return sum(1 for v in self.decision_latencies if v > budget_s)
+
+    @property
     def audio_gap_p50_s(self) -> Optional[float]:
         if not self.audio_gap_samples:
             return None
@@ -173,9 +202,19 @@ class SessionStats:
             "underrun_total_s": round(self.underrun_total_s, 4),
             "underrun_events": self.underrun_events,
             "max_underrun_s": round(self.max_underrun_s, 4),
+            "underrun_intervals": [list(x) for x in self.underrun_intervals[:PlaybackBuffer.INTERVALS_KEPT]],
             "starve_ratio": round(self.starve_ratio, 6),
             "audio_gap_p50_s": _r(self.audio_gap_p50_s),
             "audio_gap_p99_s": _r(self.audio_gap_p99_s),
+            "decision_p50_s": _r(self.decision_p50_s),
+            "decision_p95_s": _r(self.decision_p95_s),
+            "decision_max_s": _r(self.decision_max_s),
+            "decision_count": len(self.decision_latencies),
+            "speak_frames": self.speak_frames,
+            "listen_frames": self.listen_frames,
+            "frames_unanswered": self.frames_unanswered,
+            "server_decode_ms_p50": _r(percentile(self.server_decode_ms, 50)),
+            "server_prefill_ms_p50": _r(percentile(self.server_prefill_ms, 50)),
             "send_errors": self.send_errors,
             "queue_updates": self.queue_updates,
         }
@@ -218,8 +257,13 @@ class PlaybackBuffer:
     underrun_total_s: float = 0.0
     underrun_events: int = 0
     max_underrun_s: float = 0.0
+    # 每段断流的 (起点, 终点) 墙钟时刻,最多留 INTERVALS_KEPT 段。报表里只有总时长时,分不清
+    # 「开头一段大的」和「零散很多小的」,而这两种对应的原因完全不同(建会话慢 vs 供给不稳)。
+    INTERVALS_KEPT: ClassVar[int] = 32
     _underrun_started: Optional[float] = None
-    _is_listening: bool = False
+    # 开局就是倾听态:模型还没说过话,客户端没有任何东西可播,不能从会话建立那一刻
+    # 就开始记欠账。否则一个模型从头听到尾的会话会被记成整段断流。
+    _is_listening: bool = True
 
     def note_audio(self, seconds: float, now: float) -> None:
         """到货:先把时间推进到 now,再加货。收到音频意味着模型在说话,退出倾听。"""
@@ -231,8 +275,18 @@ class PlaybackBuffer:
             self._underrun_started = None
 
     def note_listen(self, now: float) -> None:
-        """收到 kind=listen:模型进入倾听状态,暂停消耗库存。"""
+        """收到 kind=listen:模型进入倾听状态,暂停消耗库存。
+
+        模型决定听,就是这一轮说完了:此前欠下的播放债到此结清。正在进行的断流在
+        这一刻结束(该播没播的那段已经记进去了),负库存归零。不归零的话,下一轮
+        模型开口时第一帧音频会先去填上一轮的窟窿,整轮都被记成断流。
+        """
         self._advance(now)
+        if self._underrun_started is not None:
+            self._close_gap(now)
+            self._underrun_started = None
+        if self.drain_s > self.supply_s:
+            self.drain_s = self.supply_s
         self._is_listening = True
 
     def tick(self, now: float) -> None:
@@ -296,6 +350,15 @@ class PlaybackBuffer:
         gap = max(0.0, end - self._underrun_started)
         self.underrun_total_s += gap
         self.max_underrun_s = max(self.max_underrun_s, gap)
+        if len(self.underrun_intervals) < self.INTERVALS_KEPT:
+            self.underrun_intervals.append((self._underrun_started, end))
+
+    @property
+    def underrun_intervals(self) -> List[Tuple[float, float]]:
+        # PlaybackBuffer 不是 dataclass,类属性上放一个 list 会被所有实例共享,所以按实例懒建
+        if "_underrun_intervals" not in self.__dict__:
+            self._underrun_intervals: List[Tuple[float, float]] = []
+        return self._underrun_intervals
 
     def _recovery_time(self) -> float:
         """库存回到正数的那一刻,即解 supply_s == 累计消耗 的时刻。

@@ -22,7 +22,7 @@ import json
 import sys
 from pathlib import Path
 
-from loadsim.activity import FRAME_MS, SAMPLES_PER_FRAME, load_pcm16k_mono, slice_frames
+from loadsim.activity import FRAME_MS, SAMPLES_PER_FRAME, load_pcm16k_mono, samples_per_frame, slice_frames
 from loadsim.runner import RunConfig, run_load
 
 
@@ -66,11 +66,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="静音段停止上行(移动端省流量口径);默认照常上行静音帧",
     )
     run.add_argument("--user-audio", required=True, help="上行音频素材,16 kHz 单声道 16 位 WAV")
+    run.add_argument(
+        "--frame-ms",
+        type=int,
+        default=FRAME_MS,
+        help="上行帧长(毫秒)。产品前端发 1000ms 一帧、模型每秒决策一次,压容量请用 1000;"
+        "默认 80 是 OpenAI Realtime server VAD 的分块粒度,比真实流量多 12.5 倍决策次数",
+    )
+    run.add_argument(
+        "--decision-budget-ms",
+        type=int,
+        default=None,
+        help="决策延迟预算(毫秒),p95 超过它判 fail;默认等于 --frame-ms",
+    )
     run.add_argument("--max-wait", type=float, default=30.0, help="排队等 worker 的上限(秒);worker 全忙时排队几十秒是正常的,压容量时要调大")
     run.add_argument("--ca-file", default=None, help="wss 用的 CA 证书;不给则用系统信任库")
     run.add_argument("--insecure", action="store_true", help="wss 不校验证书,仅用于内网临时验证")
     run.add_argument("--ref-audio", default=None, help="session.init 里的音色参考音频 WAV;不传用服务端默认音色")
     run.add_argument("--system-prompt", default="You are a helpful assistant.", help="session.init 里的系统提示词")
+    run.add_argument(
+        "--init-config",
+        default=None,
+        help="session.init 里 payload.config 的 JSON 字符串,原样透传给服务端(采样与双工参数,例如 "
+        "'{\"length_penalty\":1.1,\"listen_prob_scale\":1.0}')。不传就用服务端默认",
+    )
     run.add_argument("--out", default=None, help="结果 JSON 输出路径")
     run.add_argument("--label", default="", help="本次运行的标签,写进结果便于对照")
 
@@ -112,10 +131,24 @@ def _fmt_table(report: dict) -> str:
         ("其中用户说话的时长(秒)", f"{s['speech_sent_s_total']} / 上行总时长 {s['audio_sent_s_total']}"),
         ("语音活动比", f"{s['speech_activity_ratio']}(电话语音实测 0.32~0.38)"),
         ("下行音频 delta 总数", f"{s['audio_deltas_total']}"),
+        (
+            "决策延迟 中位/95分位/99分位/最大(秒)",
+            f"{_n(s['decision_p50_s'])} / {_n(s['decision_p95_s'])} / {_n(s['decision_p99_s'])} / {_n(s['decision_max_s'])}"
+            f"  (预算 {s['decision_budget_s']}s)",
+        ),
+        ("超预算帧占比", f"{s['decision_over_budget_ratio']:.1%}"),
+        ("应答帧 / 未应答帧", f"{s['frames_answered_total']} / {s['frames_unanswered_total']}"),
+        ("说话帧 / 倾听帧", f"{s['speak_frames_total']} / {s['listen_frames_total']}"),
+        ("服务端 decode 中位(毫秒)", f"{_n(s['server_decode_ms_p50'])}"),
+        ("判定", s["verdict"] + ("" if not s["verdict_reasons"] else ":" + ";".join(s["verdict_reasons"]))),
     ]
     width = max(len(k) for k, _ in rows)
     lines = [f"  {k.ljust(width)}  {v}" for k, v in rows]
     return "\n".join(lines)
+
+
+def _n(v) -> str:
+    return "无" if v is None else str(v)
 
 
 def _print_concurrency(report: dict, buckets: int = 12) -> None:
@@ -133,16 +166,19 @@ def _print_concurrency(report: dict, buckets: int = 12) -> None:
 
 async def _cmd_run(args) -> int:
     pcm, n_frames = load_pcm16k_mono(args.user_audio)
-    frames = slice_frames(pcm, SAMPLES_PER_FRAME)
+    frame_samples = samples_per_frame(args.frame_ms)
+    frames = slice_frames(pcm, frame_samples)
     if not frames:
-        print(f"素材 {args.user_audio} 不足一帧(需要 {SAMPLES_PER_FRAME} 采样 = 80ms)", file=sys.stderr)
+        print(f"素材 {args.user_audio} 不足一帧(需要 {frame_samples} 采样 = {args.frame_ms}ms)", file=sys.stderr)
         return 2
     print(
         f"上行素材 {args.user_audio}: {n_frames / 16000.0:.1f}s,切成 {len(frames)} 帧 "
-        f"(每帧 {SAMPLES_PER_FRAME} 采样 / {FRAME_MS}ms)"
+        f"(每帧 {frame_samples} 采样 / {args.frame_ms}ms)"
     )
 
     init_payload: dict = {"system_prompt": args.system_prompt}
+    if args.init_config:
+        init_payload["config"] = json.loads(args.init_config)
     if args.ref_audio:
         # 参考音频用来固定音色。压测里意义有两个:一是让 init 的开销与真实使用一致
         # (带参考音频的 init 要多做一次音频编码),二是不带它就等于每次压测都在用
@@ -180,6 +216,8 @@ async def _cmd_run(args) -> int:
         handshake_timeout_s=args.max_wait,
         init_payload=init_payload,
         label=args.label,
+        frame_ms=args.frame_ms,
+        decision_budget_s=(args.decision_budget_ms if args.decision_budget_ms is not None else args.frame_ms) / 1000.0,
     )
     report = await run_load(cfg, frames=frames)
     _emit(report, args.out)

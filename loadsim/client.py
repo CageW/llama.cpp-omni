@@ -5,9 +5,11 @@
 这么多并发会话,不是模型答得好不好。上行音频固定复用同一段素材,保证不同 session
 之间只有「什么时候上线、说话节奏如何」这两个变量在变。
 
-协议细节以 docs/realtime-protocol-overview.md 为准:客户端要等到 session.queue_done
+协议细节以 MiniCPM-o-Demo 仓库的实时协议文档为准:客户端要等到 session.queue_done
 才能发 session.init;音频是 16 kHz 单声道 float32,base64 编码;音频双工没有
-response.done,输出边界靠 kind=listen 表达。
+response.done,输出边界靠 kind=listen 表达。服务端给第 k 个 input.append 的响应
+命名为 <session_id>_resp_<k>(k 从 1 起),listen/text 两种 delta 各带这个 response_id,
+客户端靠它把「第 k 帧发出」与「模型对第 k 帧的决策到达」配成一对,算出决策延迟。
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import ssl
 import time
 from typing import Any, Dict, Optional
@@ -25,7 +28,11 @@ from websockets.exceptions import ConnectionClosed
 from loadsim.activity import FRAME_MS, SpeechActivity, SpeechPattern
 from loadsim.metrics import PlaybackBuffer, SessionStats, pcm_duration_s
 
-TICK_S = FRAME_MS / 1000.0
+# 播放缓冲按墙钟推进的最长间隔。它原本与帧长绑在一起,但帧长改成 1000ms 后,
+# 收不到消息时一秒才推进一次缓冲,断流起止时刻的分辨率会退化到一秒,所以单独封顶。
+PLAYBACK_TICK_MAX_S = 0.08
+
+_RESP_INDEX = re.compile(r"_resp_(\d+)$")
 
 
 def build_ssl_context(url: str, insecure: bool, ca_file: Optional[str]) -> Optional[ssl.SSLContext]:
@@ -72,11 +79,13 @@ class SimClient:
         send_silence_during_pause: bool = True,
         ssl_context: Optional[ssl.SSLContext] = None,
         handshake_timeout_s: float = 30.0,
+        frame_ms: int = FRAME_MS,
     ) -> None:
         self.index = index
         self.url = url
         self.mode = mode
         self.frames = frames
+        self.frame_s = frame_ms / 1000.0
         self.speech = speech
         self.lifetime_s = lifetime_s
         self.stats = SessionStats(index=index, scheduled_start_s=scheduled_start_s, mode=mode)
@@ -95,10 +104,12 @@ class SimClient:
         self._last_recv_at = 0.0
         self._activity: Optional[SpeechActivity] = None
         self._send_cursor = 0.0
+        # 第 k 个 input.append 的发出时刻,收到对应决策后即删,所以长度不超过在途帧数
+        self._sent_at: Dict[int, float] = {}
 
     # ------------------------------------------------------------------ 上行
     async def _pump_input(self, ws) -> None:
-        """按 80ms 节奏上行音频帧。
+        """按帧长节奏上行音频帧。
 
         send_silence_during_pause 决定静音段的行为,两种口径都有真实对应物:
 
@@ -124,9 +135,9 @@ class SimClient:
             now = time.monotonic()
             if now - started >= self.lifetime_s:
                 return
-            talking = self._activity.advance(TICK_S)
+            talking = self._activity.advance(self.frame_s)
             target = started + self._send_cursor
-            self._send_cursor += TICK_S
+            self._send_cursor += self.frame_s
             if talking or self.send_silence_during_pause:
                 if talking:
                     frame = self.frames[self._frame_idx % len(self.frames)]
@@ -150,9 +161,10 @@ class SimClient:
                     self.stats.send_errors += 1
                 else:
                     self.stats.frames_sent += 1
-                    self.stats.audio_sent_s += TICK_S
+                    self._sent_at[self.stats.frames_sent] = time.monotonic()
+                    self.stats.audio_sent_s += self.frame_s
                     if talking:
-                        self.stats.speech_sent_s += TICK_S
+                        self.stats.speech_sent_s += self.frame_s
             sleep_for = target + self.speech.sample_jitter_s() - time.monotonic()
             if sleep_for > 0:
                 try:
@@ -187,15 +199,43 @@ class SimClient:
                 self.stats.text_chars += len(msg.get("text") or "")
                 if self.stats.first_output_at is None:
                     self.stats.first_output_at = now
+                self._resolve_decision(msg, kind, now)
             elif kind == "listen":
                 self.buffer.note_listen(now)
                 self.stats.listen_events += 1
+                self._resolve_decision(msg, kind, now)
+
+    def _resolve_decision(self, msg: Dict[str, Any], kind: str, now: float) -> None:
+        """把一条 listen/text delta 归到它回应的那一帧,记下决策延迟。
+
+        只认每帧的第一条:模型说话时一帧会带出多条 text delta,后面的都是同一次决策
+        的续流,不是新的决策。audio delta 不参与,它是 TTS 异步吐的,与决策时刻无关。
+        metrics 里的 prefill_ms / generate_ms 是服务端自报的本帧耗时,单独收着,用来
+        把「决策慢」拆成「排队慢」还是「算得慢」。
+        """
+        m = _RESP_INDEX.search(msg.get("response_id") or "")
+        if not m:
+            return
+        sent = self._sent_at.pop(int(m.group(1)), None)
+        if sent is None:
+            return
+        self.stats.decision_latencies.append(now - sent)
+        if kind == "text":
+            self.stats.speak_frames += 1
+        else:
+            self.stats.listen_frames += 1
+        metrics = msg.get("metrics")
+        if isinstance(metrics, dict):
+            if metrics.get("generate_ms") is not None:
+                self.stats.server_decode_ms.append(float(metrics["generate_ms"]))
+            if metrics.get("prefill_ms") is not None:
+                self.stats.server_prefill_ms.append(float(metrics["prefill_ms"]))
 
     async def _pump_output(self, ws) -> None:
         """收下行事件,并按墙钟推进播放缓冲的消耗。"""
         while not self._closed.is_set():
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=TICK_S)
+                raw = await asyncio.wait_for(ws.recv(), timeout=min(self.frame_s, PLAYBACK_TICK_MAX_S))
             except asyncio.TimeoutError:
                 self.buffer.tick(time.monotonic())
                 if self.stats.connected_at is not None and (
@@ -254,6 +294,12 @@ class SimClient:
             self.stats.underrun_total_s = self.buffer.underrun_total_s
             self.stats.underrun_events = self.buffer.underrun_events
             self.stats.max_underrun_s = self.buffer.max_underrun_s
+            self.stats.frames_unanswered = len(self._sent_at)
+            # 断流区间改成相对会话建立时刻的秒数,读起来直接是「第几秒断到第几秒」
+            t_ref = self.stats.session_created_at or self.stats.connected_at or now
+            self.stats.underrun_intervals = [
+                (round(a - t_ref, 2), round(b - t_ref, 2)) for a, b in self.buffer.underrun_intervals
+            ]
             if self.stats.end_reason == "unknown":
                 self.stats.end_reason = "lifetime_expired"
         return self.stats

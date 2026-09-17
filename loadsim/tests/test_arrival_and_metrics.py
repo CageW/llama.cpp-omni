@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from loadsim.activity import FRAME_MS, SpeechActivity, SpeechPattern
+from loadsim.activity import FRAME_MS, SpeechActivity, SpeechPattern, samples_per_frame, slice_frames
 from loadsim.arrival import (
     build_arrival_plan,
     check_load_feasibility,
@@ -352,3 +352,136 @@ def test_summary_separates_queue_timeouts_from_failures() -> None:
     assert summary["failure_rate"] == 0.25
     assert summary["sessions_queue_timed_out"] == 2
     assert summary["queue_timeout_ratio"] == 0.5
+
+
+# --------------------------------------------------------------------- 帧长与决策延迟
+
+
+def test_samples_per_frame_1000ms_yields_one_second_frames() -> None:
+    """产品前端发 1000ms 一帧,16 kHz 下是 16000 采样;切帧要按这个数出整秒的帧。"""
+    assert samples_per_frame(1000) == 16000
+    assert samples_per_frame(80) == 1280
+    pcm = b"\x00" * (16000 * 4 * 3 + 100)  # 三秒零一点的 float32
+    frames = slice_frames(pcm, samples_per_frame(1000))
+    assert len(frames) == 3
+    assert all(len(f) == 16000 * 4 for f in frames)
+
+
+def test_session_stats_decision_bookkeeping() -> None:
+    """决策延迟的分位数与超预算计数要按逐帧样本算,空样本给 None 而不是 0。"""
+    s = SessionStats(index=0, scheduled_start_s=0.0, mode="audio")
+    assert s.decision_p50_s is None and s.decision_p95_s is None and s.decision_max_s is None
+    assert s.frames_over_budget(0.08) == 0
+    s.decision_latencies.extend([0.02] * 90 + [0.5] * 10)
+    assert s.decision_p50_s == pytest.approx(0.02)
+    assert s.decision_p95_s == pytest.approx(0.5)
+    assert s.decision_max_s == pytest.approx(0.5)
+    assert s.frames_over_budget(0.08) == 10
+    d = s.to_dict()
+    assert d["decision_count"] == 100
+    assert "decision_latencies" not in d, "原始样本不进 JSON"
+
+
+def _decision_session(index: int, latencies, starving_s: float = 0.0):
+    s = SessionStats(index=index, scheduled_start_s=0.0, mode="audio")
+    s.end_reason = "lifetime_expired"
+    s.connected_at = 0.0
+    s.closed_at = 10.0
+    s.decision_latencies.extend(latencies)
+    s.listen_frames = len(latencies)
+    s.underrun_total_s = starving_s
+    return s
+
+
+def test_summary_pools_decisions_and_passes_when_within_budget() -> None:
+    """决策延迟按全部帧合并算分位数,不按会话平均;都在预算内且没断流时判 pass。"""
+    from loadsim.arrival import ArrivalPlan
+    from loadsim.runner import RunConfig, summarize
+
+    sessions = [
+        _decision_session(0, [0.5] * 100),
+        _decision_session(1, [0.6] * 100),
+    ]
+    plan = ArrivalPlan(offsets=[0.0, 0.0], target_concurrency=2, duration_s=30.0, mode="ramp")
+    cfg = RunConfig(frame_ms=1000)
+    assert cfg.decision_budget_s == pytest.approx(1.0)
+    summary = summarize(sessions, cfg, plan, sampled_concurrency=[2.0] * 10, peak_running=2)
+    assert summary["decision_p95_s"] == pytest.approx(0.6)
+    assert summary["decision_over_budget_ratio"] == 0.0
+    assert summary["frames_answered_total"] == 200
+    assert summary["listen_frames_total"] == 200
+    assert summary["verdict"] == "pass"
+    assert summary["verdict_reasons"] == []
+
+
+def test_summary_fails_when_decision_p95_exceeds_budget_or_sessions_starve() -> None:
+    """一个会话把 p95 拉过预算、另一个会话断流,判 fail 且两条原因都要点名。"""
+    from loadsim.arrival import ArrivalPlan
+    from loadsim.runner import RunConfig, summarize
+
+    sessions = [
+        _decision_session(0, [0.05] * 100),
+        # 这 100 帧里 20 帧慢到 1.5s:合并后 200 帧中 10% 超预算,p95 落在 1.5
+        _decision_session(1, [0.05] * 80 + [1.5] * 20, starving_s=2.0),
+    ]
+    plan = ArrivalPlan(offsets=[0.0, 0.0], target_concurrency=2, duration_s=30.0, mode="ramp")
+    cfg = RunConfig(frame_ms=1000)
+    summary = summarize(sessions, cfg, plan, sampled_concurrency=[2.0] * 10, peak_running=2)
+    assert summary["decision_p95_s"] > 1.0
+    assert summary["decision_over_budget_ratio"] == pytest.approx(0.10)
+    assert summary["starving_session_ratio"] == 0.5
+    assert summary["verdict"] == "fail"
+    assert any("决策延迟" in r for r in summary["verdict_reasons"])
+    assert any("断流" in r for r in summary["verdict_reasons"])
+    assert not any("失败会话" in r for r in summary["verdict_reasons"])
+
+
+def test_summary_without_decisions_is_not_pass() -> None:
+    """没有任何带 response_id 的决策事件时不能判 pass:判据缺了一项,不是达标了。"""
+    from loadsim.arrival import ArrivalPlan
+    from loadsim.runner import RunConfig, summarize
+
+    sessions = [_decision_session(0, [])]
+    plan = ArrivalPlan(offsets=[0.0], target_concurrency=1, duration_s=30.0, mode="ramp")
+    summary = summarize(sessions, RunConfig(), plan, sampled_concurrency=[1.0], peak_running=1)
+    assert summary["decision_p95_s"] is None
+    assert summary["verdict"] == "fail"
+    assert summary["decision_over_budget_ratio"] == 0.0
+
+
+def test_buffer_starts_listening_so_a_silent_session_never_starves() -> None:
+    """模型从头听到尾、一句话没说的会话,不该被记成整段断流。
+
+    会话刚建立时客户端手里没有任何音频,这不是「该播没播」,是「还没轮到播」。
+    修之前初始状态是非倾听态,drain 从第一次 tick 就开始累加,一个 50 秒的纯倾听
+    会话会被记出 50 秒断流、判成 100% 断流。
+    """
+    buf = PlaybackBuffer()
+    buf.tick(1.0)
+    buf.note_listen(now=1.0)
+    buf.tick(50.0)
+    buf.finish(50.0)
+    assert buf.underrun_events == 0
+    assert buf.underrun_total_s == 0.0
+
+
+def test_listen_settles_the_debt_of_the_previous_turn() -> None:
+    """模型决定听,就是上一轮说完了:欠下的播放债到此结清,不带进下一轮。
+
+    时间线:0s 收到 1s 音频;3s 时已欠 2s;3s 收到 listen,断流在 3s 结束、记 2s;
+    之后 10s 模型再开口给 1s 音频,这 1s 应当是新一轮的正常库存,能播到 11s,
+    而不是先拿去填上一轮的 2s 窟窿。
+    """
+    buf = PlaybackBuffer()
+    buf.note_audio(1.0, now=0.0)
+    buf.tick(3.0)
+    assert buf.underrun_events == 1
+    buf.note_listen(now=3.0)
+    assert buf.underrun_total_s == pytest.approx(2.0, abs=0.01)
+    buf.note_audio(1.0, now=10.0)
+    buf.tick(10.9)
+    assert buf.underrun_events == 1, "新一轮的音频不该先去填旧账"
+    buf.tick(11.5)
+    assert buf.underrun_events == 2
+    buf.finish(11.5)
+    assert buf.underrun_total_s == pytest.approx(2.5, abs=0.02)
