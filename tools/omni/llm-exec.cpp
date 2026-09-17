@@ -54,6 +54,7 @@ struct omni_llm_exec::impl {
     std::chrono::steady_clock::time_point t_last_batch_end{};
     double busy_ema = 0;           // decode_ms / (decode_ms + idle_ms), EMA over batches
     double fixed_cost_ema_us = 0;  // 1-token single-step batch cost, EMA (the amortizable part of a forward)
+    double ms_per_tok_ema = 0;     // marginal cost per token of prefill-carrying batches (>= 32 tokens), EMA
 
     // called by the worker just before a step's promise is fulfilled; takes mtx because submitters update
     // the same table (note_submitted) under mtx, and the worker's hold decision reads it under mtx too
@@ -269,7 +270,32 @@ struct omni_llm_exec::impl {
                 const int LT = self->long_threshold;
                 int tok = 0, n_long = 0;
                 std::vector<bool> seq_taken(self->n_seq, false);
-                if (policy == "equal") {
+                if (policy == "adaptive") {
+                    // Batch SIZE / composition. Every frame is a chain of three steps (one prefill, two decodes) and
+                    // each waits a full queue turn. At high load a turn is a 200-500 token forward (150-260 ms), so
+                    // the cheap decode steps spend their time behind other sessions' prefills. When the GPU is busy:
+                    // take every decode step first (they merge almost for free), then prefills in FIFO order only up
+                    // to a token cap sized so the forward stays near OMNI_EXEC_BATCH_TARGET_MS. Total work is unchanged
+                    // (cost is linear in prefill tokens) but the chain's two decode turns shrink to a small batch each.
+                    // At low load (busy below the threshold) the cap is off and the batch takes everything pending.
+                    const bool busy_now = busy_ema >= self->cap_busy_threshold;
+                    int cap_tok = self->max_tokens;
+                    if (busy_now && self->batch_target_ms > 0 && ms_per_tok_ema > 0) {
+                        cap_tok = std::max(self->cap_min_tokens, (int) (self->batch_target_ms / ms_per_tok_ema));
+                    }
+                    int n_long_taken = 0;
+                    for (int pass = 0; pass < 2; pass++) {
+                        for (auto it = queue.begin(); it != queue.end();) {
+                            step * s = *it;
+                            const bool is_long = s->n > LT;
+                            if ((pass == 0) == is_long) { ++it; continue; }          // pass 0: decodes, pass 1: prefills
+                            if (seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
+                            if (is_long && n_long_taken > 0 && tok + s->n > cap_tok) { ++it; continue; }   // always at least one prefill
+                            seq_taken[s->seq] = true; tok += s->n; n_long += is_long; n_long_taken += is_long; batch.push_back(s); it = queue.erase(it);
+                        }
+                    }
+                    if (self->trace && busy_now && n_long_taken > 0) fprintf(stderr, "[cap] cap_tok=%d took_long=%d tok=%d left=%zu ms_per_tok=%.3f\n", cap_tok, n_long_taken, tok, queue.size(), ms_per_tok_ema);
+                } else if (policy == "equal") {
                     int pick_n = 0;
                     for (auto * s : queue) pick_n = std::max(pick_n, s->n);
                     for (auto it = queue.begin(); it != queue.end();) {
@@ -401,6 +427,7 @@ struct omni_llm_exec::impl {
         }
         t_last_batch_end = t1;
         if (batch.size() == 1 && n_tok == 1) fixed_cost_ema_us = fixed_cost_ema_us <= 0 ? ms * 1000.0 : 0.9 * fixed_cost_ema_us + 0.1 * ms * 1000.0;
+        if (n_tok >= 32) { const double mpt = ms / n_tok; ms_per_tok_ema = ms_per_tok_ema <= 0 ? mpt : 0.9 * ms_per_tok_ema + 0.1 * mpt; }
         const bool trace = self->trace;
         if (trace) { int mx = 0; for (auto * s : batch) mx = std::max(mx, s->n); fprintf(stderr, "[exec] steps=%zu tok=%d max_n=%d ms=%.1f qwait_avg=%.1f qwait_max=%.1f busy=%.2f\n", batch.size(), n_tok, mx, ms, qwait_sum / batch.size(), qwait_max, busy_ema); }
         {
@@ -545,6 +572,9 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->hold_max_us         = knob_i("HOLD_MAX_US", 20000);
     e->chain_gap_max_us    = knob_i("CHAIN_GAP_MAX_US", 60000);
     e->fixed_cost_us       = knob_i("FIXED_COST_US", 6500);
+    e->batch_target_ms     = knob_i("BATCH_TARGET_MS", 60);
+    e->cap_min_tokens      = knob_i("CAP_MIN_TOKENS", 32);
+    if (const char * v = knob("CAP_BUSY_THRESHOLD")) e->cap_busy_threshold = atof(v);
     if (device && device[0]) {
         // NOTE: a llama_context cannot be pinned to a GPU independently of its model: device placement is fixed
         // at llama_model load (llama_model_params.devices), and every context shares the model's device set.
