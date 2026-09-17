@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "session.h"
 #include "ws_handler.h"
+#include "token2wav/token2wav.h"
 
 #include <mutex>
 #include <thread>
@@ -16,6 +17,22 @@
 #include <condition_variable>
 #include <fstream>
 #include <string>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+
+// Fatal-signal backtrace to stderr (async-signal-safe: backtrace_symbols_fd only). Release builds on the test
+// node have no gdb and apport swallows cores, so without this a crash leaves nothing but "Segmentation fault".
+// Symbolize with: addr2line -e build-cuda/bin/libomni.so -f -C <offset>.
+static void omni_fatal_signal(int sig) {
+    void * trace[64];
+    const int n = backtrace(trace, 64);
+    const char msg[] = "\n=== fatal signal, backtrace ===\n";
+    (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    backtrace_symbols_fd(trace, n, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
@@ -88,6 +105,11 @@ struct omni_server_state {
     SessionManager session_mgr;       // WS backend session management
     SessionPool  session_pool;        // multi-session slot pool (empty in legacy mode)
     int          n_slots = 0;         // 0 = legacy single-session mode
+    omni_context * pool_root = nullptr;   // pool mode: root context (owns the shared LLM / TTS executors)
+    // pool mode: extra Token2Wav weight owners on other GPUs (OMNI_T2W_DEVICES); slots round-robin over
+    // root's device + these. Kept alive for the life of the server.
+    std::vector<std::unique_ptr<omni::flow::Token2WavSession>> t2w_owners;
+    std::vector<std::string> t2w_devices;
 };
 
 // Build the multi-session pool: one root context that owns all model weights
@@ -105,10 +127,23 @@ static bool build_session_pool(omni_server_state & state, common_params & params
 
     const std::string out_root = "./tools/omni/output";
 
-    LOG_INF("pool: loading root context (all weights)...\n");
+    // Token2Wav devices. Default is the first visible GPU (same card as the LLM). One second of speech
+    // costs a session about 100 to 300 ms of Token2Wav GPU time, so a single card saturates at roughly ten
+    // continuously speaking sessions and the backlog propagates back into LLM decode through the TTS queue.
+    // OMNI_T2W_DEVICES=gpu:2,gpu:3,gpu:4 (visible-GPU indices) loads the Token2Wav weights once per listed
+    // device and assigns slots round-robin, the same layout perf-multisession uses with --t2w-devices.
+    // OMNI_T2W_DEVICE=gpu:N is the single-device shorthand.
+    state.t2w_devices = {"gpu:0"};
+    if (const char * e = getenv("OMNI_T2W_DEVICES")) {
+        state.t2w_devices.clear(); std::string l = e; size_t q0 = 0;
+        while (q0 <= l.size()) { size_t q = l.find(',', q0); if (q == std::string::npos) q = l.size(); if (q > q0) state.t2w_devices.push_back(l.substr(q0, q - q0)); q0 = q + 1; }
+        if (state.t2w_devices.empty()) state.t2w_devices = {"gpu:0"};
+    } else if (const char * e1 = getenv("OMNI_T2W_DEVICE")) { if (e1[0]) state.t2w_devices = {e1}; }
+    const std::string & t2w_device = state.t2w_devices[0];
+    LOG_INF("pool: loading root context (all weights)... token2wav on %s (%zu device(s))\n", t2w_device.c_str(), state.t2w_devices.size());
     omni_context * root = omni_init(&params, /*media_type*/2, /*use_tts*/true,
                                     params.tts_bin_dir, /*tts_gpu_layers*/99,
-                                    /*token2wav_device*/"gpu:0", /*duplex_mode*/true,
+                                    t2w_device, /*duplex_mode*/true,
                                     /*existing_model*/nullptr, /*existing_ctx*/nullptr,
                                     out_root + "/slot0");
     if (!root) {
@@ -125,15 +160,32 @@ static bool build_session_pool(omni_server_state & state, common_params & params
         if (!omni_enable_llm_exec(root, n_slots, params.n_ctx)) {
             LOG_WRN("pool: omni_enable_llm_exec failed; falling back to per-slot decode\n");
         }
+        // Same for the TTS model: its 1-token forwards from N independent contexts would otherwise
+        // interleave with (and fragment) the LLM's batches on the same GPU. Context is small: TTS
+        // only needs the current chunk. OMNI_TTS_CTX overrides (perf-multisession uses 2048 too).
+        int tts_ctx = 2048; if (const char * e = getenv("OMNI_TTS_CTX")) { int v = atoi(e); if (v > 0) tts_ctx = v; }
+        if (!omni_enable_tts_exec(root, n_slots, tts_ctx)) {
+            LOG_WRN("pool: omni_enable_tts_exec failed; TTS runs per-slot\n");
+        }
+    }
+    state.pool_root = root;
+
+    for (size_t d = 1; d < state.t2w_devices.size(); ++d) {
+        auto o = omni_load_token2wav_owner(root->token2wav_model_dir, state.t2w_devices[d]);
+        if (!o) { LOG_ERR("pool: token2wav owner on %s failed; slots will use fewer devices\n", state.t2w_devices[d].c_str()); break; }
+        state.t2w_owners.push_back(std::move(o));
     }
 
     std::vector<omni_context *> contexts;
     contexts.push_back(root);
 
     for (int i = 1; i < n_slots; ++i) {
-        LOG_INF("pool: cloning session context %d/%d...\n", i, n_slots - 1);
+        omni::flow::Token2WavSession * t2w_owner = nullptr;   // root's device
+        if (!state.t2w_owners.empty()) { const size_t k = (size_t) i % (state.t2w_owners.size() + 1); if (k > 0) t2w_owner = state.t2w_owners[k - 1].get(); }
+        LOG_INF("pool: cloning session context %d/%d (token2wav %s)...\n", i, n_slots - 1,
+                t2w_owner ? state.t2w_devices[(size_t) i % (state.t2w_owners.size() + 1)].c_str() : t2w_device.c_str());
         omni_context * clone = omni_session_clone(root, &params,
-                                                  out_root + "/slot" + std::to_string(i));
+                                                  out_root + "/slot" + std::to_string(i), t2w_owner);
         if (!clone) {
             LOG_ERR("pool: omni_session_clone failed at slot %d; keeping %d slots\n",
                     i, (int)contexts.size());
@@ -160,6 +212,9 @@ int main(int argc, char ** argv) {
     common_params params;
 
     common_init();
+    signal(SIGSEGV, omni_fatal_signal);
+    signal(SIGABRT, omni_fatal_signal);
+    signal(SIGBUS,  omni_fatal_signal);
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
@@ -225,6 +280,37 @@ int main(int argc, char ** argv) {
             {"mode",     state.n_slots > 0 ? "pool" : "single"},
             {"capacity", state.n_slots > 0 ? state.n_slots : 1},
         };
+        // Executor statistics: how wide the batches actually were, how much of the wall time the GPU
+        // was busy, how long the adaptive policy held queues. A load report that only sees client-side
+        // latency cannot tell "batching worked" from "the GPU was just idle"; these numbers can.
+        auto exec_json = [](omni_llm_exec * ex) {
+            json j;
+            if (!ex) return j;
+            const auto s = ex->snapshot();
+            j["policy"]           = ex->policy;
+            j["n_batches"]        = s.n_batches;
+            j["n_steps"]          = s.n_steps;
+            j["n_forward"]        = s.n_forward;
+            j["n_tokens"]         = s.n_tokens_total;
+            j["steps_per_batch"]  = s.n_batches ? (double) s.n_steps / s.n_batches : 0.0;
+            j["max_steps_in_batch"] = s.max_steps_in_batch;
+            j["decode_ms_total"]  = s.decode_ms_total;
+            j["qwait_ms_mean"]    = s.n_steps ? s.qwait_ms_total / s.n_steps : 0.0;
+            j["qwait_ms_max"]     = s.qwait_ms_max;
+            j["hold_ms_total"]    = s.hold_ms_total;
+            j["n_hold"]           = s.n_hold;
+            j["n_hold_hit"]       = s.n_hold_hit;
+            j["busy_fraction"]    = s.busy_fraction;
+            j["fixed_cost_ms"]    = s.fixed_cost_ms;
+            json hist = json::object();
+            for (const auto & kv : s.batch_width_hist) hist[std::to_string(kv.first)] = kv.second;
+            j["batch_width_hist"] = hist;
+            return j;
+        };
+        if (state.pool_root) {
+            if (state.pool_root->llm_exec) health["llm_exec"] = exec_json(state.pool_root->llm_exec);
+            if (state.pool_root->tts_exec) health["tts_exec"] = exec_json(state.pool_root->tts_exec);
+        }
         return health;
     };
 

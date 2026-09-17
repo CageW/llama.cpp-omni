@@ -204,13 +204,21 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
 
     clear_text_stream_state(octx);
 
-    if (octx->ctx_llama) {
+    // KV reset. With the shared executors on (pool mode), ctx_llama / ctx_tts_llama point at the ONE context
+    // that holds every slot's sequence: llama_memory_clear on it wipes all other sessions' KV, and it runs
+    // unsynchronized with the executor worker's in-flight llama_decode (segfault at slot checkout, seen at
+    // N=16..24). Clear only this slot's own sequence, through the executor so it serializes with the worker.
+    if (octx->llm_exec) {
+        octx->llm_exec->seq_clear(octx->llm_seq);
+    } else if (octx->ctx_llama) {
         llama_memory_t mem = llama_get_memory(octx->ctx_llama);
         if (mem) {
             llama_memory_clear(mem, /*data=*/false);
         }
     }
-    if (octx->ctx_tts_llama) {
+    if (octx->tts_exec) {
+        octx->tts_exec->seq_clear(octx->tts_seq);
+    } else if (octx->ctx_tts_llama) {
         llama_memory_t mem = llama_get_memory(octx->ctx_tts_llama);
         if (mem) {
             llama_memory_clear(mem, /*data=*/false);
@@ -588,7 +596,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // Helper: fail-fast — send session.closed and close WS
     auto fail_fast = [&](const std::string & session_id, const std::string & reason) {
         if (!session_id.empty()) {
-            std::string ev = make_session_closed(session_id, reason).dump();
+            std::string ev = make_session_closed(session_id, reason).dump(-1, ' ', false, json::error_handler_t::replace);
             ws.send(ev);
         }
         session_mgr.close(session_id);
@@ -601,7 +609,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
     // Helper: send a JSON event over WS
     auto send_event = [&](const json & ev) -> bool {
-        return ws.send(ev.dump());
+        return ws.send(ev.dump(-1, ' ', false, json::error_handler_t::replace));
     };
 
     // ================================================================
@@ -714,7 +722,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         // Register the session with the manager.
         std::string session_id = session_mgr.register_slot_session(slot->slot_idx, octx);
         session_mgr.set_close_callback(session_id, [&ws, session_id]() {
-            ws.send(make_session_closed(session_id, "client_closed").dump());
+            ws.send(make_session_closed(session_id, "client_closed").dump(-1, ' ', false, json::error_handler_t::replace));
             ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
         });
 
@@ -763,7 +771,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 ProtocolMetrics metrics = make_runtime_metrics(
                     audio_state->octx, 0.0, 0.0, elapsed_ms(rstart));
                 audio_state->ws->send(
-                    make_audio_delta(audio_state->session_id, rid, b64, metrics).dump());
+                    make_audio_delta(audio_state->session_id, rid, b64, metrics).dump(-1, ' ', false, json::error_handler_t::replace));
             }
         };
 
@@ -776,7 +784,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
             json msg;
             try { msg = json::parse(raw); } catch (...) {
-                ws.send(make_session_closed(session_id, "invalid_json").dump());
+                ws.send(make_session_closed(session_id, "invalid_json").dump(-1, ' ', false, json::error_handler_t::replace));
                 break;
             }
             const std::string msg_type = msg.value("type", "");
@@ -791,7 +799,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Full-duplex: push audio frame and stream listen/text/audio deltas.
             auto parsed_input = parse_input_append(msg);
             if (!parsed_input.ok) {
-                ws.send(make_session_closed(session_id, "invalid_input").dump());
+                ws.send(make_session_closed(session_id, "invalid_input").dump(-1, ' ', false, json::error_handler_t::replace));
                 break;
             }
 
@@ -850,7 +858,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         // ---- Pool cleanup ----
         LOG_INF("WS /backend (pool): session %s slot %d disconnecting\n",
                 session_id.c_str(), slot->slot_idx);
-        ws.send(make_session_closed(session_id, "client_disconnected").dump());
+        ws.send(make_session_closed(session_id, "client_disconnected").dump(-1, ' ', false, json::error_handler_t::replace));
         {
             octx->break_event = true;
             {
@@ -861,6 +869,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             octx->text_cv.notify_all();
             omni_duplex_session_end(octx);
             omni_prepare_for_reuse(octx);
+            // the callback captures audio_state, whose ws pointer dies with this handler; the next session
+            // installs its own only after session_begin, so leave nothing dangling on the slot meanwhile
+            octx->audio_output_cb = nullptr;
         }
         session_mgr.close(session_id);
         // return_slot is called inside session_mgr.close via the pool reference.
@@ -927,7 +938,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         session_mgr.set_close_callback(session_id, [&ws, session_id]() {
             // Preserve protocol ordering for older runtimes: emit session.closed
             // before the transport close wakes a blocked ws.read().
-            ws.send(make_session_closed(session_id, "client_closed").dump());
+            ws.send(make_session_closed(session_id, "client_closed").dump(-1, ' ', false, json::error_handler_t::replace));
             ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
         });
     }
@@ -984,7 +995,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             ProtocolMetrics metrics = make_runtime_metrics(
                 audio_state->octx, 0.0, 0.0, elapsed_ms(response_start));
             json ev = make_audio_delta(audio_state->session_id, response_id, b64, metrics);
-            audio_state->ws->send(ev.dump());
+            audio_state->ws->send(ev.dump(-1, ' ', false, json::error_handler_t::replace));
         }
     };
 
@@ -1486,7 +1497,7 @@ cleanup:
     LOG_INF("WS /backend: session %s disconnected\n", session_id.c_str());
 
     // Send session.closed (best-effort)
-    std::string close_ev = make_session_closed(session_id, "client_disconnected").dump();
+    std::string close_ev = make_session_closed(session_id, "client_disconnected").dump(-1, ' ', false, json::error_handler_t::replace);
     ws.send(close_ev);
 
     // On disconnect, stop inference and recycle the shared context (via
