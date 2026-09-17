@@ -42,7 +42,7 @@ static std::vector<int> parse_list(const std::string & s) {
 }
 
 int main(int argc, char ** argv) {
-    std::string llm_path; std::vector<int> widths{1, 2, 4, 8, 16}; std::vector<int> lens{1, 80}; int reps = 5; int n_ctx = 8192; int n_ubatch = 512; int n_seq_max = 0; int warm = 2; bool mixed = false; int verify_w = 0;
+    std::string llm_path; std::vector<int> widths{1, 2, 4, 8, 16}; std::vector<int> lens{1, 80}; int reps = 5; int n_ctx = 8192; int n_ubatch = 512; int n_seq_max = 0; int warm = 2; bool mixed = false; int verify_w = 0; int warm_pos = 0; int mix_len = 0;
     ggml_type ctk = GGML_TYPE_F16;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -53,6 +53,8 @@ int main(int argc, char ** argv) {
         else if (a == "--warm" && i + 1 < argc) warm = atoi(argv[++i]);
         else if (a == "--mixed") mixed = true;
         else if (a == "--verify" && i + 1 < argc) verify_w = atoi(argv[++i]);
+        else if (a == "--pos" && i + 1 < argc) warm_pos = atoi(argv[++i]);
+        else if (a == "--mix" && i + 1 < argc) mix_len = atoi(argv[++i]);
         else if (a == "-c" && i + 1 < argc) n_ctx = atoi(argv[++i]);
         else if (a == "--ub" && i + 1 < argc) n_ubatch = atoi(argv[++i]);
         else if (a == "--nseq" && i + 1 < argc) n_seq_max = atoi(argv[++i]);
@@ -90,7 +92,7 @@ int main(int argc, char ** argv) {
     std::vector<int> seqs(n_seq_max);
     for (int i = 0; i < n_seq_max; ++i) seqs[i] = ex->alloc_seq();
 
-    int max_len = 0; for (int l : lens) max_len = std::max(max_len, l);
+    int max_len = std::max(1, mix_len); for (int l : lens) max_len = std::max(max_len, l);
     std::vector<float> embd((size_t) max_len * n_embd, 0.01f);
 
     if (verify_w > 0) {
@@ -178,12 +180,23 @@ int main(int argc, char ** argv) {
     }
     printf("kind,width,n_tok,rep,ms_forward,ms_per_step,n_forward\n");
     // measure one (kind, W, L, n_extra_decode) point: W steps of L tokens (+ n_extra 1-token steps on other seqs)
+    // --pos P: every sequence is first filled to position P (in chunks, untimed) so the timed forward runs
+    // with a realistic KV length instead of at position 0. The calibration at position 0 is optimistic: with
+    // 88 live sessions the server's batches sit at positions 500-1000 and cost 4-6x more per token.
+    std::vector<float> warm_embd(warm_pos > 0 ? (size_t) std::min(warm_pos, 256) * n_embd : 0, 0.01f);
+    auto warm_seq = [&](int seq) {
+        int pos = 0;
+        while (pos < warm_pos) { const int n = std::min(256, warm_pos - pos); ex->prefill_target = 1; ex->run(seq, pos, warm_embd.data(), n, false); pos += n; }
+    };
+    // --mix M: in addition to W steps of L tokens, add W steps of M tokens on other sequences in the SAME forward
+    // (e.g. L=2 listen decodes with M=11 frame prefills), the shape the server actually produces under load.
     auto measure = [&](const char * kind, int W, int L, int n_extra) {
         const int total = W + n_extra;
         if (total > n_seq_max) return;
         ex->prefill_target = total;   // ripe with LONG_THRESHOLD=0: hold until exactly `total` steps queued, then one merged forward
         for (int rep = -warm; rep < reps; ++rep) {
-            for (int i = 0; i < total; ++i) ex->seq_clear(seqs[i]);
+            for (int i = 0; i < total; ++i) { ex->seq_clear(seqs[i]); if (warm_pos > 0) warm_seq(seqs[i]); }
+            ex->prefill_target = total;
             std::mutex m; std::condition_variable cv; bool go = false; std::atomic<int> ready{0};
             std::vector<std::thread> th;
             std::vector<double> t_done(total);
@@ -191,10 +204,10 @@ int main(int argc, char ** argv) {
             const uint64_t nb0 = ex->n_batches;
             auto t_start_holder = std::chrono::steady_clock::now();
             for (int i = 0; i < total; ++i) {
-                const int n = i < W ? L : 1;
+                const int n = i < W ? L : (mix_len > 0 ? mix_len : 1);
                 th.emplace_back([&, i, n]() {
                     { std::unique_lock<std::mutex> lk(m); ready++; cv.wait(lk, [&]{ return go; }); }
-                    auto r = ex->run(seqs[i], 0, embd.data(), n, false);
+                    auto r = ex->run(seqs[i], warm_pos, embd.data(), n, false);
                     if (!r.ok) fprintf(stderr, "step failed w=%d l=%d\n", W, n);
                     t_done[i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start_holder).count();
                 });
@@ -219,6 +232,7 @@ int main(int argc, char ** argv) {
             // mixed: the same W prefills plus W single-token decodes in ONE forward (what a policy that does not
             // separate the two classes produces). Tells whether mixing costs GPU time or "only" decode latency.
             if (mixed && L > 8) measure("mixed", W, L, W);
+            if (mix_len > 0) measure("mix", W, L, W);   // W steps of L tokens + W steps of mix_len tokens, one forward
         }
     }
     ex.reset();
