@@ -52,6 +52,11 @@ CAPACITY_FAILURES = {"queue_timeout"}
 VERDICT_MAX_STARVING_SESSION_RATIO = 0.05
 VERDICT_MAX_FAILED_SESSIONS = 0
 VERDICT_MAX_QUEUE_TIMEOUT_RATIO = 0.0
+# 稳态并发至少要达到目标的这个比例,否则这次压测压的不是它标称的那个并发。
+# 容量结论直接建立在「跑到了 N 路」之上,跑不到就必须判 fail 而不是给出一个
+# 看着正常、实际上是另一个负载的 p95。取 0.85 是因为补位天然有占空比损耗
+# (会话退出到补上之间有一次重连间隔),完全顶满做不到。
+VERDICT_MIN_STEADY_CONCURRENCY_RATIO = 0.85
 
 
 @dataclass
@@ -162,6 +167,8 @@ async def run_load(
     # 随机抽的,计划阶段的预演和运行时的抽样不可能重合,拿预演去驱动补位会让实际
     # 并发慢慢跑偏——这正是第一版自检里并发从 8 掉到 3 的原因。
     done_queue: asyncio.Queue[int] = asyncio.Queue()
+    # 补位的等待任务。到时长后还没触发的要取消,否则会在收尾之后再投出会话。
+    refill_tasks: List[asyncio.Task] = []
 
     def _on_done(task: asyncio.Task) -> None:
         nonlocal running
@@ -240,6 +247,20 @@ async def run_load(
                     if time.monotonic() - t0 < cfg.duration_s:
                         _launch(launched, time.monotonic() - t0)
 
+        async def _relaunch_after(delay: float) -> None:
+            """等 delay 秒再补一个会话,等待本身必须是并发的。
+
+            这个 sleep 若放在投放循环里串行执行,每秒最多补 1/retry_mean 个会话
+            (默认 0.33 个)。会话退出速率是并发数除以平均时长,目标并发一高就超过
+            这个上限,于是实际稳态并发卡在一个与目标无关的天花板上——实测目标 32
+            到 56 都只跑到 26 到 29,而报告上仍写着目标并发,压出来的容量结论是错的。
+            """
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if time.monotonic() - t0 >= cfg.duration_s:
+                return
+            _launch(launched, time.monotonic() - t0)
+
         # 阶段二:爬升结束。补位模式下等会话退出再补,把并发顶住;
         # 不补位就一直等到时长跑完。
         while True:
@@ -256,14 +277,15 @@ async def run_load(
             if cfg.abandon_probability and refill_rng.random() < cfg.abandon_probability:
                 continue
             delay = refill_rng.expovariate(1.0 / cfg.retry_mean_s) if cfg.retry_mean_s > 0 else 0.0
-            if delay > 0:
-                await asyncio.sleep(min(delay, max(0.0, t0 + cfg.duration_s - time.monotonic())))
-            if time.monotonic() - t0 >= cfg.duration_s:
-                break
-            _launch(launched, time.monotonic() - t0)
+            refill_tasks.append(asyncio.create_task(_relaunch_after(delay)))
     finally:
         sampler_task.cancel()
         await asyncio.gather(sampler_task, return_exceptions=True)
+
+    for t in refill_tasks:
+        t.cancel()
+    if refill_tasks:
+        await asyncio.gather(*refill_tasks, return_exceptions=True)
 
     _p(f"投放结束,还有 {running} 个会话在跑,等它们各自结束")
     if tasks:
@@ -370,6 +392,11 @@ def summarize(
         reasons.append(f"决策延迟 p95 {decision_p95:.3f}s 超过预算 {budget:.3f}s")
     if starving_ratio > VERDICT_MAX_STARVING_SESSION_RATIO:
         reasons.append(f"断流会话占比 {starving_ratio:.1%} 超过 {VERDICT_MAX_STARVING_SESSION_RATIO:.0%}")
+    if plan.target_concurrency > 0 and steady_mean < plan.target_concurrency * VERDICT_MIN_STEADY_CONCURRENCY_RATIO:
+        reasons.append(
+            f"稳态并发只有 {steady_mean:.1f},不到目标 {plan.target_concurrency} 的 "
+            f"{VERDICT_MIN_STEADY_CONCURRENCY_RATIO:.0%};这次压的不是标称的并发,容量结论不成立"
+        )
 
     return {
         "verdict": "pass" if not reasons else "fail",
