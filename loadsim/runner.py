@@ -135,6 +135,11 @@ async def run_load(
             abandon_probability=cfg.abandon_probability,
         )
 
+    # 补位模式下「退出后隔多久补上」和「退不退了」这两次抽样必须吃本次压测的种子。
+    # 用全局 random 的话,同一份配置跑两遍的补位时刻不同,而策略 A/B 比较正是靠
+    # 「两臂看到同一份到达序列」才能把差异归给策略;不seed 等于给对比注入噪声。
+    refill_rng = random.Random(cfg.seed + 2)
+
     lifecycle = SessionLifecycle(
         mean_s=cfg.lifetime_mean_s,
         dist=cfg.lifetime_dist,
@@ -248,9 +253,9 @@ async def run_load(
                 await asyncio.wait_for(done_queue.get(), timeout=min(remaining, 1.0))
             except asyncio.TimeoutError:
                 continue
-            if cfg.abandon_probability and random.random() < cfg.abandon_probability:
+            if cfg.abandon_probability and refill_rng.random() < cfg.abandon_probability:
                 continue
-            delay = random.expovariate(1.0 / cfg.retry_mean_s) if cfg.retry_mean_s > 0 else 0.0
+            delay = refill_rng.expovariate(1.0 / cfg.retry_mean_s) if cfg.retry_mean_s > 0 else 0.0
             if delay > 0:
                 await asyncio.sleep(min(delay, max(0.0, t0 + cfg.duration_s - time.monotonic())))
             if time.monotonic() - t0 >= cfg.duration_s:
