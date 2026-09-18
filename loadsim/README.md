@@ -7,6 +7,28 @@ MiniCPM-o 的实时双工服务,一个 worker 同时挂着多个会话。要回�
 这套工具补的是另一个维度——把会话数量、会话**什么时候上来**、**上来之后怎么说话**
 都变成可控的参数,并且观测端到端的结果,而不是单轮耗时。
 
+## 音视频上行
+
+默认只发音频。要压视频双工,加 `--input-mode audio-video` 并用 `--user-video` 给素材:
+
+```bash
+python -m loadsim.cli run --url wss://host/backend --insecure \
+    --user-audio user_audio.wav \
+    --input-mode audio-video --user-video frames/ --video-fps 1 --max-slice-nums 1 \
+    --frame-ms 1000 --concurrency 24 --duration 300 --out out.json
+```
+
+素材可以是一个 JPEG 文件,也可以是一个装着同分辨率 JPEG 的目录(按文件名循环)。工具不自己
+合成 JPEG:发压节点上没有图像库,而手写编码器一旦产出服务端解不开的文件,压测会静默退化成
+纯音频。画面内容不影响视觉编码开销,分辨率影响,所以工具会从 JPEG 文件头读出宽高打印出来。
+
+服务端每个 `input.append` 只取第一帧,所以视频帧率的上限是 `1000 / --frame-ms`。产品前端
+每秒一个音频包、每包带一帧,对应 `--frame-ms 1000 --video-fps 1`。
+
+判定里有一条与此相关的硬门禁:声明了 `audio-video`、帧也发出去了,但服务端自报的视觉切片
+总数是 0 时直接判 fail。这种情况下延迟、吞吐、断流全都正常,只是测的是纯音频负载,不看这
+一条就会把它当成一次有效的音视频压测。
+
 ## 为什么需要它
 
 同一台机器上,「8 个会话同时连上」和「8 个会话在前 60 秒里陆续连上」是两件完全

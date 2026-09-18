@@ -67,6 +67,10 @@ class SessionStats:
     send_errors: int = 0
 
     # 下行
+    video_frames_sent: int = 0
+    vision_slices_total: int = 0
+    vision_tokens_total: int = 0
+
     audio_deltas: int = 0
     text_deltas: int = 0
     audio_received_s: float = 0.0
@@ -193,6 +197,9 @@ class SessionStats:
             "audio_sent_s": round(self.audio_sent_s, 4),
             "speech_sent_s": round(self.speech_sent_s, 4),
             "silence_frames_sent": self.silence_frames_sent,
+            "video_frames_sent": self.video_frames_sent,
+            "vision_slices_total": self.vision_slices_total,
+            "vision_tokens_total": self.vision_tokens_total,
             "speech_activity_ratio": round(self.speech_activity_ratio, 4),
             "audio_deltas": self.audio_deltas,
             "text_deltas": self.text_deltas,

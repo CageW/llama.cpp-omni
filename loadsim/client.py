@@ -27,6 +27,7 @@ from websockets.exceptions import ConnectionClosed
 
 from loadsim.activity import FRAME_MS, SpeechActivity, SpeechPattern
 from loadsim.metrics import PlaybackBuffer, SessionStats, pcm_duration_s
+from loadsim.video import VideoSource
 
 # 播放缓冲按墙钟推进的最长间隔。它原本与帧长绑在一起,但帧长改成 1000ms 后,
 # 收不到消息时一秒才推进一次缓冲,断流起止时刻的分辨率会退化到一秒,所以单独封顶。
@@ -80,6 +81,7 @@ class SimClient:
         ssl_context: Optional[ssl.SSLContext] = None,
         handshake_timeout_s: float = 30.0,
         frame_ms: int = FRAME_MS,
+        video: Optional["VideoSource"] = None,
     ) -> None:
         self.index = index
         self.url = url
@@ -97,6 +99,7 @@ class SimClient:
         self.send_silence_during_pause = send_silence_during_pause
         self.ssl_context = ssl_context
         self.handshake_timeout_s = handshake_timeout_s
+        self.video = video
 
         self._frame_idx = 0
         self._last_audio_at: Optional[float] = None
@@ -149,10 +152,14 @@ class SimClient:
                         # 但不是「用户说的话」。两者混在一个字段里,读报告的人会
                         # 以为上行音频时长等于用户说话时长,进而把语音活动比算错。
                         self.stats.silence_frames_sent += 1
-                payload = {
-                    "type": "input.append",
-                    "input": {"audio": base64.b64encode(frame).decode("ascii")},
-                }
+                inp: Dict[str, Any] = {"audio": base64.b64encode(frame).decode("ascii")}
+                video_frames = self.video.next_frames() if self.video is not None else []
+                if video_frames:
+                    # 字段名与产品前端一致(realtime-api/video.md):input.video_frames 是
+                    # base64 JPEG 列表,服务端只取第一帧;max_slice_nums 是本次输入的切片数。
+                    inp["video_frames"] = video_frames
+                    inp["max_slice_nums"] = self.video.max_slice_nums
+                payload = {"type": "input.append", "input": inp}
                 try:
                     await ws.send(json.dumps(payload))
                 except ConnectionClosed:
@@ -161,6 +168,7 @@ class SimClient:
                     self.stats.send_errors += 1
                 else:
                     self.stats.frames_sent += 1
+                    self.stats.video_frames_sent += len(video_frames)
                     self._sent_at[self.stats.frames_sent] = time.monotonic()
                     self.stats.audio_sent_s += self.frame_s
                     if talking:
@@ -230,6 +238,12 @@ class SimClient:
                 self.stats.server_decode_ms.append(float(metrics["generate_ms"]))
             if metrics.get("prefill_ms") is not None:
                 self.stats.server_prefill_ms.append(float(metrics["prefill_ms"]))
+            # 服务端自报「这一帧编了几个视觉切片」。声称发了视频却全程为零,说明视频那一路
+            # 根本没生效,这时测出来的是纯音频负载,必须让它暴露出来而不是记成一次正常压测。
+            if metrics.get("vision_slices"):
+                self.stats.vision_slices_total += int(metrics["vision_slices"])
+            if metrics.get("vision_tokens"):
+                self.stats.vision_tokens_total += int(metrics["vision_tokens"])
 
     async def _pump_output(self, ws) -> None:
         """收下行事件,并按墙钟推进播放缓冲的消耗。"""

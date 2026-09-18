@@ -42,7 +42,8 @@ class FakeServerState:
         return max(0.05, BASE_REALTIME_FACTOR / (1.0 + CONCURRENCY_DECAY * max(0, concurrency - 1)))
 
 
-async def _handle(ws, state: FakeServerState, path: str = "", init_cost: bool = True) -> None:
+async def _handle(ws, state: FakeServerState, path: str = "", init_cost: bool = True,
+                  echo_input: bool = False, report_vision: bool = True) -> None:
     sid = f"fake_{state.total + 1}_{int(time.time() * 1000)}"
     active = 0
     tasks: list[asyncio.Task] = []
@@ -106,7 +107,15 @@ async def _handle(ws, state: FakeServerState, path: str = "", init_cost: bool = 
                 )
 
         async def uplink() -> None:
-            """只管收,不看在什么内容。"""
+            """收上行包。
+
+            echo_input=True 时对每个 input.append 回一条 listen delta,response_id 带上
+            与产品一致的 `_resp_<k>` 后缀,并在 metrics 里报这一帧编了几个视觉切片。
+            这是验证「声称发视频、服务端却没处理」这条门禁所必需的:门禁判的正是
+            metrics.vision_slices,没有它就只能测到客户端发出去了、测不到服务端收没收到。
+            report_vision=False 用来扮演一个把 video_frames 丢掉的服务端。
+            """
+            seq = 0
             while not stop.is_set():
                 raw = await ws.recv()
                 if isinstance(raw, bytes):
@@ -115,6 +124,20 @@ async def _handle(ws, state: FakeServerState, path: str = "", init_cost: bool = 
                 if msg.get("type") == "session.close":
                     stop.set()
                     return
+                if echo_input and msg.get("type") == "input.append":
+                    seq += 1
+                    inp = msg.get("input") or {}
+                    frames = inp.get("video_frames") or []
+                    slices = 0
+                    if frames and report_vision:
+                        slices = int(inp.get("max_slice_nums") or 1)
+                    await ws.send(json.dumps({
+                        "type": "response.output.delta",
+                        "kind": "listen",
+                        "session_id": sid,
+                        "response_id": f"{sid}_resp_{seq}",
+                        "metrics": {"vision_slices": slices, "vision_tokens": slices * 64},
+                    }))
 
         tasks = [asyncio.create_task(downlink()), asyncio.create_task(uplink())]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -136,11 +159,20 @@ async def _handle(ws, state: FakeServerState, path: str = "", init_cost: bool = 
 
 
 async def serve_fake(
-    host: str = "127.0.0.1", port: int = 0
+    host: str = "127.0.0.1", port: int = 0,
+    echo_input: bool = False, report_vision: bool = True,
 ) -> Tuple[Any, int, Callable[[], Any]]:
-    """起假服务端,返回 (server, 实际端口, 关闭函数)。传 port=0 由系统分配端口。"""
+    """起假服务端,返回 (server, 实际端口, 关闭函数)。传 port=0 由系统分配端口。
+
+    echo_input: 对每个 input.append 回一条带 response_id 与 metrics 的 listen delta。
+    report_vision: echo_input 时,收到视频帧要不要在 metrics 里报视觉切片。设 False 就是
+        扮演一个把 video_frames 丢掉的服务端,用来验证压测工具能不能发现这件事。
+    """
     state = FakeServerState()
-    server = await websockets.serve(lambda ws, path=None: _handle(ws, state, path or ""), host, port)
+    server = await websockets.serve(
+        lambda ws, path=None: _handle(ws, state, path or "", echo_input=echo_input,
+                                      report_vision=report_vision),
+        host, port)
     sock = next(iter(server.sockets))
     actual_port = sock.getsockname()[1]
 

@@ -32,6 +32,7 @@ from loadsim.arrival import (
 from loadsim.activity import FRAME_MS, SpeechPattern
 from loadsim.client import SimClient, build_ssl_context
 from loadsim.metrics import SessionStats, percentile
+from loadsim.video import VideoSource, load_jpeg_frames
 
 TRANSIENT_FAILURES = {
     "connect_timeout",
@@ -90,6 +91,12 @@ class RunConfig:
     frame_ms: int = FRAME_MS
     # 决策延迟预算,None 时取帧长:决策慢过一帧就是落后于实时
     decision_budget_s: Optional[float] = None
+    # 上行模态。audio 只发音频;audio-video 在部分上行包里附带一张 base64 JPEG,
+    # 与产品的视频双工一致。选了 audio-video 就必须给素材,否则没有帧可发。
+    input_mode: str = "audio"
+    video_source_path: Optional[str] = None
+    video_fps: float = 1.0
+    max_slice_nums: int = 1
 
     def __post_init__(self) -> None:
         if self.decision_budget_s is None:
@@ -144,6 +151,14 @@ async def run_load(
     # 用全局 random 的话,同一份配置跑两遍的补位时刻不同,而策略 A/B 比较正是靠
     # 「两臂看到同一份到达序列」才能把差异归给策略;不seed 等于给对比注入噪声。
     refill_rng = random.Random(cfg.seed + 2)
+
+    # 视频素材只读一次并共享字节；每个 session 拿一个独立的 VideoSource，因为帧游标和
+    # 节奏累加器是按会话推进的，共享会让所有会话在同一个包上同时带帧，人为制造同相位。
+    video_frames_data = None
+    if cfg.input_mode == "audio-video":
+        if not cfg.video_source_path:
+            raise ValueError("input_mode=audio-video 需要 video_source_path（一个 JPEG 文件或装着 JPEG 的目录）")
+        video_frames_data = load_jpeg_frames(cfg.video_source_path)
 
     lifecycle = SessionLifecycle(
         mean_s=cfg.lifetime_mean_s,
@@ -203,6 +218,16 @@ async def run_load(
             ssl_context=ssl_context,
             handshake_timeout_s=cfg.handshake_timeout_s,
             frame_ms=cfg.frame_ms,
+            video=(
+                VideoSource(
+                    frames=video_frames_data,
+                    fps=cfg.video_fps,
+                    frame_ms=cfg.frame_ms,
+                    max_slice_nums=cfg.max_slice_nums,
+                )
+                if video_frames_data
+                else None
+            ),
         )
         task = asyncio.create_task(client.run())
         task.add_done_callback(_on_done)
@@ -216,6 +241,24 @@ async def run_load(
         f"时长 {cfg.duration_s:.0f}s, 上行 {cfg.url}"
     )
     _p(f"到达说明: {plan.notes}")
+    if video_frames_data:
+        probe = VideoSource(frames=video_frames_data, fps=cfg.video_fps, frame_ms=cfg.frame_ms,
+                            max_slice_nums=cfg.max_slice_nums)
+        dims = probe.dimensions
+        _p(
+            f"上行模态: 音频 + 视频，素材 {cfg.video_source_path}（{len(video_frames_data)} 帧循环，"
+            f"分辨率 {dims[0]}x{dims[1] if dims else '未知'}），"
+            f"{cfg.video_fps} fps，平均每 {1.0 / probe.per_append:.2f} 个上行包带一帧，"
+            f"max_slice_nums={cfg.max_slice_nums}"
+        )
+        if probe.per_append > 1.0:
+            _p(
+                f"警告: {cfg.video_fps} fps 配 {cfg.frame_ms}ms 的上行包意味着每个包 "
+                f"{probe.per_append:.2f} 帧，而服务端每个 input.append 只取第一帧，多出来的会被丢掉。"
+                f"要提高视频帧率得把 --frame-ms 调小。"
+            )
+    else:
+        _p("上行模态: 只有音频")
 
     feasibility = check_load_feasibility(
         mode=cfg.arrival_mode,
@@ -378,6 +421,8 @@ def summarize(
     budget = cfg.decision_budget_s if cfg.decision_budget_s is not None else cfg.frame_ms / 1000.0
     over_budget = sum(1 for v in decisions if v > budget)
 
+    video_frames_sent = sum(s.video_frames_sent for s in sessions)
+    vision_slices = sum(s.vision_slices_total for s in sessions)
     queue_timeout_ratio = round(len(capacity) / total, 4) if total else 0.0
     starving_ratio = round(len(starving) / total, 4) if total else 0.0
     decision_p95 = _stat(decisions, "p95")
@@ -392,6 +437,16 @@ def summarize(
         reasons.append(f"决策延迟 p95 {decision_p95:.3f}s 超过预算 {budget:.3f}s")
     if starving_ratio > VERDICT_MAX_STARVING_SESSION_RATIO:
         reasons.append(f"断流会话占比 {starving_ratio:.1%} 超过 {VERDICT_MAX_STARVING_SESSION_RATIO:.0%}")
+    if cfg.input_mode == "audio-video":
+        if video_frames_sent == 0:
+            reasons.append("声明了 audio-video 却一帧视频都没发出,上行形状与声明不符")
+        elif vision_slices == 0:
+            # 服务端把 video_frames 丢掉时(例如它那条代码路径不处理视频、或会话没有视觉
+            # 上下文)客户端看不出异常:延迟、吞吐、断流全都正常,只是测的是纯音频负载。
+            reasons.append(
+                f"发出了 {video_frames_sent} 帧视频,但服务端自报的视觉切片总数是 0;"
+                "这次压的是纯音频负载,不能当作音视频结论"
+            )
     if plan.target_concurrency > 0 and steady_mean < plan.target_concurrency * VERDICT_MIN_STEADY_CONCURRENCY_RATIO:
         reasons.append(
             f"稳态并发只有 {steady_mean:.1f},不到目标 {plan.target_concurrency} 的 "
@@ -442,6 +497,10 @@ def summarize(
         "audio_deltas_total": sum(s.audio_deltas for s in sessions),
         "text_chars_total": sum(s.text_chars for s in sessions),
         "frames_sent_total": sum(s.frames_sent for s in sessions),
+        "input_mode": cfg.input_mode,
+        "video_frames_sent_total": video_frames_sent,
+        "vision_slices_total": vision_slices,
+        "vision_tokens_total": sum(s.vision_tokens_total for s in sessions),
         "audio_sent_s_total": round(sum(s.audio_sent_s for s in sessions), 2),
         "speech_sent_s_total": round(sum(s.speech_sent_s for s in sessions), 2),
         "speech_activity_ratio": round(

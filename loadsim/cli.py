@@ -67,6 +67,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--user-audio", required=True, help="上行音频素材,16 kHz 单声道 16 位 WAV")
     run.add_argument(
+        "--input-mode",
+        default="audio",
+        choices=["audio", "audio-video"],
+        help="上行模态。audio 只发音频;audio-video 在上行包里附带 base64 JPEG 视频帧,"
+        "与产品的视频双工一致。选 audio-video 必须同时给 --user-video",
+    )
+    run.add_argument(
+        "--user-video",
+        default=None,
+        help="上行视频素材:一个 JPEG 文件,或一个装着同分辨率 JPEG 的目录(按文件名循环)。"
+        "画面内容不影响视觉编码开销,分辨率影响",
+    )
+    run.add_argument(
+        "--video-fps",
+        type=float,
+        default=1.0,
+        help="上行视频帧率。服务端每个 input.append 只取第一帧,所以帧率上限是 1000/--frame-ms;"
+        "1000ms 的包配 1 fps 就是每个包一帧,与 benches 里音视频压测的形状一致",
+    )
+    run.add_argument(
+        "--max-slice-nums",
+        type=int,
+        default=1,
+        help="随视频帧下发的切片数,对应 input.max_slice_nums。切片数直接决定视觉 token 数与编码开销",
+    )
+    run.add_argument(
         "--frame-ms",
         type=int,
         default=FRAME_MS,
@@ -128,6 +154,16 @@ def _fmt_table(report: dict) -> str:
         ("排队等待 中位/95分位/最长(秒)", f"{s['queue_wait_p50_s']} / {s['queue_wait_p95_s']} / {s['queue_wait_max_s']}"),
         ("首帧音频延迟 中位/95分位(秒)", f"{s['ttfa_p50_s']} / {s['ttfa_p95_s']}"),
         ("上行帧总数", f"{s['frames_sent_total']}"),
+        (
+            "上行模态",
+            f"{s['input_mode']}"
+            + (
+                f"  视频帧 {s['video_frames_sent_total']} 帧,服务端自报视觉切片 "
+                f"{s['vision_slices_total']} 个 / 视觉 token {s['vision_tokens_total']} 个"
+                if s["input_mode"] == "audio-video"
+                else ""
+            ),
+        ),
         ("其中用户说话的时长(秒)", f"{s['speech_sent_s_total']} / 上行总时长 {s['audio_sent_s_total']}"),
         ("语音活动比", f"{s['speech_activity_ratio']}(电话语音实测 0.32~0.38)"),
         ("下行音频 delta 总数", f"{s['audio_deltas_total']}"),
@@ -188,9 +224,20 @@ async def _cmd_run(args) -> int:
         init_payload["voice"] = {"ref_audio_base64": ref_b64, "tts_ref_audio_base64": ref_b64}
         print(f"参考音频 {args.ref_audio}: {ref_frames / 16000.0:.1f}s,已随 session.init 下发")
 
+    if args.input_mode == "audio-video" and not args.user_video:
+        print("--input-mode audio-video 需要 --user-video 指定 JPEG 素材", file=sys.stderr)
+        return 2
+    if args.user_video and args.input_mode != "audio-video":
+        print("给了 --user-video 但 --input-mode 不是 audio-video;视频不会被发出", file=sys.stderr)
+        return 2
+
     cfg = RunConfig(
         url=args.url,
         mode=args.mode,
+        input_mode=args.input_mode,
+        video_source_path=args.user_video,
+        video_fps=args.video_fps,
+        max_slice_nums=args.max_slice_nums,
         arrival_mode=args.arrival,
         target_concurrency=args.concurrency,
         duration_s=args.duration,
