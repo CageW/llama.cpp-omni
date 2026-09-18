@@ -815,23 +815,54 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 audio_state->accumulate      = false;
             }
 
-            // Write the input audio to a temp file and push a duplex frame.
+            // Write the input audio, and the video frame if this input carries one, to temp
+            // files and push a duplex frame. Video: the protocol allows a list, the duplex
+            // pipeline takes one image per frame, so the first one is used — same rule as the
+            // single-session path. Without this the pool path silently dropped every video
+            // frame a client sent, so an audio+video load test measured audio only.
+            const int media_index = msg_counter++;
             std::string audio_path;
             if (!parsed_input.audio_b64.empty()) {
                 audio_path = TempMediaFiles::write_audio_wav(
-                    parsed_input.audio_b64, temp_dir, msg_counter++);
+                    parsed_input.audio_b64, temp_dir, media_index);
             }
+            std::string image_path;
+            if (!parsed_input.video_frames_b64.empty()) {
+                image_path = TempMediaFiles::write_image_jpeg(
+                    parsed_input.video_frames_b64[0], temp_dir, media_index);
+                if (image_path.empty()) {
+                    // A frame that arrived but could not be decoded must not be reported as a
+                    // successfully processed one: the caller would read vision_slices=1 and
+                    // conclude the vision path ran.
+                    LOG_WRN("WS /backend (pool): session %s video frame %d could not be written\n",
+                            session_id.c_str(), media_index);
+                }
+            }
+            // Report a vision slice only when the frame will actually be encoded. The duplex
+            // encoder skips the image when the session has no vision context, so reporting on
+            // "a frame arrived" alone would tell the caller the vision path ran when it did not.
+            if (!image_path.empty() && !octx->ctx_vision) {
+                LOG_WRN("WS /backend (pool): session %s sent a video frame but this session has "
+                        "no vision context; the frame will be ignored\n", session_id.c_str());
+            }
+            const int vision_slices = (!image_path.empty() && octx->ctx_vision) ? 1 : 0;
             OmniDuplexFrame frame;
             frame.aud_fname = audio_path;
+            frame.img_fname = image_path;
+            frame.max_slice_nums = parsed_input.max_slice_nums;
             frame.user_seq  = response_seq;
             if (omni_duplex_push_frame(octx, frame) < 0) {
                 LOG_ERR("WS /backend (pool): push_frame failed, session %s\n",
                         session_id.c_str());
                 if (!audio_path.empty()) { fs::remove(audio_path); }
+                if (!image_path.empty()) { fs::remove(image_path); }
                 break;
             }
             if (!audio_path.empty()) {
                 retained_media_files.push_back(audio_path);
+            }
+            if (!image_path.empty()) {
+                retained_media_files.push_back(image_path);
             }
 
             OmniDuplexFrameResult result;
@@ -845,7 +876,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // to keep listening for this frame (protocol: kind=listen).
             ProtocolMetrics metrics = make_runtime_metrics(
                 octx, result.ms_prefill_submit, result.ms_decode,
-                elapsed_ms(t_req), /*n_tokens*/0, /*vision_slices*/0);
+                elapsed_ms(t_req), /*n_tokens*/0, vision_slices);
 
             if (!result.is_speak) {
                 send_event(make_listen_delta(session_id, response_id, metrics));
