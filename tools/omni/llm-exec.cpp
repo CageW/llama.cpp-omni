@@ -184,7 +184,23 @@ struct omni_llm_exec::impl {
                     bool any_long = false, any_short = false;
                     for (auto * s : queue) { (s->n > LT ? any_long : any_short) = true; }
                     const bool ripe = self->policy == "ripe";
-                    if (self->policy == "adaptive") {
+                    if (self->policy == "none") {
+                        // 完全不合批：不等，且下面只取一个 step。这是对照组的下界，用来回答
+                        // 「合批到底值多少」——没有它，贪心与自适应的差值无从标定大小。
+                    } else if (self->policy == "static") {
+                        // 静态合批：等一个固定窗口，或等到队列里攒够固定的步数，两者先到先算。
+                        // 与 mixed 的区别在于它不因为「队列里已经有一个 decode」就提前返回，
+                        // 所以窗口是真的在等，而不是一个几乎永远不生效的上限。窗口与目标步数
+                        // 都是启动时读死的，不随负载变化——这正是「静态」的含义，也是它与
+                        // adaptive 的唯一差别。
+                        const int target = self->static_target;
+                        if (self->static_window_us > 0) {
+                            cv.wait_for(lk, std::chrono::microseconds(self->static_window_us), [&]{
+                                if (!running) return true;
+                                return target > 0 && (int) queue.size() >= target;
+                            });
+                        }
+                    } else if (self->policy == "adaptive") {
                         // Hold the queue only for sequences predicted to resubmit within the budget. Each hold is
                         // re-evaluated when a new step lands (cv notify): a sequence that arrived is no longer expected,
                         // one that is now overdue is dropped, and the wait shrinks to the latest remaining ETA.
@@ -336,6 +352,12 @@ struct omni_llm_exec::impl {
                             if ((s->n > LT) != other || seq_taken[s->seq] || tok + s->n > self->max_tokens) { ++it; continue; }
                             seq_taken[s->seq] = true; tok += s->n; batch.push_back(s); it = queue.erase(it);
                         }
+                    }
+                } else if (policy == "none") {
+                    // 一次 forward 只带一个 step，队列里剩下的等下一轮。
+                    if (!queue.empty()) {
+                        step * s0 = queue.front(); queue.pop_front();
+                        tok += s0->n; n_long += (s0->n > LT); batch.push_back(s0);
                     }
                 } else {
                     const bool decode_first = policy == "decode";
@@ -572,6 +594,8 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->hold_max_us         = knob_i("HOLD_MAX_US", 20000);
     e->chain_gap_max_us    = knob_i("CHAIN_GAP_MAX_US", 60000);
     e->fixed_cost_us       = knob_i("FIXED_COST_US", 6500);
+    e->static_window_us    = knob_i("STATIC_WINDOW_US", 10000);
+    e->static_target       = knob_i("STATIC_TARGET", 0);
     e->batch_target_ms     = knob_i("BATCH_TARGET_MS", 0);   // off: measured strictly worse at the ceiling (docs/adaptive-batching.md)
     e->cap_min_tokens      = knob_i("CAP_MIN_TOKENS", 32);
     if (const char * v = knob("CAP_BUSY_THRESHOLD")) e->cap_busy_threshold = atof(v);

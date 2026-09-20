@@ -34,7 +34,13 @@ struct omni_llm_exec {
     int window_us  = 3000;        // how long the worker waits for more sessions to join a batch
     int max_tokens = 4096;        // logical batch cap
     // scheduling knobs (per executor; filled from OMNI_EXEC_* or OMNI_<PREFIX>_EXEC_* at create time)
-    std::string policy = "mixed";  // mixed | equal | decode | pd | ripe | adaptive
+    std::string policy = "mixed";  // none | static | mixed | equal | decode | pd | ripe | adaptive
+    // The three settings the batching question is actually about:
+    //   none     : one step per forward, never wait. The lower bound, so the value of batching is measurable.
+    //   static   : wait a fixed window (and/or for a fixed step count) read at startup, then take everything.
+    //   adaptive : wait only for sequences predicted to come back, with the budget following GPU pressure.
+    // `mixed` is not "no batching": it waits up to window_us but returns the moment any decode step is
+    // queued, which under this workload is almost always, so it batches whatever happens to be pending.
     int long_threshold = 8;        // a step with n > long_threshold counts as "prefill" for scheduling
     int prefill_target = 0;        // ripe/gather: release prefills once this many are queued (0 = n_seq)
     int prefill_deadline_us = 200000;
@@ -64,6 +70,11 @@ struct omni_llm_exec {
     double cap_busy_threshold = 0.5;
     int chain_gap_max_us = 60000;
     int fixed_cost_us = 6500;
+    // static policy: the fixed window and the fixed step-count trigger, whichever comes first
+    //   static_window_us : OMNI_EXEC_STATIC_WINDOW_US, default 10000 (10 ms)
+    //   static_target    : OMNI_EXEC_STATIC_TARGET, default 0 = window only
+    int static_window_us = 10000;
+    int static_target = 0;
 
     // submit a run of embeddings for `seq` starting at `pos0`; returns when the forward is done
     omni_llm_step_result run(int seq, int pos0, const float * embd, int n_tokens, bool all_outputs);
