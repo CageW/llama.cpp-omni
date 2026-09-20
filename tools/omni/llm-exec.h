@@ -64,6 +64,13 @@ struct omni_llm_exec {
     //   cap_min_tokens : floor of that cap (OMNI_EXEC_CAP_MIN_TOKENS, default 32)
     //   cap_busy_threshold: busy fraction above which the cap engages (OMNI_EXEC_CAP_BUSY_THRESHOLD, default 0.5)
     double hold_gain = 1.5;
+    // Charge the hold to every step already queued instead of once (OMNI_EXEC_HOLD_QUEUE_COST).
+    // Default OFF: it was tried to stop the policy holding under saturation, where it measured worse
+    // than greedy, and it did not help. The reason is in the counters — the worker drains the queue on
+    // every forward, so at the moment the hold decision is taken only one or two steps are pending even
+    // at 16 sessions, and the divisor almost never bites. Kept as a knob because the measurement is
+    // worth being able to repeat, not because it is a better rule.
+    bool hold_queue_cost = false;
     int hold_max_us = 20000;
     int batch_target_ms = 0;
     int cap_min_tokens = 32;

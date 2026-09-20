@@ -85,7 +85,15 @@ struct omni_llm_exec::impl {
     // GPU pressure (0 when idle -> never hold), gain absorbs the active/queued ratio (OMNI_EXEC_HOLD_GAIN).
     int adaptive_hold_us(std::chrono::steady_clock::time_point now, size_t q_steps, int * n_expected_out) {
         const double fixed_us = fixed_cost_ema_us > 0 ? fixed_cost_ema_us : (double) self->fixed_cost_us;
-        (void) q_steps;
+        // The wait is paid by every step already in the queue, not once. The first version of this rule
+        // compared a single Δ against the saving, which is right when one or two steps are waiting and
+        // badly wrong when twenty are: past the knee the queue is never empty, holding delays a dozen
+        // steps to save a handful of forwards, and adaptive measured worse than plain greedy there
+        // (audio 88 sessions 3.909 s vs 2.889 s; audio+video 14 sessions 2.905 s vs 1.318 s).
+        // Dividing the saving by the queue depth makes the budget collapse exactly where that happens,
+        // so the policy converges to greedy under saturation instead of losing to it, and is unchanged
+        // at low load where the queue holds one or two steps.
+        const double q_cost = self->hold_queue_cost ? std::max<double>(1.0, (double) q_steps) : 1.0;
         // candidates: in-flight sequences with a known chain gap whose ETA is still ahead of us and within the hard cap
         int k = 0; std::vector<double> etas;
         for (auto & p : pred) {
@@ -101,7 +109,7 @@ struct omni_llm_exec::impl {
         int best = 0; double best_wait = 0;
         for (int i = 0; i < k; i++) {
             const double wait = etas[i];
-            const double value = (i + 1) * fixed_us * busy_ema * self->hold_gain;
+            const double value = (i + 1) * fixed_us * busy_ema * self->hold_gain / q_cost;
             if (wait < value) { best = i + 1; best_wait = wait; }
         }
         if (n_expected_out) *n_expected_out = best;
@@ -594,6 +602,7 @@ std::unique_ptr<omni_llm_exec> omni_llm_exec_create(struct llama_model * model, 
     e->hold_max_us         = knob_i("HOLD_MAX_US", 20000);
     e->chain_gap_max_us    = knob_i("CHAIN_GAP_MAX_US", 60000);
     e->fixed_cost_us       = knob_i("FIXED_COST_US", 6500);
+    e->hold_queue_cost     = knob_i("HOLD_QUEUE_COST", 0) != 0;   // off: measured no better (docs/adaptive-batching.md)
     e->static_window_us    = knob_i("STATIC_WINDOW_US", 10000);
     e->static_target       = knob_i("STATIC_TARGET", 0);
     e->batch_target_ms     = knob_i("BATCH_TARGET_MS", 0);   // off: measured strictly worse at the ceiling (docs/adaptive-batching.md)

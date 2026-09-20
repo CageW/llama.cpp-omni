@@ -10,6 +10,9 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <atomic>
+#include <system_error>
+
 #include "ws_handler.h"
 #include "session.h"
 #include "protocol.h"
@@ -588,8 +591,23 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         omni_context *& shared_octx,
                         std::mutex & octx_mutex,
                         SessionPool * pool) {
-    const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
+    // One temp directory per connection. Media file names are built from a per-connection counter
+    // ("audio_.7.wav", "image_.7.jpg") with nothing session-specific in them, so a single shared
+    // directory means every concurrent session writes the same paths. Sessions all send one frame per
+    // second, so their counters advance in lockstep and the collisions are simultaneous: one session
+    // overwrites a file while another session's encoder thread is reading it. The reader then gets a
+    // truncated WAV or JPEG. A truncated WAV mostly surfaced as "failed to read audio file", which is
+    // why audio-only runs only logged errors; a truncated JPEG decodes into a wrong-shaped buffer and
+    // the encode crashes inside the matmul. That is the audio+video segfault.
+    static std::atomic<uint64_t> conn_seq{0};
+    const std::string temp_dir =
+        (fs::temp_directory_path() / "omni_ws" / ("conn_" + std::to_string(conn_seq.fetch_add(1)))).string();
     fs::create_directories(temp_dir);
+    // Remove the whole per-connection directory on the way out, whichever exit path is taken.
+    struct TempDirGuard {
+        std::string dir;
+        ~TempDirGuard() { std::error_code ec; fs::remove_all(dir, ec); }
+    } temp_dir_guard{temp_dir};
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
 
