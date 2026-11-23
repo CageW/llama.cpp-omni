@@ -50,12 +50,14 @@
 
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
+#define N_R0_Q4_K_ID 4 // mc15: the expert mat-vecs (MUL_MAT_ID) take more rows per simdgroup
 
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2
 
 #define N_R0_Q6_K 2
 #define N_SG_Q6_K 2
+#define N_R0_Q6_K_ID 4 // mc15: the expert mat-vecs (MUL_MAT_ID) take more rows per simdgroup
 
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
