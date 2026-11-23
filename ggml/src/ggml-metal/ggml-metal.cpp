@@ -229,6 +229,14 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            {
+                const ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+
+                const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+                res += ggml_metal_op_mul_mat_extra_f16_act(tensor, props_dev->has_tensor, props_dev->has_nax);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
@@ -239,6 +247,9 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_rows(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -248,6 +259,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
         case GGML_OP_TOP_K:
             {
                 res = 2*sizeof(int32_t)*ggml_nelements(tensor->src[0]);
+            } break;
+        case GGML_OP_ARGMAX:
+            {
+                res += ggml_metal_op_argmax_extra(tensor);
             } break;
         default:
             break;
@@ -948,7 +963,7 @@ static ggml_backend_dev_t ggml_backend_metal_device_init(ggml_backend_reg_t reg,
     return new ggml_backend_device {
         /* .iface   = */ ggml_backend_metal_device_i,
         /* .reg     = */ reg,
-        /* .context = */ ggml_metal_device_get(device),
+        /* .context = */ ggml_metal_device_get(device, 1),
     };
 }
 

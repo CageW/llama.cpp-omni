@@ -9094,6 +9094,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mc15: the expert mat-vecs with 4 rows per simdgroup and, for q4_K rows of two blocks, the split-lane path;
+    // row counts not a multiple of the rows of a threadgroup
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int m : {2048, 200, 21}) {
+            for (int k : {512, 2048}) {
+                for (int n : {1, 3}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, m, n, k));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -9423,6 +9435,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
+    // mc15: MiniCPM5-15B prefill at the served ubatch (2048 tokens), same cases as the metal-m5 fork's test file:
+    // FA (random mask) and every MUL_MAT / MUL_MAT_ID of a layer
+    for (int kv : {2048, 8192, 16384, 40960}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 40960, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    {
+        struct mc15_mm { ggml_type type; int m; int k; };
+        for (const mc15_mm & c : std::vector<mc15_mm>{
+                 {GGML_TYPE_Q4_K, 4096, 2048}, {GGML_TYPE_Q4_K, 256, 2048}, {GGML_TYPE_Q6_K, 256, 2048},
+                 {GGML_TYPE_Q4_K, 2048, 4096}, {GGML_TYPE_Q4_K, 512, 2048}, {GGML_TYPE_Q4_K, 2048, 512},
+                 {GGML_TYPE_Q6_K, 2048, 512}, {GGML_TYPE_F32, 160, 2048},
+             }) {
+            test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 2048, c.k, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 2048, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));
+    // mc15: the expert mat-vecs of one MiniCPM5-15B decode token
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
