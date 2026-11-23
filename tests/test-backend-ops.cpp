@@ -9094,6 +9094,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mc15: the expert mat-vecs with 4 rows per simdgroup and, for q4_K rows of two blocks, the split-lane path;
+    // row counts not a multiple of the rows of a threadgroup
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int m : {2048, 200, 21}) {
+            for (int k : {512, 2048}) {
+                for (int n : {1, 3}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, m, n, k));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -9423,6 +9435,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
+    // mc15: the expert mat-vecs of one MiniCPM5-15B decode token
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
