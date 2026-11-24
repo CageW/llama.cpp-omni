@@ -599,6 +599,32 @@ struct llama_moe_slot_runtime::impl {
     /// 每层被延后读取的 (expert, slot)，由 phase A 写入、phase B 消费。
     std::vector<std::vector<pending_install>> deferred;
 
+    /// 预填充读算重叠（LLAMA_MOE_PREFILL_PREFETCH=1）：第 L 层 process() 装完本层后，
+    /// 后台线程把第 L+1 层的**全部**专家读进 prefill 视图的另一半，与 GPU 算第 L 层
+    /// FFN、第 L+1 层注意力重叠；第 L+1 层 process() 只等它收尾、发布映射。
+    ///
+    /// 为什么读全部而不是预测：2048 词元的批次每层要用约 135/160 个专家，L+1 的
+    /// 路由要等 L 算完才知道，全读只多 ~19% 字节。代价是 bank 要 ≥ 2×n_expert：
+    /// 奇偶层各占 [parity×n_expert, (parity+1)×n_expert)，L+2 复用 L 那半时，
+    /// L 的 FFN 必然已经算完（L+1 的路由依赖它）。
+    /// 小批次每层算得太少、盖不住 160 个专家的读，所以只对批宽 ≥ pf2_min_rows 开。
+    bool pf2 = false;
+    int32_t pf2_min_rows = 512;
+    std::thread pf2_th;
+    std::mutex pf2_mtx;
+    std::condition_variable pf2_cv;
+    int pf2_req = -1;          // 待读的层；-1 = 无
+    bool pf2_busy = false;
+    int pf2_ready_layer = -1;  // 已读完、未被取走的层
+    bool pf2_stop = false;
+    std::string pf2_err;
+    std::atomic<uint64_t> pf2_layers{0};
+    std::atomic<int64_t> pf2_bg_ns{0};
+    std::atomic<int64_t> pf2_wait_ns{0};
+    uint64_t last_pf2_layers = 0;
+    int64_t last_pf2_bg_ns = 0;
+    int64_t last_pf2_wait_ns = 0;
+
     uint64_t miss_pos[16] = {};
     uint64_t miss_pos_steps = 0;
     uint64_t miss_per_layer_steps = 0;
@@ -705,6 +731,7 @@ struct llama_moe_slot_runtime::impl {
                 }
             });
         resolve_decode_window();
+        pf2_init();
         {
             const char * e = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
             matmul_split = e ? std::atoi(e) : 0;
@@ -1131,8 +1158,13 @@ struct llama_moe_slot_runtime::impl {
         {
             const std::vector<int32_t> per_layer_c = model.moe_layer_windows();
             layer_width.assign(layers.size(), 0);
+            // per_layer_c 的下标是 MoE 层序号（模型侧 width_of 也这么用），这里是绝对层号：
+            // 前面有 dense 层的架构（minicpm5moe）要减掉它们，否则窗口错位一层、绑定失败。
+            const int64_t n_dense = (int64_t) model.hparams.n_layer_dense_lead;
             for (size_t il = 0; il < layers.size(); ++il) {
-                const int32_t c_il = il < per_layer_c.size() ? per_layer_c[il] : decode_window;
+                const int64_t mi = (int64_t) il - n_dense;
+                const int32_t c_il = mi >= 0 && mi < (int64_t) per_layer_c.size()
+                    ? per_layer_c[(size_t) mi] : decode_window;
                 const int32_t w = c_il + prefetch_slots;
                 layers[il].window_start = 0;
                 layers[il].window_width = w;
@@ -1217,6 +1249,7 @@ struct llama_moe_slot_runtime::impl {
     }
 
     ~impl() {
+        pf2_shutdown();
         if (cur.n_layers > 0) {
             flush_ubatch(cur.n_tokens <= 1 ? "decode" : "prefill",
                 cur.n_tokens <= 1 ? n_decode_step : n_prefill_ubatch);
@@ -1737,6 +1770,100 @@ struct llama_moe_slot_runtime::impl {
         return t;
     }
 
+    // ── 预填充读算重叠（见 pf2 字段注释）──
+    int32_t pf2_base(int layer) const { return (layer & 1) * n_expert; }
+
+    void pf2_init() {
+        const char * e = std::getenv("LLAMA_MOE_PREFILL_PREFETCH");
+        if (!e || !*e || *e == '0') {
+            return;
+        }
+        if (const char * r = std::getenv("LLAMA_MOE_PREFILL_PREFETCH_MIN_ROWS")) {
+            pf2_min_rows = std::max(2, std::atoi(r));
+        }
+        if (!shared_bank || n_slots < 2 * n_expert) {
+            moe_log("prefill-prefetch: off, needs a shared bank of >= %d slots (bank=%d shared=%s)",
+                    (int) (2 * n_expert), (int) n_slots, shared_bank ? "on" : "off");
+            return;
+        }
+        pf2 = true;
+        pf2_th = std::thread([this]() { pf2_worker(); });
+        moe_log("prefill-prefetch: on, next layer's %d experts read during this layer, rows>=%d",
+                (int) n_expert, (int) pf2_min_rows);
+    }
+
+    void pf2_worker() {
+        for (;;) {
+            int layer;
+            {
+                std::unique_lock<std::mutex> lk(pf2_mtx);
+                pf2_cv.wait(lk, [&] { return pf2_stop || pf2_req >= 0; });
+                if (pf2_stop) {
+                    return;
+                }
+                layer = pf2_req;
+                pf2_req = -1;
+            }
+            std::vector<pending_install> pending((size_t) n_expert);
+            for (int32_t x = 0; x < n_expert; ++x) {
+                pending[(size_t) x] = { x, pf2_base(layer) + x };
+            }
+            install_timing t;
+            std::string err;
+            try {
+                t = install_pending(layers[(size_t) layer], pending, false);
+            } catch (const std::exception & ex) {
+                err = ex.what();
+            }
+            pf2_layers.fetch_add(1, std::memory_order_relaxed);
+            pf2_bg_ns.fetch_add(t.wall_ns, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(pf2_mtx);
+                pf2_err = err;
+                pf2_ready_layer = err.empty() ? layer : -1;
+                pf2_busy = false;
+            }
+            pf2_cv.notify_all();
+        }
+    }
+
+    void pf2_arm(int layer) {
+        {
+            std::lock_guard<std::mutex> lk(pf2_mtx);
+            pf2_req = layer;
+            pf2_busy = true;
+        }
+        pf2_cv.notify_all();
+    }
+
+    /// 等后台读收尾；返回它读的是不是 `layer`（不是就作废，比如上一批中途被取消）。
+    bool pf2_take(int layer, int64_t & wait_ns) {
+        const int64_t t0 = now_ns();
+        std::unique_lock<std::mutex> lk(pf2_mtx);
+        pf2_cv.wait(lk, [&] { return !pf2_busy; });
+        wait_ns = now_ns() - t0;
+        const bool ok = pf2_ready_layer == layer;
+        pf2_ready_layer = -1;
+        if (!pf2_err.empty()) {
+            const std::string err = pf2_err;
+            pf2_err.clear();
+            throw std::runtime_error("prefill prefetch failed: " + err);
+        }
+        return ok;
+    }
+
+    void pf2_shutdown() {
+        if (!pf2_th.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pf2_mtx);
+            pf2_stop = true;
+        }
+        pf2_cv.notify_all();
+        pf2_th.join();
+    }
+
     static double ms_of(int64_t ns) {
         return ns / 1e6;
     }
@@ -1804,6 +1931,15 @@ struct llama_moe_slot_runtime::impl {
         last_pred_read = pred_read_now;
         last_pf_hits = pf_hits_now;
         last_pf_pub  = pf_pub_now;
+        const uint64_t pf2_layers_now = pf2_layers.load(std::memory_order_relaxed);
+        const int64_t  pf2_bg_now     = pf2_bg_ns.load(std::memory_order_relaxed);
+        const int64_t  pf2_wait_now   = pf2_wait_ns.load(std::memory_order_relaxed);
+        const uint64_t pf2_layers_delta = pf2_layers_now - last_pf2_layers;
+        const int64_t  pf2_bg_delta     = pf2_bg_now - last_pf2_bg_ns;
+        const int64_t  pf2_wait_delta   = pf2_wait_now - last_pf2_wait_ns;
+        last_pf2_layers  = pf2_layers_now;
+        last_pf2_bg_ns   = pf2_bg_now;
+        last_pf2_wait_ns = pf2_wait_now;
 
         // 这些计数器只在 flush 时前进，而 flush 受 should_log_ubatch 节流。
         // 所以必须把「本次 flush 覆盖了多少步」一起打出来，否则消费方会把
@@ -1818,7 +1954,7 @@ struct llama_moe_slot_runtime::impl {
                 "pread_wall=%.0fms pread_sum=%.0fms bytes=%.0fMiB par=%.2f io=%.0fMiB/s "
                 "readall=%.0fMiB calls=%llu realio=%.0fMiB/s span=%llu pmgmt=%.1fms "
                 "pfskip=%llu pfwait=%llu/%.1fms pfread=%llu pfpub=%llu pfhit=%llu pfpredict=%llu pevsave=%llu pevforced=%llu pfcached=%llu usedpf=%llu "
-                "runs=%d avg_run=%.1f max_run=%d zerocopy=%.0f%%",
+                "runs=%d avg_run=%.1f max_run=%d zerocopy=%.0f%% pf2=%llu pf2bg=%.0fms pf2wait=%.0fms",
             kind,
             (unsigned long long) idx,
             cur.n_tokens,
@@ -1855,7 +1991,8 @@ struct llama_moe_slot_runtime::impl {
             cur.runs.n,
             avg_run,
             cur.runs.max,
-            cur.runs.experts > 0 ? 100.0 * (double) cur.runs.ok_ex / (double) cur.runs.experts : 0.0);
+            cur.runs.experts > 0 ? 100.0 * (double) cur.runs.ok_ex / (double) cur.runs.experts : 0.0,
+            (unsigned long long) pf2_layers_delta, ms_of(pf2_bg_delta), ms_of(pf2_wait_delta));
         cur = ubatch_acc{};
     }
 
@@ -2112,6 +2249,10 @@ struct llama_moe_slot_runtime::impl {
             return;
         }
         lookahead.drain();
+        if (pf2) {
+            int64_t ignored = 0;
+            pf2_take(-2, ignored);   // 停泊前不能有后台读还在写专家内存
+        }
         std::lock_guard<std::mutex> lk(park_mutex);
         if (parked.load(std::memory_order_relaxed)) {
             return;
@@ -2362,6 +2503,16 @@ void llama_moe_slot_runtime::process(
         pimpl->lookahead.take(layer, ignored);
     }
 
+    // 预填充读算重叠：任何一步都先等后台读收尾（它只可能在读本层，或是被取消的
+    // 上一批留下的作废读），再决定本层是否已经整层在内存里。
+    const bool pf2_step = pimpl->pf2 && !window_mode && pimpl->shared_bank &&
+                          n_tokens_ub >= pimpl->pf2_min_rows;
+    bool pf2_have = false;
+    int64_t pf2_wait_ns = 0;
+    if (pimpl->pf2) {
+        pf2_have = pimpl->pf2_take(layer, pf2_wait_ns) && pf2_step;
+    }
+
     std::lock_guard<std::mutex> lock(state.mutex);
 
     // 阶段切换：prefill 用的是整块 bank / prefill 共享视图，与每层窗口在物理上可能
@@ -2408,6 +2559,13 @@ void llama_moe_slot_runtime::process(
 
     if (pimpl->shared_bank && !window_mode) {
         llama_moe_slot_runtime::impl::clear_layer_cache(state);
+        if (pf2_have) {
+            const int32_t base = pimpl->pf2_base(layer);
+            for (int32_t x = 0; x < pimpl->n_expert; ++x) {
+                state.slot_to_expert[(size_t) (base + x)] = x;
+                state.expert_to_slot[(size_t) x] = base + x;
+            }
+        }
     }
     std::vector<int32_t> experts;
     {
@@ -2477,6 +2635,10 @@ void llama_moe_slot_runtime::process(
                    (pimpl->prefetch_unified ? 0 : pimpl->prefetch_slots);
     } else if (lookahead_step) {
         alloc_hi = pimpl->lookahead.slot_floor();
+    } else if (pf2_step) {
+        // 另一半留给后台读下一层（见 pf2 字段注释）。
+        alloc_lo = pimpl->pf2_base(layer);
+        alloc_hi = alloc_lo + pimpl->n_expert;
     }
 
     // 「缓存 + 预测」的结合点（零 I/O 成本）：
@@ -2605,9 +2767,16 @@ void llama_moe_slot_runtime::process(
     }
     pimpl->unique_sum.fetch_add(n_unique, std::memory_order_relaxed);
 
-    const llama_moe_slot_runtime::impl::install_timing timing =
+    llama_moe_slot_runtime::impl::install_timing timing =
         pimpl->install_pending(state, pending, window_mode);
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
+    // 等后台读也是读盘挡在关键路径上的时间，记进本步的 pread_wall。
+    timing.wall_ns += pf2_wait_ns;
+    pimpl->pf2_wait_ns.fetch_add(pf2_wait_ns, std::memory_order_relaxed);
+    if (pf2_step && layer < pimpl->last_moe_layer &&
+        pimpl->layers[(size_t) layer + 1].enabled) {
+        pimpl->pf2_arm(layer + 1);
+    }
 
     if (!pending.empty()) {
         // 仅统计，不影响读取路径。按层取增量，避免 cur 累计后重复计数。
