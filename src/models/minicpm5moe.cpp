@@ -279,6 +279,8 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool predict = moe_slots && moe_slots->lookahead_prefetch_enabled() && ubatch.n_tokens == 1;
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -342,7 +344,39 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // 下一层要用哪些专家的预测，只决定预读，不影响输出（上游 eefebf4 不带训练头的那一支）：
+        // 下一层自己的路由矩阵给本层的 ffn_norm 打分，变换与偏置照 build_moe_ffn。
+        ggml_tensor * prediction = nullptr;
+        if (predict && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+            const auto & tgt = model.layers[il + 1];
+            ggml_tensor * logits = build_lora_mm(tgt.ffn_gate_inp, cur);
+            ggml_tensor * scores;
+            switch ((llama_expert_gating_func_type) hparams.expert_gating_func) {
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                    scores = ggml_soft_max(ctx0, logits);
+                    break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+                    scores = logits;
+                    break;
+                default:
+                    scores = ggml_sigmoid(ctx0, logits);
+                    break;
+            }
+            if (tgt.ffn_exp_probs_b) {
+                scores = ggml_add(ctx0, scores, tgt.ffn_exp_probs_b);
+            }
+            prediction = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, scores, moe_slots->lookahead_prefetch_depth()));
+            cb(prediction, "prefetch_topk", il);
+        }
+
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+            // dense 层没有每层的 CPU 节点可搭载预测，给下一层（MoE）的预测单独一个节点
+            if (prediction) {
+                ggml_tensor * hand_off = moe_slots->build_lookahead_only(ctx0, prediction, il + 1);
+                if (hand_off) {
+                    ggml_build_forward_expand(gf, hand_off);
+                }
+            }
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   NULL, NULL,
                     model.layers[il].ffn_gate, NULL, NULL,
@@ -358,6 +392,13 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
             ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
 
+            // 给 il+1 的预测搭在本层的槽映射 CPU 节点上
+            if (prediction) {
+                ggml_build_forward_expand(gf, prediction);
+            }
+            if (moe_slots) {
+                moe_slots->set_lookahead_pred(prediction);
+            }
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     p_up,
