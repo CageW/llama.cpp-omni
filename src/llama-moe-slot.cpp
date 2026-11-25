@@ -174,6 +174,8 @@ struct lookahead_expert_prefetch {
                                               // （用完不保留，本层结束就被重填冲掉）
     std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
     std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
+    std::atomic<uint64_t> n_drain_waits{0};   // drain() 里真有读在飞、等了的次数
+    std::atomic<int64_t>  n_drain_ns{0};      // 这些等待的总时长
     bool ready = false;
 
     void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<void(int, int, int)> fn) {
@@ -276,7 +278,12 @@ struct lookahead_expert_prefetch {
             return;
         }
         std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [this]() { return !job_running && !job_pending; });
+        if (job_running || job_pending) {
+            const int64_t t0 = now_ns();
+            cv_done.wait(lk, [this]() { return !job_running && !job_pending; });
+            n_drain_waits.fetch_add(1, std::memory_order_relaxed);
+            n_drain_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        }
         arm_layer = -1;
         arm_n = 0;
     }
@@ -288,10 +295,12 @@ struct lookahead_expert_prefetch {
         const uint64_t armed = n_armed.load(std::memory_order_relaxed);
         const uint64_t hits = n_hits.load(std::memory_order_relaxed);
         const uint64_t preds = armed * (uint64_t) depth;
-        moe_log("lookahead-prefetch: armed=%llu hits=%llu (%.1f%% of predictions)",
+        moe_log("lookahead-prefetch: armed=%llu hits=%llu (%.1f%% of predictions) drain_waits=%llu drain_ms=%.1f",
             (unsigned long long) armed,
             (unsigned long long) hits,
-            preds ? 100.0 * (double) hits / (double) preds : 0.0);
+            preds ? 100.0 * (double) hits / (double) preds : 0.0,
+            (unsigned long long) n_drain_waits.load(std::memory_order_relaxed),
+            (double) n_drain_ns.load(std::memory_order_relaxed) / 1e6);
     }
 
     void reset() {
@@ -798,6 +807,13 @@ struct llama_moe_slot_runtime::impl {
                     st.dec_pack_ok = false;
                 }
                 decode_window = 0;
+                // 预读也回到共享 bank 尾部的乒乓区（尾区在 set_depth 时已经保留），
+                // 否则它按窗口模式往不存在的窗口里发布，process() 也不会在 pf2 前 drain。
+                if (lookahead.enabled && lookahead.window_mode) {
+                    std::lock_guard<std::mutex> lk(lookahead.mtx);
+                    lookahead.window_mode = false;
+                    moe_log("decode-cache: 预读改回写共享 bank 尾部");
+                }
             } else {
                 moe_log("decode-cache: %d 层绑定 decode 张量（每层 %d = cache %d + prefetch %d slot，pack %s）",
                         n_dec, (int) (decode_window + prefetch_slots), (int) decode_window,
@@ -1891,6 +1907,7 @@ struct llama_moe_slot_runtime::impl {
             const std::string err = pf2_err;
             pf2_err.clear();
             if (!rethrow) {
+                // 这层不发布；下次 process() 按主路径重读，那次失败才抛。重读成功时这次失败只留这行日志。
                 moe_log("prefill-prefetch: background read failed (ignored while parking): %s", err.c_str());
                 return false;
             }
