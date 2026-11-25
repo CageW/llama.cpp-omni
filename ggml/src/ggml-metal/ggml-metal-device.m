@@ -1320,9 +1320,9 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 {
                     const char * val = getenv("GGML_METAL_FUSION_DEBUG");
                     dev->finfo = ggml_metal_fusion_info_init(
-                            // mc15: off by default here - the fork's fusions need the alloc dependencies its graph_optimize adds, and this
-                            // ggml's graph_optimize has no way to add them, so a fused kernel could read an input the allocator already reused
-                            getenv("GGML_METAL_FUSION_ENABLE") != nil,
+                            // mc15: on by default since the scheduler adds the fusions' alloc dependencies (ggml_backend_graph_alloc_deps);
+                            // GGML_METAL_FUSION_DISABLE turns it off as in the fork
+                            getenv("GGML_METAL_FUSION_DISABLE") == nil,
                             val ? atoi(val) : 0);
                 }
 
