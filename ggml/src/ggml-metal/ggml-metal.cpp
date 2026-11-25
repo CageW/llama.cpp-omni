@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-fusion.h"
 
 #include <mutex>
 #include <string>
@@ -603,6 +604,15 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_graph_optimize(ctx, cgraph);
 }
 
+static void ggml_backend_metal_graph_alloc_deps(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(backend);
+    GGML_ASSERT(params && params->add_alloc_dep);
+
+    // keep the inputs of every fusable pattern alive until the pattern's last node so the allocator cannot reuse
+    // them while a fused kernel is still reading them (the fork does this in its graph_optimize)
+    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
+}
+
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
@@ -933,6 +943,10 @@ static ggml_backend_buffer_type_t ggml_backend_metal_reg_buffer_type_alloc_only(
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+
+    if (strcmp(name, "ggml_backend_graph_alloc_deps") == 0) {
+        return (void *)ggml_backend_metal_graph_alloc_deps;
     }
 
     if (strcmp(name, "ggml_backend_dev_buffer_type_alloc_only") == 0) {

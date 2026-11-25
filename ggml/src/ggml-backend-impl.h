@@ -107,6 +107,20 @@ extern "C" {
     // Backend (stream)
     //
 
+    // A backend that needs allocation dependencies exports
+    //   void ggml_backend_graph_alloc_deps(ggml_backend_t, struct ggml_cgraph *, struct ggml_backend_graph_optimize_params *)
+    // through its reg's get_proc_address (not a ggml_backend_i member, so backends built without it keep their layout).
+    // The scheduler calls it on each split before graph_optimize.
+    // passed to ggml_backend_graph_alloc_deps so the backend can add allocation dependencies: a backend whose kernels read
+    // tensors past the node that last uses them in the graph (e.g. fused kernels) must keep those tensors
+    // allocated until the node where the read has happened (mc15: from the metal-m5 fork)
+    struct ggml_backend_graph_optimize_params {
+        // keep `tensor` allocated at least until `until` (a node of the same graph) has been computed
+        // can be called multiple times for the same tensor: the longest lifetime applies
+        void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
+        void * user_data;
+    };
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
