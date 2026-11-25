@@ -1877,8 +1877,10 @@ struct llama_moe_slot_runtime::impl {
         pf2_cv.notify_all();
     }
 
-    /// 等后台读收尾；返回它读的是不是 `layer`（不是就作废，比如上一批中途被取消）。
-    bool pf2_take(int layer, int64_t & wait_ns) {
+    /// 等后台读收尾；返回它读的是不是 `layer`（不是就作废：读没法中途取消，
+    /// 比如上一批在读完那层之前就抛错了，作废的读仍要在这里等完）。
+    /// rethrow 为假时读错误只记日志（停泊收尾用，错误留给下次 process() 前的重读）。
+    bool pf2_take(int layer, int64_t & wait_ns, bool rethrow = true) {
         const int64_t t0 = now_ns();
         std::unique_lock<std::mutex> lk(pf2_mtx);
         pf2_cv.wait(lk, [&] { return !pf2_busy; });
@@ -1888,6 +1890,10 @@ struct llama_moe_slot_runtime::impl {
         if (!pf2_err.empty()) {
             const std::string err = pf2_err;
             pf2_err.clear();
+            if (!rethrow) {
+                moe_log("prefill-prefetch: background read failed (ignored while parking): %s", err.c_str());
+                return false;
+            }
             throw std::runtime_error("prefill prefetch failed: " + err);
         }
         return ok;
@@ -2299,7 +2305,7 @@ struct llama_moe_slot_runtime::impl {
         lookahead.drain();
         if (pf2) {
             int64_t ignored = 0;
-            pf2_take(-2, ignored);   // 停泊前不能有后台读还在写专家内存
+            pf2_take(-2, ignored, false);   // 停泊前不能有后台读还在写专家内存
         }
         std::lock_guard<std::mutex> lk(park_mutex);
         if (parked.load(std::memory_order_relaxed)) {
@@ -2709,7 +2715,14 @@ void llama_moe_slot_runtime::process(
     }
 
     if (pimpl->lookahead.enabled && !decode) {
-        pimpl->lookahead.reset();
+        if (pimpl->pf2 && !pimpl->lookahead.window_mode) {
+            // 没有窗口时预读写的是共享 bank 尾部的乒乓区 [n_slots-2·depth, n_slots)，
+            // 而 pf2 的奇数层半区 [n_expert, 2·n_expert) 盖住它；旧的预填充从 0 分配、
+            // 单层够不到尾区，pf2 之后不是。这里等解码时发出的读收完再分配。
+            pimpl->lookahead.drain();
+        } else {
+            pimpl->lookahead.reset();
+        }
     }
     // 非窗口模式：在这里取预读结果（命中已在乒乓区，需搬到目标 slot）。
     // 窗口模式的结果由 worker 直接写进目标窗口了，这里无事可做。
