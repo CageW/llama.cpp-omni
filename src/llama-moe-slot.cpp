@@ -1377,16 +1377,18 @@ struct llama_moe_slot_runtime::impl {
     }
 
     /// LLAMA_MOE_F_NOCACHE：experts 读是否绕过 page cache。
-    ///   未设 / "0" → 全程不绕（默认）
-    ///   "auto"     → 按阶段（prefill 绕、decode 不绕）
-    ///   "1"        → 全程绕过
+    ///   未设 / "auto" → 按阶段（prefill 绕、decode 不绕；默认）
+    ///   "0"           → 全程不绕
+    ///   "1"           → 全程绕过
+    /// mc15：默认从「不绕」改成 auto。16G M5 上 prefill 9.2K / 22.5K 词元快 6.8% / 3.6%，
+    /// decode 未测出差异；48G M5 Pro 上两个阶段都未测出差异；输出逐字相同。
     static int nocache_mode() {
         static const int m = [] {
             const char * e = std::getenv("LLAMA_MOE_F_NOCACHE");
-            if (!e || !*e || std::strcmp(e, "0") == 0) {
-                return 0;
+            if (!e || !*e || std::strcmp(e, "auto") == 0) {
+                return -1;
             }
-            return std::strcmp(e, "auto") == 0 ? -1 : 1;
+            return std::strcmp(e, "0") == 0 ? 0 : 1;
         }();
         return m;
     }
