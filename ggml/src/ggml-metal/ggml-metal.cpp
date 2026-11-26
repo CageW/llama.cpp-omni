@@ -605,8 +605,13 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
 }
 
 static void ggml_backend_metal_graph_alloc_deps(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    GGML_UNUSED(backend);
     GGML_ASSERT(params && params->add_alloc_dep);
+
+    // nothing is fused when fusion is off (GGML_METAL_FUSION_DISABLE), so the inputs need no extra lifetime
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) backend->device->context;
+    if (!ggml_metal_fusion_info_enabled(ggml_metal_device_get_fusion_info(ctx_dev))) {
+        return;
+    }
 
     // keep the inputs of every fusable pattern alive until the pattern's last node so the allocator cannot reuse
     // them while a fused kernel is still reading them (the fork does this in its graph_optimize)
